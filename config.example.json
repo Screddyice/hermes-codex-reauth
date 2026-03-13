@@ -1,0 +1,28 @@
+{
+  "servers": {
+    "MY_SERVER": {
+      "instance_id": "i-0123456789abcdef0",
+      "hostname": "my-server-ssh-alias",
+      "provider": "claude",
+      "email": "you@example.com",
+      "password": "your-password"
+    }
+  },
+  "gmail": {
+    "default": {
+      "client_id": "YOUR_GMAIL_CLIENT_ID.apps.googleusercontent.com",
+      "client_secret": "GOCSPX-YOUR_SECRET",
+      "refresh_token": "1//YOUR_REFRESH_TOKEN",
+      "token_uri": "https://oauth2.googleapis.com/token",
+      "email": "you@example.com"
+    }
+  },
+  "chrome_path": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+  "callback_port": 19876,
+  "screenshot_dir": "~/.headless-oauth/screenshots",
+  "browser_profile_dir": "~/.headless-oauth/browser-profiles",
+  "slack": {
+    "bot_token": "",
+    "user_id": ""
+  }
+}
