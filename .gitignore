@@ -5,3 +5,7 @@ __pycache__/
 *.log
 screenshots/
 browser-profiles/
+.openclaw-oauth/
+*.tmp
+.pytest_cache/
+venv/
