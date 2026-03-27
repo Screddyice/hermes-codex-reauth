@@ -41,12 +41,56 @@ CLAUDE_AUTHORIZE_URL = "https://claude.ai/oauth/authorize"
 CLAUDE_REDIRECT_URI = "http://localhost:{port}/callback"
 CLAUDE_SCOPES = "user:inference user:profile"
 
+# === Gemini OAuth Constants ===
+GEMINI_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GEMINI_AUTHORIZE_URL = "https://accounts.google.com/o/oauth2/auth"
+GEMINI_SCOPES = "https://www.googleapis.com/auth/cloud-platform openid email"
+GEMINI_REDIRECT_URI = "http://localhost:{port}/callback"
+
 MAX_ATTEMPTS = 2
 
 
 def log(msg):
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{ts}] {msg}")
+
+
+def recover_server(server_name: str, config: dict, dry_run: bool = False) -> bool:
+    """Module-callable entry point for headless recovery of a single server.
+    Called by oauth_manager.py. Returns True on success."""
+    global _config
+    _config = config
+    try:
+        result = run_reauth_for_server(server_name, headed=False, dry_run=dry_run)
+        return result.get("success", False)
+    except Exception as e:
+        log(f"[{server_name}] Recovery failed: {e}")
+        return False
+
+
+def recover_all(config: dict, dry_run: bool = False) -> bool:
+    """Recover the local server. Called by oauth_manager.py."""
+    global _config
+    _config = config
+    servers = config.get("servers", {})
+    # For standalone/receiver, use "local" as the server name
+    if not servers:
+        # Create a synthetic "local" server entry from top-level config
+        _config.setdefault("servers", {})["local"] = {
+            "hostname": "localhost",
+            "provider": config.get("provider", "claude"),
+            "email": config.get("email", ""),
+            "password": config.get("password", ""),
+        }
+        server_name = "local"
+    else:
+        server_name = list(servers.keys())[0]
+    try:
+        result = run_reauth_for_server(server_name, headed=False, dry_run=dry_run)
+        return result.get("success", False)
+    except Exception as e:
+        log(f"Recovery failed: {e}")
+        return False
 
 
 # ============================================================
@@ -1042,6 +1086,120 @@ def run_chatgpt_reauth(server_name, server, headed=False, dry_run=False):
 # Main orchestrator
 # ============================================================
 
+def run_gemini_reauth(server_name, server, headed=False, dry_run=False):
+    """Gemini OAuth via Google Sign-In — reuses Google login automation."""
+    try:
+        from token_refresh import _get_gemini_credentials
+        client_id, client_secret = _get_gemini_credentials({"client_id": None, "client_secret": None})
+    except ImportError:
+        return {"success": False, "message": "token_refresh.py not found — needed for Gemini credentials"}
+
+    port = get_callback_port()
+    verifier, challenge = generate_pkce()
+
+    auth_url = (
+        f"{GEMINI_AUTHORIZE_URL}?"
+        f"client_id={client_id}&"
+        f"redirect_uri={GEMINI_REDIRECT_URI.format(port=port)}&"
+        f"response_type=code&"
+        f"scope={urllib.parse.quote(GEMINI_SCOPES)}&"
+        f"access_type=offline&"
+        f"prompt=consent&"
+        f"code_challenge={challenge}&"
+        f"code_challenge_method=S256"
+    )
+
+    chrome_proc = None
+    browser = None
+    try:
+        chrome_proc, cdp_port = launch_chrome_cdp(server_name, headed=headed)
+        from playwright.sync_api import sync_playwright
+        pw = sync_playwright().start()
+        browser = pw.chromium.connect_over_cdp(f"http://localhost:{cdp_port}")
+        page = browser.contexts[0].pages[0] if browser.contexts and browser.contexts[0].pages else browser.contexts[0].new_page() if browser.contexts else browser.new_context().new_page()
+
+        # Start callback server
+        callback_result, thread, callback_server = start_callback_server(port)
+
+        # Navigate to Google OAuth
+        log(f"[{server_name}] Navigating to Google OAuth for Gemini...")
+        page.goto(auth_url, wait_until="networkidle", timeout=30000)
+
+        # Enter email
+        email = server.get("email", "")
+        if email:
+            try:
+                email_input = page.locator('input[type="email"]')
+                email_input.fill(email, timeout=10000)
+                page.locator('#identifierNext, button:has-text("Next")').click(timeout=5000)
+                time.sleep(2)
+            except Exception as e:
+                log(f"[{server_name}] Email entry: {e}")
+
+        # Enter password
+        password = server.get("password", "")
+        if password:
+            try:
+                pw_input = page.locator('input[type="password"]')
+                pw_input.fill(password, timeout=10000)
+                page.locator('#passwordNext, button:has-text("Next")').click(timeout=5000)
+                time.sleep(3)
+            except Exception as e:
+                log(f"[{server_name}] Password entry: {e}")
+
+        # Wait for callback
+        thread.join(timeout=120)
+        if "code" not in callback_result:
+            save_screenshot(page, f"{server_name}-gemini-no-code")
+            return {"success": False, "message": "No auth code received from Gemini OAuth"}
+
+        # Exchange code for tokens
+        payload = urllib.parse.urlencode({
+            "grant_type": "authorization_code",
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "code": callback_result["code"],
+            "redirect_uri": GEMINI_REDIRECT_URI.format(port=port),
+            "code_verifier": verifier,
+        }).encode()
+        req = urllib.request.Request(
+            GEMINI_TOKEN_URL, data=payload,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        )
+        resp = urllib.request.urlopen(req, timeout=15)
+        tokens = json.loads(resp.read().decode())
+
+        if "access_token" not in tokens:
+            return {"success": False, "message": f"Gemini token exchange failed: {json.dumps(tokens)[:300]}"}
+
+        # Build OAuth object
+        oauth = {
+            "type": "oauth",
+            "provider": "google-gemini",
+            "access": tokens["access_token"],
+            "refresh": tokens.get("refresh_token", ""),
+            "expires": int(time.time() * 1000) + tokens.get("expires_in", 3600) * 1000 - 60000,
+            "scopes": ["cloud-platform", "userinfo.email"],
+        }
+        tokens_json = json.dumps(oauth)
+
+        if not dry_run:
+            push_tokens_to_server(tokens_json, server_name, dry_run=False)
+
+        hrs = round(tokens.get("expires_in", 3600) / 3600, 1)
+        return {"success": True, "message": f"Gemini tokens refreshed ({hrs}h)"}
+
+    except Exception as e:
+        return {"success": False, "message": f"Gemini reauth error: {e}"}
+    finally:
+        if browser:
+            try:
+                cleanup_chrome(browser, chrome_proc)
+            except Exception:
+                pass
+
+
 def run_reauth_for_server(server_name, headed=False, dry_run=False):
     server = get_server(server_name)
     provider = server.get("provider", "claude")
@@ -1049,6 +1207,8 @@ def run_reauth_for_server(server_name, headed=False, dry_run=False):
         return run_claude_reauth(server_name, server, headed, dry_run)
     elif provider == "chatgpt":
         return run_chatgpt_reauth(server_name, server, headed, dry_run)
+    elif provider == "gemini":
+        return run_gemini_reauth(server_name, server, headed, dry_run)
     else:
         return {"success": False, "message": f"Unknown provider: {provider}"}
 
