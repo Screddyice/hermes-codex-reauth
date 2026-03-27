@@ -1,28 +1,35 @@
 {
-  "servers": {
-    "MY_SERVER": {
-      "instance_id": "i-0123456789abcdef0",
-      "hostname": "my-server-ssh-alias",
-      "provider": "claude",
-      "email": "you@example.com",
-      "password": "your-password"
-    }
+  "role": "standalone",
+  "provider": "claude",
+  "email": "",
+  "password": "",
+  "api_key": "",
+  "check_interval_minutes": 15,
+  "refresh_threshold_hours": 4,
+  "_comment_refresh_threshold": "Set to 0.5 for Gemini (60-min token TTL)",
+  "headless_recovery_cooldown_minutes": 30,
+  "headless_enabled": true,
+  "chrome_path": "",
+  "callback_port": 19876,
+  "screenshot_dir": "~/.openclaw-oauth/screenshots",
+  "browser_profile_dir": "~/.openclaw-oauth/browser-profiles",
+  "servers": {},
+  "s3": {
+    "bucket": "",
+    "key": "oauth/tokens.json",
+    "region": "us-east-2"
   },
   "gmail": {
     "default": {
-      "client_id": "YOUR_GMAIL_CLIENT_ID.apps.googleusercontent.com",
-      "client_secret": "GOCSPX-YOUR_SECRET",
-      "refresh_token": "1//YOUR_REFRESH_TOKEN",
+      "client_id": "",
+      "client_secret": "",
+      "refresh_token": "",
       "token_uri": "https://oauth2.googleapis.com/token",
-      "email": "you@example.com"
+      "email": ""
     }
   },
-  "chrome_path": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-  "callback_port": 19876,
-  "screenshot_dir": "~/.headless-oauth/screenshots",
-  "browser_profile_dir": "~/.headless-oauth/browser-profiles",
   "slack": {
     "bot_token": "",
-    "user_id": ""
+    "channel": ""
   }
 }
