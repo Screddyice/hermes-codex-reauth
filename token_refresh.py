@@ -15,11 +15,15 @@ import urllib.error
 # ── Provider Registry ──────────────────────────────────────────────────
 
 PROVIDERS = {
+    # NOTE: The "claude" key is a historical name kept for config
+    # back-compatibility. The profile slot "openai-codex:codex-cli" now holds
+    # OpenAI Codex tokens, and this entry refreshes them against OpenAI's
+    # OAuth endpoint. All OpenClaw instances use OpenAI regardless of server.
     "claude": {
         "profile_key": "openai-codex:codex-cli",
         "provider_name": "openai-codex",
-        "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
-        "token_url": "https://platform.claude.com/v1/oauth/token",
+        "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
+        "token_url": "https://auth.openai.com/oauth/token",
         "api_refresh": True,
     },
     "chatgpt": {
@@ -151,7 +155,14 @@ def refresh_token(provider: str, refresh_tok: str) -> dict:
 # ── Private refresh implementations ───────────────────────────────────
 
 def _refresh_claude(prov: dict, refresh_tok: str) -> dict:
-    payload = json.dumps({
+    """Refresh the openai-codex:codex-cli profile against OpenAI's OAuth endpoint.
+
+    OpenAI uses application/x-www-form-urlencoded (unlike Anthropic's historical
+    JSON body) and may omit refresh_token from the response when the existing
+    refresh token is still valid — fall back to the caller-supplied one in that
+    case so we don't lose the ability to refresh next cycle.
+    """
+    payload = urllib.parse.urlencode({
         "grant_type": "refresh_token",
         "client_id": prov["client_id"],
         "refresh_token": refresh_tok,
@@ -159,7 +170,10 @@ def _refresh_claude(prov: dict, refresh_tok: str) -> dict:
     req = urllib.request.Request(
         prov["token_url"],
         data=payload,
-        headers={"Content-Type": "application/json", "User-Agent": "OpenClawOAuth/1.0"},
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "OpenClawOAuth/1.0",
+        },
         method="POST",
     )
     try:
@@ -186,9 +200,9 @@ def _refresh_claude(prov: dict, refresh_tok: str) -> dict:
         "type": "oauth",
         "provider": prov["provider_name"],
         "access": result["access_token"],
-        "refresh": result["refresh_token"],
+        "refresh": result.get("refresh_token", refresh_tok),
         "expires": int(time.time() * 1000) + result["expires_in"] * 1000 - 5 * 60 * 1000,
-        "scopes": ["user:inference", "user:profile"],
+        "scopes": ["openid", "profile", "email", "offline_access"],
     }
 
 
