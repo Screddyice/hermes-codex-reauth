@@ -1,0 +1,90 @@
+# Standard legion.toml — single source of truth for all ~/projects/* repos.
+# To update the standard: edit this file, then re-run the bulk-sync script.
+# To override per-repo: edit that repo's legion.toml directly (won't get auto-synced).
+
+[swarm]
+# Hard cap on concurrent cloud workers. Pro session shared across N workers
+# will throttle hard above ~5. Stay conservative.
+max_workers = 5
+
+# Start with 1 worker on first run, observe throttle behavior, then ramp up.
+# Set false to commit to max_workers immediately.
+ramp_first_run = true
+
+# Pause between decomposition and dispatch so the human can review the task graph.
+# Set false for full-autonomous yolo mode.
+human_checkpoint_after_decompose = true
+
+# Auth mode for workers (not for the orchestrator Claude session):
+#   "session" — Pro session token. Free but shared rate limits kick in at
+#               ~3-5 concurrent workers.
+#   "api"     — ANTHROPIC_API_KEY. No throttle, but you pay per token.
+# Flip to "api" per-repo if a heavy run hits throttle. ANTHROPIC_API_KEY is set
+# in ~/projects/.env so the cloud setup picks it up automatically.
+auth_mode = "session"
+
+[budget]
+# Hard ceiling for $/hour of Modal spend. 0 means no $ cap (Pro session is free).
+# Set this if you ever flip workers to API auth — runaway autoloops have killed wallets.
+max_dollars_per_hour = 0
+
+# Kill any individual worker that runs longer than this. Tasks needing more
+# should be split.
+worker_timeout_minutes = 30
+
+[reconciler]
+# Max retries for the mediator agent to resolve a merge conflict before
+# escalating to the human.
+mediator_max_retries = 2
+
+# GitHub repo to push branches/PRs to. Empty = inferred from `git remote`.
+github_repo = ""
+
+# Branch prefix for legion-spawned branches.
+branch_prefix = "legion/"
+
+# Fully autonomous merge on owned repos — no needs_human gate.
+# Per holyclaude-cloud STATUS.md (v0.3.0 GA polish): dogfood #6 confirmed
+# 4 PRs auto-merged in ~6 min wall-clock with this on.
+use_admin_merge = true
+
+[review]
+# Run an independent reviewer on each shipped PR before merging.
+# - "critical" verdict blocks merge and re-dispatches the task
+#   (up to max_review_redispatches, with feedback appended to the spec)
+# - "warnings" verdict merges but posts issues as a PR comment
+# - "clean" verdict merges silently
+enabled = true
+
+# Categories the reviewer checks for
+categories = ["security", "task_adherence", "silent_failures", "type_design", "dead_code"]
+
+# Max re-dispatches on critical verdict before giving up and blocking
+# the merge for human review
+max_review_redispatches = 2
+
+# Where to run reviewer workers:
+#   "local" (default) — fast, free with Pro session, uses whatever Claude
+#                       Code is installed locally
+#   "cloud"           — runs in Modal container, slower, uses same auth as
+#                       regular cloud workers
+#   "auto"            — same router heuristics as regular workers
+target = "local"
+
+[dispatch]
+# Heuristics router uses for local-vs-cloud routing. The router is an Opus call
+# that takes these as priors. Tweak to bias.
+
+# Tasks under this many files go local by default.
+local_file_threshold = 5
+
+# Tasks over this many estimated minutes go cloud by default.
+cloud_minutes_threshold = 5
+
+# Always-cloud task types (regex on task title).
+always_cloud_patterns = [
+    "(?i)scrape",
+    "(?i)browser test",
+    "(?i)long-running",
+    "(?i)benchmark"
+]
