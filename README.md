@@ -8,7 +8,7 @@ When Codex's refresh-token chain breaks (OpenAI rotates / expires the refresh to
 
 Each server runs two things on a schedule:
 
-1. **Watchdog** (`codex_watchdog.py`, cron every 15 min): cheap check on token TTL. If the access token is still healthy, exit. If it's near expiry, try an API refresh. If the refresh chain is broken (`invalid_grant`), escalate to the recovery flow.
+1. **Watchdog** (`codex_watchdog.py`, cron every 3h): cheap check on token TTL. If the access token is still healthy, exit. If it's near expiry, try an API refresh. If the refresh chain is broken (`invalid_grant`), escalate to the recovery flow. (Older docs and the script's docstring suggested 15 min — 3h is the production-tuned cadence with the recovery escalation in place; brief downtime up to one tick is acceptable because the recovery auto-heals it.)
 
 2. **Recovery** (`codex_reauth_server.py`, invoked by the watchdog on escalation): launches a real Chrome over CDP, walks the OpenAI auth URL, submits the configured email, waits for OpenAI's verification email to arrive in Gmail (via read-only Gmail API), extracts the magic link or 6-digit code, completes the login, catches the auth callback on localhost, exchanges the code for fresh tokens, writes them into the server's `auth-profiles.json`, and restarts the OpenClaw gateway.
 
@@ -54,12 +54,40 @@ cp config.server.example.json config.server.json
 #    OpenAI's verification emails. Store as ~/.openclaw/gmail-oauth-credentials.json:
 #      { "client_id", "client_secret", "refresh_token", "token_uri", "email" }
 
-# 4. Install the watchdog on a 15-min cron
-crontab -l 2>/dev/null | { cat; echo "*/15 * * * * $HOME/codex-reauth/venv/bin/python $HOME/codex-reauth/codex_watchdog.py >> $HOME/.openclaw-oauth/watchdog.log 2>&1"; } | crontab -
+# 4. Install the watchdog on a 3h cron (recovery escalation handles brief downtime)
+crontab -l 2>/dev/null | { cat; echo "0 */3 * * * $HOME/codex-reauth/venv/bin/python $HOME/codex-reauth/codex_watchdog.py >> $HOME/.openclaw-oauth/watchdog.log 2>&1"; } | crontab -
 
 # 5. Bring up a residential exit (one of the two patterns above) so the
 #    recovery flow has a non-datacenter IP to use.
 ```
+
+### Bring-up validation checklist
+
+Before declaring a new server "self-healing," verify all of these. If any fail, the watchdog will eventually go silent on the first refresh-chain break — and you'll find out when an agent stops responding:
+
+```bash
+# 1. Binaries on PATH
+which google-chrome-stable Xvfb gost
+# 2. Credentials in place
+ls ~/.openclaw/gmail-oauth-credentials.json ~/.openclaw/residential-proxy.env
+# 3. Residential proxy systemd unit running
+systemctl --user is-active residential-proxy.service
+# 4. Watchdog cron present
+crontab -l | grep codex_watchdog.py
+# 5. End-to-end smoke test: real OAuth via Chrome+Xvfb+Gmail+residential proxy
+~/codex-reauth/venv/bin/python ~/codex-reauth/codex_reauth_server.py
+#    Expect ~25s runtime; final lines should be:
+#      "wrote N auth-profiles.json files + oauth-token-cache.json + codex-cli-native=yes"
+#      "restarted openclaw-gateway"
+```
+
+If you hand-seeded `~/.openclaw/auth-profiles.json` from `oauth-token-cache.json` rather than letting `codex_reauth_server.py` create it, double-check that `lastGood` is a **dict** keyed by provider, not a bare string:
+
+```json
+"lastGood": { "openai-codex": "openai-codex:codex-cli" }
+```
+
+`auth_profiles.write_tokens()` normalizes a string lastGood defensively (so the headless flow no longer crashes on the first run), but the canonical shape is still the dict form.
 
 ## Files
 
