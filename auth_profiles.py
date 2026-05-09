@@ -65,7 +65,12 @@ def write_tokens(paths: list[str], tokens: CodexTokens) -> int:
             continue
         d.setdefault("profiles", {})[PROFILE_KEY] = new_profile
         d.get("profiles", {}).pop(f"{PROVIDER_NAME}:api_key", None)
-        d.setdefault("lastGood", {})[PROVIDER_NAME] = PROFILE_KEY
+        # `lastGood` is canonically a dict keyed by provider, but older hand-seeded
+        # files sometimes set it to a bare PROFILE_KEY string. Normalize defensively
+        # so we don't crash with TypeError on the first headless reauth.
+        if not isinstance(d.get("lastGood"), dict):
+            d["lastGood"] = {}
+        d["lastGood"][PROVIDER_NAME] = PROFILE_KEY
         try:
             with open(p, "w") as f:
                 json.dump(d, f)
