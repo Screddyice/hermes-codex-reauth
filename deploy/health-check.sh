@@ -29,11 +29,20 @@ if [[ -z "$EXPECTED" ]]; then
   exit 2
 fi
 
-# 10s total timeout; SOCKS handshake + IP echo should be fast
-OBSERVED=$(curl -sS --max-time 10 --socks5 127.0.0.1:1080 https://api.ipify.org || true)
+# Retry the SOCKS5 handshake up to 3 times with 30s timeout each. Residential
+# proxy pools (IPRoyal) commonly drop individual connections under load; a
+# single 10s shot was too brittle and produced daily false positives.
+MAX_ATTEMPTS=3
+TIMEOUT=30
+OBSERVED=""
+for i in $(seq 1 "$MAX_ATTEMPTS"); do
+  OBSERVED=$(curl -sS --max-time "$TIMEOUT" --socks5 127.0.0.1:1080 https://api.ipify.org 2>/dev/null || true)
+  [[ -n "$OBSERVED" ]] && break
+  [[ "$i" -lt "$MAX_ATTEMPTS" ]] && sleep 2
+done
 
 if [[ -z "$OBSERVED" ]]; then
-  bash "$ALERT" residential-proxy "health check failed: could not reach api.ipify.org through SOCKS tunnel. Tunnel may be down." || true
+  bash "$ALERT" residential-proxy "upstream IPRoyal handshake failed after ${MAX_ATTEMPTS} attempts (${TIMEOUT}s each). Local gost service is likely still running — this is an upstream provider issue. Codex re-auth via this proxy will fail until IPRoyal recovers; fall back to the Mac tunnel if a server hits invalid_grant in the meantime." || true
   exit 3
 fi
 
