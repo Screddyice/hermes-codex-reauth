@@ -55,6 +55,11 @@ PROXY_ENV_FILE = os.path.expanduser("~/.openclaw/residential-proxy.env")
 SERVER_REAUTH_SCRIPT = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "codex_reauth_server.py"
 )
+# Written when OAuth is confirmed broken (escalation failed past threshold) and
+# the disconnect alert has fired. The Mac-side reactive trigger watches for this
+# flag and runs the interactive Mac re-auth flow. Cleared when the server
+# recovers (healthy refresh or successful escalation).
+REAUTH_FLAG_FILE = os.path.expanduser("~/.openclaw-oauth/reauth-requested.flag")
 LOG_DIR = os.path.expanduser("~/.openclaw-oauth")
 os.makedirs(LOG_DIR, exist_ok=True)
 
@@ -99,6 +104,7 @@ def main() -> int:
 
     if hours_left > REFRESH_BUFFER_HOURS:
         log.info("token healthy — no action")
+        _clear_reauth_flag()
         return 0
 
     refresh_tok = current.get("refresh")
@@ -127,6 +133,7 @@ def main() -> int:
         "API refresh OK, new token expires in %.1fh (openclaw=%d codex-cli=%s)",
         new_hours, openclaw_updated, "yes" if codex_cli_updated else "no",
     )
+    _clear_reauth_flag()
     return 0
 
 
@@ -142,6 +149,30 @@ def _save_escalation_state(state: dict) -> None:
     os.makedirs(os.path.dirname(ESCALATION_STATE_FILE), exist_ok=True)
     with open(ESCALATION_STATE_FILE, "w") as f:
         json.dump(state, f)
+
+
+def _set_reauth_flag() -> None:
+    """Signal the Mac-side reactive trigger that this server needs a fresh
+    interactive re-auth. The Mac watches for this flag and runs the Mac re-auth
+    flow only after it appears — never pre-emptively."""
+    try:
+        with open(REAUTH_FLAG_FILE, "w") as f:
+            f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {os.uname().nodename}\n")
+        log.info("wrote reauth-requested flag for Mac trigger: %s", REAUTH_FLAG_FILE)
+    except Exception as e:
+        log.error("failed to write reauth flag: %s", e)
+
+
+def _clear_reauth_flag() -> None:
+    """Remove the reauth-requested flag once the server is healthy again, so the
+    Mac trigger stops acting on a stale request."""
+    try:
+        os.remove(REAUTH_FLAG_FILE)
+        log.info("cleared reauth-requested flag (server recovered)")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.error("failed to clear reauth flag: %s", e)
 
 
 def _alert_slack(message: str) -> None:
@@ -179,6 +210,7 @@ def _escalate() -> int:
         if state.get("consecutive_failures", 0) > 0:
             log.info("escalation recovered after %d failure(s)", state["consecutive_failures"])
         state["consecutive_failures"] = 0
+        _clear_reauth_flag()
     else:
         state["consecutive_failures"] = state.get("consecutive_failures", 0) + 1
         log.warning(
@@ -190,13 +222,15 @@ def _escalate() -> int:
                 "Codex login on this server keeps failing. The automatic "
                 f"refresh tried {state['consecutive_failures']} times in a row "
                 "and couldn't recover.\n\n"
-                "To fix: on your Mac, open Terminal and run:\n"
-                "  cd ~/projects/openclaw-codex-reauth\n"
-                "  python3 codex_reauth_mac.py\n\n"
-                "That opens a browser, you log in once, and fresh tokens "
-                "are pushed back to this server automatically. Until then, "
-                "any agent that uses Codex on this box will be stuck."
+                "Your Mac watches for this and will re-auth automatically — just "
+                "finish the OpenAI login when the browser opens on your Mac "
+                "(within the hour). To trigger it immediately, on your Mac run:\n"
+                "  cd ~/projects/Screddyice/openclaw-codex-reauth && python3 codex_reauth_mac.py\n\n"
+                "Until then, any agent that uses Codex on this box will be stuck."
             )
+            # Signal the Mac-side reactive trigger (only after the disconnect
+            # alert has fired — never pre-emptively).
+            _set_reauth_flag()
     _save_escalation_state(state)
     return result.returncode
 
