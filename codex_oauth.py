@@ -133,10 +133,17 @@ def exchange_code(code: str, verifier: str) -> CodexTokens:
 
 
 def refresh_access_token(refresh_token: str) -> CodexTokens:
+    # CRITICAL: send `scope` (openid ...) and `id_token_add_organizations` on the
+    # refresh grant, exactly as build_authorize_url does. Without the openid
+    # scope OpenAI's refresh_token grant returns NO id_token, so a long-lived
+    # access token rolls forward while the id_token silently rots. Mirroring the
+    # authorize params here makes every successful refresh mint a fresh id_token.
     result = _post_token({
         "grant_type": "refresh_token",
         "client_id": CLIENT_ID,
         "refresh_token": refresh_token,
+        "scope": SCOPE,
+        "id_token_add_organizations": "true",
     })
     # OpenAI may omit refresh_token on refresh if unchanged; keep caller's
     # refresh in that case so we don't lose rotation chain.
@@ -159,14 +166,14 @@ def _parse_tokens(result: dict) -> CodexTokens:
     )
 
 
-def expires_ms_from_jwt(access_token: str) -> int:
-    """Read the `exp` claim (seconds) from a JWT access_token, return epoch ms.
+def _exp_ms_from_jwt(token: str) -> int:
+    """Decode any JWT's `exp` claim (seconds) and return it as epoch ms.
 
-    Used when reading tokens from `~/.codex/auth.json`, which has no explicit
-    `expires` field but does carry a JWT we can decode locally.
+    Returns 0 on any failure: empty/None token, malformed JWT, or missing/
+    non-numeric exp. Shared by the access-token and id-token readers.
     """
     try:
-        payload_b64 = access_token.split(".")[1]
+        payload_b64 = token.split(".")[1]
         payload_b64 += "=" * (-len(payload_b64) % 4)
         payload = json.loads(base64.urlsafe_b64decode(payload_b64))
         exp = payload.get("exp")
@@ -175,6 +182,26 @@ def expires_ms_from_jwt(access_token: str) -> int:
     except Exception:
         pass
     return 0
+
+
+def expires_ms_from_jwt(access_token: str) -> int:
+    """Read the `exp` claim (seconds) from a JWT access_token, return epoch ms.
+
+    Used when reading tokens from `~/.codex/auth.json`, which has no explicit
+    `expires` field but does carry a JWT we can decode locally.
+    """
+    return _exp_ms_from_jwt(access_token)
+
+
+def id_token_expires_ms_from_jwt(id_token: str) -> int:
+    """Read the `exp` claim (seconds) from a JWT id_token, return epoch ms.
+
+    Lets the watchdog/health gate and the merge layer detect a rotting id_token
+    (the access token can stay healthy while the id_token expires). Returns 0
+    when the id_token is missing or undecodable, which callers treat as
+    "no id_token TTL to enforce".
+    """
+    return _exp_ms_from_jwt(id_token)
 
 
 def _account_id_from_jwt(access_token: str) -> str | None:

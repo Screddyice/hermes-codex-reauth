@@ -40,7 +40,11 @@ from auth_profiles import (
     write_token_cache,
     write_tokens,
 )
-from codex_oauth import CodexTokens, refresh_access_token
+from codex_oauth import (
+    CodexTokens,
+    id_token_expires_ms_from_jwt,
+    refresh_access_token,
+)
 
 REFRESH_BUFFER_HOURS = 0  # reactive: refresh only after the token has actually expired
 DEFAULT_GLOBS = [
@@ -98,21 +102,44 @@ def main() -> int:
         return _escalate()
 
     expires_ms = int(current.get("expires", 0))
+    id_expires_ms = int(current.get("id_token_expires", 0))
     now_ms = int(time.time() * 1000)
     hours_left = (expires_ms - now_ms) / 3_600_000
-    log.info("read tokens from source=%s, %.1fh remaining", source, hours_left)
+    # id_token TTL only matters when one is actually present (id_expires_ms > 0).
+    id_hours_left = (id_expires_ms - now_ms) / 3_600_000 if id_expires_ms > 0 else None
+    if id_hours_left is not None:
+        log.info(
+            "read tokens from source=%s, access %.1fh / id_token %.1fh remaining",
+            source, hours_left, id_hours_left,
+        )
+    else:
+        log.info("read tokens from source=%s, access %.1fh remaining (no id_token)", source, hours_left)
 
-    if hours_left > REFRESH_BUFFER_HOURS:
+    # Healthy only when the access token has life AND (no id_token OR the
+    # id_token also has life). An access-fresh / id_token-expired pair must fall
+    # through to the refresh path — refresh now requests a fresh id_token, so the
+    # rot can finally self-heal instead of being declared "healthy" forever.
+    access_healthy = hours_left > REFRESH_BUFFER_HOURS
+    id_healthy = id_hours_left is None or id_hours_left > REFRESH_BUFFER_HOURS
+    if access_healthy and id_healthy:
         log.info("token healthy — no action")
         _clear_reauth_flag()
         return 0
+    if access_healthy and not id_healthy:
+        log.info(
+            "access token healthy but id_token expired (%.1fh past) — forcing refresh to mint a fresh id_token",
+            -id_hours_left if id_hours_left is not None else 0,
+        )
 
     refresh_tok = current.get("refresh")
     if not refresh_tok:
         log.error("profile has no refresh token — escalating")
         return _escalate()
 
-    log.info("token expired (%.1fh past expiry), attempting reactive refresh", -hours_left)
+    if not access_healthy:
+        log.info("access token expired (%.1fh past expiry), attempting reactive refresh", -hours_left)
+    else:
+        log.info("refreshing to heal an expired id_token while access is still valid")
     try:
         tokens: CodexTokens = refresh_access_token(refresh_tok)
     except Exception as e:
@@ -130,9 +157,26 @@ def main() -> int:
     codex_cli_updated = write_codex_cli_native(tokens)
     new_hours = (tokens.expires_ms - now_ms) / 3_600_000
     log.info(
-        "API refresh OK, new token expires in %.1fh (openclaw=%d codex-cli=%s)",
+        "API refresh OK, new access token expires in %.1fh (openclaw=%d codex-cli=%s)",
         new_hours, openclaw_updated, "yes" if codex_cli_updated else "no",
     )
+
+    # Post-refresh verification: confirm the refresh actually minted a usable
+    # id_token. If OpenAI's refresh grant still declined to return one (or
+    # returned an already-expired one — server-side scope refusal), do NOT return
+    # 0 with a half-fresh store: escalate to a full interactive login that can
+    # mint a real id_token. write_codex_cli_native has already dropped any dead
+    # id_token and stamped needs_reauth, so the gap is never a stale-token gap.
+    id_exp_ms = id_token_expires_ms_from_jwt(tokens.id_token or "")
+    if not tokens.id_token or (id_exp_ms and id_exp_ms <= int(time.time() * 1000)):
+        log.error(
+            "refresh succeeded but id_token is still %s — escalating for full reauth",
+            "absent" if not tokens.id_token else "expired",
+        )
+        return _escalate()
+
+    new_id_hours = (id_exp_ms - now_ms) / 3_600_000 if id_exp_ms else 0
+    log.info("refresh minted a fresh id_token (%.1fh remaining)", new_id_hours)
     _clear_reauth_flag()
     return 0
 

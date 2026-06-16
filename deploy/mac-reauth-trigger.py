@@ -27,7 +27,11 @@ import sys
 import time
 from pathlib import Path
 
-SERVERS = ["neb-server", "cliqk-server", "trc-server"]
+# hostinger runs Hermes (not openclaw-gateway) and codex is not installed there,
+# so it self-heals on access_token alone and rarely sets the flag — but it IS in
+# config.mac.json, so the reactive path should still observe its flag if one ever
+# appears rather than being structurally blind to the Hermes box.
+SERVERS = ["neb-server", "cliqk-server", "trc-server", "hostinger"]
 REMOTE_FLAG = "~/.openclaw-oauth/reauth-requested.flag"
 REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REAUTH_SCRIPT = os.path.join(REPO_DIR, "codex_reauth_mac.py")
@@ -44,19 +48,53 @@ def log(msg: str) -> None:
         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} mac-reauth-trigger {msg}\n")
 
 
+def _probe_flag(alias: str, *, timeout: int) -> str:
+    """Probe one server for the reauth flag.
+
+    Returns one of: "set" (flag present), "absent" (reachable, no flag),
+    "unknown" (SSH could not establish — timeout/connection error, so flag
+    state is genuinely unknown, NOT the same as 'absent').
+
+    `test -f` exits 0 when the file exists and 1 when it doesn't. An SSH
+    transport failure (host down, network, auth) surfaces as a 255 exit or a
+    TimeoutExpired — those are "unknown", because conflating an unreachable box
+    with "no flag" silently disarms the reactive path exactly when a server is
+    in trouble.
+    """
+    try:
+        r = subprocess.run(
+            ["ssh", *SSH_OPTS, alias, f"test -f {REMOTE_FLAG}"],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return "unknown"
+    except Exception:
+        return "unknown"
+    if r.returncode == 0:
+        return "set"
+    if r.returncode == 1:
+        return "absent"
+    # 255 (ssh transport error) or anything else → couldn't determine.
+    return "unknown"
+
+
 def servers_requesting() -> list[str]:
-    """Return the list of servers whose reauth-requested flag is set."""
+    """Return the list of servers whose reauth-requested flag is set.
+
+    An SSH timeout/transport error is treated as 'unknown' and retried once
+    with a longer timeout before being logged loudly — never silently folded
+    into 'no flag'.
+    """
     hits = []
     for alias in SERVERS:
-        try:
-            r = subprocess.run(
-                ["ssh", *SSH_OPTS, alias, f"test -f {REMOTE_FLAG}"],
-                capture_output=True, text=True, timeout=40,
-            )
-            if r.returncode == 0:
-                hits.append(alias)
-        except Exception as e:
-            log(f"flag check for {alias} errored (treating as no-flag): {e}")
+        state = _probe_flag(alias, timeout=40)
+        if state == "unknown":
+            # Retry once with a longer ceiling before giving up on this tick.
+            state = _probe_flag(alias, timeout=90)
+        if state == "set":
+            hits.append(alias)
+        elif state == "unknown":
+            log(f"flag check for {alias} UNREACHABLE after retry (state unknown, not treated as no-flag)")
     return hits
 
 

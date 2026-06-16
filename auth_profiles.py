@@ -12,7 +12,11 @@ import json
 import os
 import time
 
-from codex_oauth import CodexTokens, expires_ms_from_jwt
+from codex_oauth import (
+    CodexTokens,
+    expires_ms_from_jwt,
+    id_token_expires_ms_from_jwt,
+)
 
 PROFILE_KEY = "openai-codex:codex-cli"
 PROVIDER_NAME = "openai-codex"
@@ -114,6 +118,10 @@ def read_codex_cli_native(path: str = CODEX_CLI_AUTH_PATH) -> dict | None:
     if not access or not refresh:
         return None
     expires_ms = expires_ms_from_jwt(access)
+    # Surface the id_token's TTL alongside the access token's so the watchdog can
+    # gate health on the SOONER of the two. 0 means "no id_token present" — the
+    # health gate treats that as nothing-to-enforce, not as expired.
+    id_expires_ms = id_token_expires_ms_from_jwt(tokens.get("id_token") or "")
     profile: dict = {
         "type": "oauth",
         "provider": PROVIDER_NAME,
@@ -121,6 +129,7 @@ def read_codex_cli_native(path: str = CODEX_CLI_AUTH_PATH) -> dict | None:
         "access": access,
         "refresh": refresh,
         "expires": expires_ms,
+        "id_token_expires": id_expires_ms,
         "scopes": ["openid", "profile", "email", "offline_access"],
     }
     if tokens.get("account_id"):
@@ -137,8 +146,17 @@ def write_codex_cli_native(
     """Merge fresh tokens into Codex CLI's native auth.json.
 
     Preserves any non-token fields already in the file (`auth_mode`,
-    `OPENAI_API_KEY`, etc.). If the response omitted `id_token`, the existing
-    id_token is preserved.
+    `OPENAI_API_KEY`, etc.).
+
+    id_token merge policy (the rot-prevention rule):
+      - If the fresh `tokens.id_token` is present, write it (it is current).
+      - Else, inspect the pre-existing id_token:
+          * still valid (exp > now) → keep it untouched.
+          * EXPIRED → drop it entirely (`pop`) so a dead id_token can never be
+            re-persisted, and stamp `needs_reauth = True` on the store so the
+            watchdog can detect that refresh-alone could not heal it and must
+            escalate to a full interactive login.
+      - If a fresh id_token IS present, clear any stale `needs_reauth` flag.
 
     By default this is a no-op when the file is missing — the watchdog should
     not invent a Codex CLI install where one doesn't exist. Pass
@@ -163,7 +181,22 @@ def write_codex_cli_native(
     existing["access_token"] = tokens.access
     existing["refresh_token"] = tokens.refresh
     if tokens.id_token:
+        # Fresh id_token — write it and clear any prior needs-reauth signal.
         existing["id_token"] = tokens.id_token
+        d.pop("needs_reauth", None)
+    else:
+        # Refresh response omitted id_token. Decide on the EXISTING one rather
+        # than blindly preserving it (the old bug that let id_tokens rot).
+        stale = existing.get("id_token")
+        if stale:
+            id_exp_ms = id_token_expires_ms_from_jwt(stale)
+            now_ms = int(time.time() * 1000)
+            if id_exp_ms and id_exp_ms <= now_ms:
+                # Dead id_token: never re-persist it, and signal needs-reauth so
+                # the watchdog escalates to a full login that mints a fresh one.
+                existing.pop("id_token", None)
+                d["needs_reauth"] = True
+            # else: still-valid id_token → leave it in place untouched.
     if tokens.account_id:
         existing["account_id"] = tokens.account_id
     d["tokens"] = existing
