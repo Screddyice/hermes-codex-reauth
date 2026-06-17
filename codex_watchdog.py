@@ -36,6 +36,7 @@ from auth_profiles import (
     discover_paths,
     read_codex_cli_native,
     read_current,
+    read_hermes_pool,
     write_codex_cli_native,
     write_token_cache,
     write_tokens,
@@ -88,6 +89,7 @@ def _is_invalid_grant(err: Exception) -> bool:
 
 
 def main() -> int:
+    now_ms = int(time.time() * 1000)
     paths = discover_paths(DEFAULT_GLOBS)
     current = read_current(paths)
     source = "openclaw"
@@ -98,48 +100,50 @@ def main() -> int:
         current = read_codex_cli_native()
         source = "codex-cli"
     if not current:
+        # No openclaw / codex-cli store on this host. It may be a Hermes-only box
+        # (neb-brain-hostinger): Hermes owns its own credential store and its own
+        # re-login, so here we only MONITOR it (read-only) — we never refresh or
+        # escalate on Hermes' behalf, which would rotate the shared refresh token
+        # out from under the live gateway.
+        if read_hermes_pool() is not None:
+            log.info("no openclaw/codex-cli store on this host — Hermes box, monitoring only")
+            _monitor_hermes(now_ms)
+            return 0
         log.error("no existing openai-codex tokens found in openclaw or ~/.codex/auth.json — escalating")
         return _escalate()
 
     expires_ms = int(current.get("expires", 0))
     id_expires_ms = int(current.get("id_token_expires", 0))
-    now_ms = int(time.time() * 1000)
     hours_left = (expires_ms - now_ms) / 3_600_000
-    # id_token TTL only matters when one is actually present (id_expires_ms > 0).
-    id_hours_left = (id_expires_ms - now_ms) / 3_600_000 if id_expires_ms > 0 else None
-    if id_hours_left is not None:
-        log.info(
-            "read tokens from source=%s, access %.1fh / id_token %.1fh remaining",
-            source, hours_left, id_hours_left,
-        )
-    else:
-        log.info("read tokens from source=%s, access %.1fh remaining (no id_token)", source, hours_left)
 
-    # Healthy only when the access token has life AND (no id_token OR the
-    # id_token also has life). An access-fresh / id_token-expired pair must fall
-    # through to the refresh path — refresh now requests a fresh id_token, so the
-    # rot can finally self-heal instead of being declared "healthy" forever.
-    access_healthy = hours_left > REFRESH_BUFFER_HOURS
-    id_healthy = id_hours_left is None or id_hours_left > REFRESH_BUFFER_HOURS
-    if access_healthy and id_healthy:
-        log.info("token healthy — no action")
+    # REACTIVE ONLY (Hermes-safe): act solely when the ACCESS token has actually
+    # expired. A live access token means this box is up — codex CLI and Hermes
+    # both authorize on the access token — so we do NOTHING even if the id_token
+    # has expired. The id_token heals for free on the next genuine refresh (the
+    # refresh now carries the openid scope). We deliberately do NOT rotate the
+    # shared OpenAI refresh token just to freshen a latent id_token: that
+    # rotation would invalidate Hermes' pooled copy of the same account
+    # (refresh_token_reused). Latent id_token rot is harmless; needless rotation
+    # is not.
+    if hours_left > REFRESH_BUFFER_HOURS:
+        if id_expires_ms and id_expires_ms <= now_ms:
+            log.info(
+                "source=%s, access %.1fh remaining; id_token expired but latent — "
+                "no action (heals on next real refresh; not rotating the shared token)",
+                source, hours_left,
+            )
+        else:
+            log.info("source=%s, access %.1fh remaining — token healthy, no action", source, hours_left)
         _clear_reauth_flag()
+        _monitor_hermes(now_ms)
         return 0
-    if access_healthy and not id_healthy:
-        log.info(
-            "access token healthy but id_token expired (%.1fh past) — forcing refresh to mint a fresh id_token",
-            -id_hours_left if id_hours_left is not None else 0,
-        )
 
     refresh_tok = current.get("refresh")
     if not refresh_tok:
         log.error("profile has no refresh token — escalating")
         return _escalate()
 
-    if not access_healthy:
-        log.info("access token expired (%.1fh past expiry), attempting reactive refresh", -hours_left)
-    else:
-        log.info("refreshing to heal an expired id_token while access is still valid")
+    log.info("access token expired (%.1fh past expiry), attempting reactive refresh", -hours_left)
     try:
         tokens: CodexTokens = refresh_access_token(refresh_tok)
     except Exception as e:
@@ -177,7 +181,11 @@ def main() -> int:
 
     new_id_hours = (id_exp_ms - now_ms) / 3_600_000 if id_exp_ms else 0
     log.info("refresh minted a fresh id_token (%.1fh remaining)", new_id_hours)
+    # An actual refresh happened — the ONLY routine event worth a notification.
+    # Healthy no-op ticks stay silent.
+    _notify_refresh(source, new_hours, new_id_hours)
     _clear_reauth_flag()
+    _monitor_hermes(now_ms)
     return 0
 
 
@@ -236,6 +244,55 @@ def _alert_slack(message: str) -> None:
         subprocess.run(cmd, check=False, timeout=15)
     except Exception as e:
         log.error("failed to invoke slack-alert.sh: %s", e)
+
+
+def _notify_refresh(source: str, access_hours: float, id_hours: float) -> None:
+    """Notify ONLY when an actual refresh happened — the single routine event
+    worth a ping. Healthy no-op ticks never notify (that was the noise we are
+    cutting). Best-effort; never crashes the watchdog."""
+    try:
+        host = os.uname().nodename
+    except Exception:
+        host = "this host"
+    msg = (
+        f"Codex token refreshed on {host} (source={source}). "
+        f"New access token valid ~{access_hours:.0f}h"
+        + (f", id_token ~{id_hours:.0f}h." if id_hours else ".")
+    )
+    _alert_slack(msg)
+
+
+def _monitor_hermes(now_ms: int) -> None:
+    """READ-ONLY Hermes health check (neb-brain-hostinger).
+
+    Never writes Hermes' store: Hermes (hermes-gateway) is the sole writer, and
+    force-writing it both races the live gateway and rotates the shared OpenAI
+    refresh token (the refresh_token_reused collision). We only alert — and ONLY
+    when Hermes is ACTUALLY down: its access token is expired AND it has flagged
+    relogin_required. Silent (info-log only) otherwise, on every other host the
+    file is absent and this is a no-op."""
+    try:
+        h = read_hermes_pool()
+    except Exception as e:  # never let a monitor read break the watchdog
+        log.warning("hermes health read failed (non-fatal): %s", e)
+        return
+    if not h:
+        return  # no Hermes credential store on this host
+    acc_ms = int(h.get("expires", 0))
+    acc_hours = (acc_ms - now_ms) / 3_600_000 if acc_ms else 0.0
+    access_down = bool(acc_ms) and acc_ms <= now_ms
+    if access_down and h.get("relogin_required"):
+        log.error("Hermes codex auth is DOWN (access expired %.1fh ago + relogin_required)", -acc_hours)
+        _alert_slack(
+            "Hermes (Hostinger) codex auth is down: its access token has expired "
+            "and the credential pool needs an interactive re-login. Re-auth Hermes "
+            "on the box via its own flow to restore agent access."
+        )
+    else:
+        log.info(
+            "hermes health: access %.1fh remaining, relogin_required=%s — ok",
+            acc_hours, bool(h.get("relogin_required")),
+        )
 
 
 def _escalate() -> int:

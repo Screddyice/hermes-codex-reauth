@@ -72,13 +72,15 @@ def watchdog(tmp_path, monkeypatch):
     return mod
 
 
-def test_access_fresh_idtoken_expired_forces_refresh(watchdog, monkeypatch):
-    """The core regression: access token healthy (+200h) but id_token expired.
+def test_access_fresh_idtoken_expired_is_latent_no_action(watchdog, monkeypatch):
+    """Reactive-only (Hermes-safe): access token healthy (+200h) but id_token
+    expired.
 
-    Old behavior: hours_left > 0 -> 'token healthy — no action' (exit 0, no
-    refresh) -> the id_token rot is frozen forever.
-    New behavior: the gate sees the expired id_token, falls through, refreshes,
-    and the (scope-fixed) refresh mints a fresh id_token.
+    The watchdog must do NOTHING — it must NOT rotate the shared OpenAI refresh
+    token just to freshen a latent id_token, because that rotation would
+    invalidate Hermes' pooled copy of the same account (refresh_token_reused).
+    The latent id_token heals for free on the next genuine (access-expiry)
+    refresh, which now carries the openid scope.
     """
     mod = watchdog
     now_ms = int(time.time() * 1000)
@@ -96,29 +98,86 @@ def test_access_fresh_idtoken_expired_forces_refresh(watchdog, monkeypatch):
             "id_token_expires": now_ms - 29 * 3_600_000,    # id_token EXPIRED -29h
         },
     )
+    # No Hermes store on this host.
+    monkeypatch.setattr(mod, "read_hermes_pool", lambda *a, **k: None)
 
     refresh_called = {"n": 0}
+    monkeypatch.setattr(mod, "refresh_access_token", lambda rt: refresh_called.__setitem__("n", refresh_called["n"] + 1))
+    notified = {"n": 0}
+    monkeypatch.setattr(mod, "_notify_refresh", lambda *a, **k: notified.__setitem__("n", notified["n"] + 1))
+    escalated = {"n": 0}
+    monkeypatch.setattr(mod, "_escalate", lambda: escalated.__setitem__("n", escalated["n"] + 1) or 0)
+
+    rc = mod.main()
+    assert rc == 0
+    assert refresh_called["n"] == 0, "a latent expired id_token must NOT trigger a token rotation (Hermes-safe)"
+    assert notified["n"] == 0, "no refresh happened -> no notification"
+    assert escalated["n"] == 0
+
+
+def test_access_expired_refreshes_and_notifies(watchdog, monkeypatch):
+    """When the ACCESS token has actually expired, the watchdog refreshes, the
+    scoped refresh mints a fresh id_token, and exactly one notification fires
+    (a real refresh is the only routine event worth a ping)."""
+    mod = watchdog
+    now_ms = int(time.time() * 1000)
+    monkeypatch.setattr(mod, "discover_paths", lambda globs: [])
+    monkeypatch.setattr(mod, "read_current", lambda paths: None)
+    monkeypatch.setattr(
+        mod, "read_codex_cli_native",
+        lambda *a, **k: {
+            "provider": "openai-codex",
+            "access": _jwt(int(time.time()) - 3600),     # access EXPIRED
+            "refresh": "rt_old",
+            "expires": now_ms - 3_600_000,
+            "id_token_expires": now_ms - 5 * 3_600_000,
+        },
+    )
+    monkeypatch.setattr(mod, "read_hermes_pool", lambda *a, **k: None)
 
     def fake_refresh(rt):
-        refresh_called["n"] += 1
         from codex_oauth import CodexTokens
-        fresh_id = _jwt(int(time.time()) + 3600)
         return CodexTokens(
             access=_jwt(int(time.time()) + 3600), refresh="rt_new",
-            expires_ms=now_ms + 3_600_000, account_id="acct", id_token=fresh_id,
+            expires_ms=now_ms + 3_600_000, account_id="acct",
+            id_token=_jwt(int(time.time()) + 3600),  # fresh id_token from scoped refresh
         )
 
     monkeypatch.setattr(mod, "refresh_access_token", fake_refresh)
     monkeypatch.setattr(mod, "write_tokens", lambda paths, t: 0)
     monkeypatch.setattr(mod, "write_token_cache", lambda c, t: None)
     monkeypatch.setattr(mod, "write_codex_cli_native", lambda t: True)
-    escalated = {"n": 0}
-    monkeypatch.setattr(mod, "_escalate", lambda: escalated.__setitem__("n", escalated["n"] + 1) or 0)
-
+    notified = {"n": 0}
+    monkeypatch.setattr(mod, "_notify_refresh", lambda *a, **k: notified.__setitem__("n", notified["n"] + 1))
     rc = mod.main()
     assert rc == 0
-    assert refresh_called["n"] == 1, "expired id_token must force a refresh even when access is healthy"
-    assert escalated["n"] == 0, "a refresh that mints a fresh id_token must NOT escalate"
+    assert notified["n"] == 1, "an actual refresh must notify exactly once"
+
+
+def test_healthy_tick_is_silent(watchdog, monkeypatch):
+    """A fully-healthy tick must not notify (no constant pings)."""
+    mod = watchdog
+    now_ms = int(time.time() * 1000)
+    monkeypatch.setattr(mod, "discover_paths", lambda globs: [])
+    monkeypatch.setattr(mod, "read_current", lambda paths: None)
+    monkeypatch.setattr(
+        mod, "read_codex_cli_native",
+        lambda *a, **k: {
+            "provider": "openai-codex",
+            "access": _jwt(int(time.time()) + 200 * 3600),
+            "refresh": "rt_old",
+            "expires": now_ms + 200 * 3_600_000,
+            "id_token_expires": now_ms + 50 * 3_600_000,
+        },
+    )
+    monkeypatch.setattr(mod, "read_hermes_pool", lambda *a, **k: None)
+    notified = {"n": 0}
+    monkeypatch.setattr(mod, "_notify_refresh", lambda *a, **k: notified.__setitem__("n", notified["n"] + 1))
+    alerted = {"n": 0}
+    monkeypatch.setattr(mod, "_alert_slack", lambda *a, **k: alerted.__setitem__("n", alerted["n"] + 1))
+    rc = mod.main()
+    assert rc == 0
+    assert notified["n"] == 0 and alerted["n"] == 0, "healthy tick must be silent"
 
 
 def test_both_healthy_no_action(watchdog, monkeypatch):

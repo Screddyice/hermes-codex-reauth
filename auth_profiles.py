@@ -25,6 +25,12 @@ DEFAULT_GLOBS = [
     "~/.openclaw/agents/*/agent/auth-profiles.json",
 ]
 CODEX_CLI_AUTH_PATH = "~/.codex/auth.json"
+# Hermes' own credential store on the cloud box (neb-brain-hostinger). Hermes
+# (hermes-gateway) is the SOLE writer of this file — we only ever READ it, to
+# assess whether Hermes' codex auth has actually gone down. Force-writing it
+# would both race the live gateway and rotate the shared OpenAI refresh token
+# out from under Hermes (the exact refresh_token_reused collision we avoid).
+HERMES_AUTH_PATH = "~/.hermes/auth.json"
 
 
 def discover_paths(globs: list[str] | None = None) -> list[str]:
@@ -209,3 +215,45 @@ def write_codex_cli_native(
         return True
     except Exception:
         return False
+
+
+# ----------------------------- Hermes pool (~/.hermes/auth.json) — READ ONLY --
+def read_hermes_pool(path: str = HERMES_AUTH_PATH) -> dict | None:
+    """READ-ONLY view of Hermes' codex credentials, shaped like read_current's
+    output so the watchdog can assess Hermes health uniformly.
+
+    We never write this file (Hermes owns it). Returns None when the file is
+    missing (i.e. this host doesn't run Hermes) or has no usable tokens.
+
+    Adds two Hermes-specific keys on top of the standard profile:
+      - `relogin_required`: True when Hermes has recorded an unrecovered auth
+        error that needs an interactive re-login (e.g. refresh_token_reused).
+      - `last_refresh`: Hermes' own last successful refresh timestamp (ISO str).
+    """
+    p = os.path.expanduser(path)
+    try:
+        with open(p) as f:
+            d = json.load(f)
+    except Exception:
+        return None
+    prov = (d.get("providers") or {}).get(PROVIDER_NAME) or {}
+    tokens = prov.get("tokens") or {}
+    access = tokens.get("access_token")
+    refresh = tokens.get("refresh_token")
+    if not access or not refresh:
+        return None
+    profile: dict = {
+        "type": "oauth",
+        "provider": PROVIDER_NAME,
+        "mode": "oauth",
+        "access": access,
+        "refresh": refresh,
+        "expires": expires_ms_from_jwt(access),
+        "id_token_expires": id_token_expires_ms_from_jwt(tokens.get("id_token") or ""),
+        "scopes": ["openid", "profile", "email", "offline_access"],
+        "relogin_required": bool((prov.get("last_auth_error") or {}).get("relogin_required")),
+        "last_refresh": prov.get("last_refresh"),
+    }
+    if tokens.get("account_id"):
+        profile["accountId"] = tokens["account_id"]
+    return profile
