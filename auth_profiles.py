@@ -12,7 +12,11 @@ import json
 import os
 import time
 
-from codex_oauth import CodexTokens, expires_ms_from_jwt
+from codex_oauth import (
+    CodexTokens,
+    expires_ms_from_jwt,
+    id_token_expires_ms_from_jwt,
+)
 
 PROFILE_KEY = "openai-codex:codex-cli"
 PROVIDER_NAME = "openai-codex"
@@ -21,6 +25,12 @@ DEFAULT_GLOBS = [
     "~/.openclaw/agents/*/agent/auth-profiles.json",
 ]
 CODEX_CLI_AUTH_PATH = "~/.codex/auth.json"
+# Hermes' own credential store on the cloud box (neb-brain-hostinger). Hermes
+# (hermes-gateway) is the SOLE writer of this file — we only ever READ it, to
+# assess whether Hermes' codex auth has actually gone down. Force-writing it
+# would both race the live gateway and rotate the shared OpenAI refresh token
+# out from under Hermes (the exact refresh_token_reused collision we avoid).
+HERMES_AUTH_PATH = "~/.hermes/auth.json"
 
 
 def discover_paths(globs: list[str] | None = None) -> list[str]:
@@ -114,6 +124,10 @@ def read_codex_cli_native(path: str = CODEX_CLI_AUTH_PATH) -> dict | None:
     if not access or not refresh:
         return None
     expires_ms = expires_ms_from_jwt(access)
+    # Surface the id_token's TTL alongside the access token's so the watchdog can
+    # gate health on the SOONER of the two. 0 means "no id_token present" — the
+    # health gate treats that as nothing-to-enforce, not as expired.
+    id_expires_ms = id_token_expires_ms_from_jwt(tokens.get("id_token") or "")
     profile: dict = {
         "type": "oauth",
         "provider": PROVIDER_NAME,
@@ -121,6 +135,7 @@ def read_codex_cli_native(path: str = CODEX_CLI_AUTH_PATH) -> dict | None:
         "access": access,
         "refresh": refresh,
         "expires": expires_ms,
+        "id_token_expires": id_expires_ms,
         "scopes": ["openid", "profile", "email", "offline_access"],
     }
     if tokens.get("account_id"):
@@ -137,8 +152,17 @@ def write_codex_cli_native(
     """Merge fresh tokens into Codex CLI's native auth.json.
 
     Preserves any non-token fields already in the file (`auth_mode`,
-    `OPENAI_API_KEY`, etc.). If the response omitted `id_token`, the existing
-    id_token is preserved.
+    `OPENAI_API_KEY`, etc.).
+
+    id_token merge policy (the rot-prevention rule):
+      - If the fresh `tokens.id_token` is present, write it (it is current).
+      - Else, inspect the pre-existing id_token:
+          * still valid (exp > now) → keep it untouched.
+          * EXPIRED → drop it entirely (`pop`) so a dead id_token can never be
+            re-persisted, and stamp `needs_reauth = True` on the store so the
+            watchdog can detect that refresh-alone could not heal it and must
+            escalate to a full interactive login.
+      - If a fresh id_token IS present, clear any stale `needs_reauth` flag.
 
     By default this is a no-op when the file is missing — the watchdog should
     not invent a Codex CLI install where one doesn't exist. Pass
@@ -163,7 +187,22 @@ def write_codex_cli_native(
     existing["access_token"] = tokens.access
     existing["refresh_token"] = tokens.refresh
     if tokens.id_token:
+        # Fresh id_token — write it and clear any prior needs-reauth signal.
         existing["id_token"] = tokens.id_token
+        d.pop("needs_reauth", None)
+    else:
+        # Refresh response omitted id_token. Decide on the EXISTING one rather
+        # than blindly preserving it (the old bug that let id_tokens rot).
+        stale = existing.get("id_token")
+        if stale:
+            id_exp_ms = id_token_expires_ms_from_jwt(stale)
+            now_ms = int(time.time() * 1000)
+            if id_exp_ms and id_exp_ms <= now_ms:
+                # Dead id_token: never re-persist it, and signal needs-reauth so
+                # the watchdog escalates to a full login that mints a fresh one.
+                existing.pop("id_token", None)
+                d["needs_reauth"] = True
+            # else: still-valid id_token → leave it in place untouched.
     if tokens.account_id:
         existing["account_id"] = tokens.account_id
     d["tokens"] = existing
@@ -176,3 +215,45 @@ def write_codex_cli_native(
         return True
     except Exception:
         return False
+
+
+# ----------------------------- Hermes pool (~/.hermes/auth.json) — READ ONLY --
+def read_hermes_pool(path: str = HERMES_AUTH_PATH) -> dict | None:
+    """READ-ONLY view of Hermes' codex credentials, shaped like read_current's
+    output so the watchdog can assess Hermes health uniformly.
+
+    We never write this file (Hermes owns it). Returns None when the file is
+    missing (i.e. this host doesn't run Hermes) or has no usable tokens.
+
+    Adds two Hermes-specific keys on top of the standard profile:
+      - `relogin_required`: True when Hermes has recorded an unrecovered auth
+        error that needs an interactive re-login (e.g. refresh_token_reused).
+      - `last_refresh`: Hermes' own last successful refresh timestamp (ISO str).
+    """
+    p = os.path.expanduser(path)
+    try:
+        with open(p) as f:
+            d = json.load(f)
+    except Exception:
+        return None
+    prov = (d.get("providers") or {}).get(PROVIDER_NAME) or {}
+    tokens = prov.get("tokens") or {}
+    access = tokens.get("access_token")
+    refresh = tokens.get("refresh_token")
+    if not access or not refresh:
+        return None
+    profile: dict = {
+        "type": "oauth",
+        "provider": PROVIDER_NAME,
+        "mode": "oauth",
+        "access": access,
+        "refresh": refresh,
+        "expires": expires_ms_from_jwt(access),
+        "id_token_expires": id_token_expires_ms_from_jwt(tokens.get("id_token") or ""),
+        "scopes": ["openid", "profile", "email", "offline_access"],
+        "relogin_required": bool((prov.get("last_auth_error") or {}).get("relogin_required")),
+        "last_refresh": prov.get("last_refresh"),
+    }
+    if tokens.get("account_id"):
+        profile["accountId"] = tokens["account_id"]
+    return profile
