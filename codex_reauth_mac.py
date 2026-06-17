@@ -8,7 +8,7 @@ non-zero on both servers), run this on the Mac instead. It does the same
 Codex OAuth dance using the Mac's real Chrome (no Turnstile problem, real
 display, existing Google session), catches the auth code on localhost:1455,
 exchanges it for tokens, and pushes the fresh token pair to both servers
-via scp. Finally it restarts openclaw-gateway on each server over SSH.
+via scp. Finally it restarts hermes-gateway on each server over SSH.
 
 This is the escape hatch. Gmail involvement is still wired in — if OpenAI
 throws up an email-verification challenge during the Mac run, the same
@@ -28,7 +28,7 @@ The Mac config tells this script which servers to push to:
           "~/.openclaw/agents/*/agent/auth-profiles.json"
         ],
         "oauth_token_cache": "~/.openclaw/oauth-token-cache.json",
-        "restart_units": ["openclaw-gateway", "n8n-openclaw-bridge", "webhook-receiver"]
+        "restart_units": ["hermes-gateway", "n8n-openclaw-bridge", "webhook-receiver"]
       },
       { "ssh_alias": "server-b", ... }
     ]
@@ -79,7 +79,7 @@ DEFAULT_CONFIG = {
                 "~/.openclaw/agents/*/agent/auth-profiles.json",
             ],
             "oauth_token_cache": "~/.openclaw/oauth-token-cache.json",
-            "restart_units": ["openclaw-gateway", "n8n-openclaw-bridge", "webhook-receiver"],
+            "restart_units": ["hermes-gateway", "n8n-openclaw-bridge", "webhook-receiver"],
         },
         {
             "ssh_alias": "server-b",
@@ -88,11 +88,11 @@ DEFAULT_CONFIG = {
                 "~/.openclaw/agents/*/agent/auth-profiles.json",
             ],
             "oauth_token_cache": "~/.openclaw/oauth-token-cache.json",
-            "restart_units": ["openclaw-gateway", "webhook-receiver"],
+            "restart_units": ["hermes-gateway", "webhook-receiver"],
         },
     ],
     "logging": {
-        "log_file": "~/.openclaw-oauth/codex-reauth-mac.log",
+        "log_file": "~/.hermes-oauth/codex-reauth-mac.log",
         "level": "INFO",
     },
 }
@@ -346,7 +346,7 @@ def run(cfg: dict, dry_run: bool, log: logging.Logger) -> int:
     if _write_local_codex_cli(tokens, create_if_missing=True):
         log.info("wrote local Mac ~/.codex/auth.json")
 
-    profile_json = json.dumps(tokens.to_openclaw_profile())
+    profile_json = json.dumps(tokens.to_hermes_profile())
     cli_tokens_json = json.dumps(tokens.to_codex_cli_tokens())
     all_ok = True
     for server_cfg in cfg["servers"]:

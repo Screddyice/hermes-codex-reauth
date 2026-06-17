@@ -7,33 +7,42 @@
     "link_host_allowlist": ["openai.com", "auth.openai.com", "chatgpt.com"]
   },
   "codex": {
-    "openai_email": "you@example.com",
+    "openai_email": "shawn@teamnebula.ai",
     "callback_host": "127.0.0.1",
     "callback_port": 1455,
     "callback_path": "/auth/callback"
   },
   "servers": [
     {
-      "ssh_alias": "server-a",
+      "ssh_alias": "neb-server",
       "remote_paths": [
         "~/.openclaw/auth-profiles.json",
         "~/.openclaw/agents/*/agent/auth-profiles.json"
       ],
       "oauth_token_cache": "~/.openclaw/oauth-token-cache.json",
-      "restart_units": ["hermes-gateway", "n8n-openclaw-bridge", "webhook-receiver"]
+      "restart_units": ["openclaw-gateway", "webhook-receiver", "n8n-openclaw-bridge"]
     },
     {
-      "ssh_alias": "server-b",
+      "ssh_alias": "cliqk-server",
       "remote_paths": [
         "~/.openclaw/auth-profiles.json",
         "~/.openclaw/agents/*/agent/auth-profiles.json"
       ],
       "oauth_token_cache": "~/.openclaw/oauth-token-cache.json",
-      "restart_units": ["hermes-gateway", "webhook-receiver"]
+      "restart_units": ["openclaw-gateway", "webhook-receiver"]
+    },
+    {
+      "ssh_alias": "trc-server",
+      "remote_paths": [
+        "~/.openclaw/auth-profiles.json",
+        "~/.openclaw/agents/*/agent/auth-profiles.json"
+      ],
+      "oauth_token_cache": "~/.openclaw/oauth-token-cache.json",
+      "restart_units": ["openclaw-gateway", "webhook-receiver"]
     }
   ],
   "logging": {
-    "log_file": "~/.hermes-oauth/codex-reauth-mac.log",
+    "log_file": "~/.openclaw-oauth/codex-reauth-mac.log",
     "level": "INFO"
   }
 }

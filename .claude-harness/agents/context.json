@@ -1,0 +1,24 @@
+{
+  "version": 3,
+  "lastUpdated": "2026-05-07T23:15:57Z",
+  "currentSession": null,
+  "projectContext": {
+    "name": "openclaw-codex-reauth",
+    "techStack": ["Python"],
+    "testingFramework": "pytest",
+    "buildCommand": "",
+    "testCommand": "pytest"
+  },
+  "architecturalDecisions": [],
+  "activeConstraints": [],
+  "sharedState": {
+    "discoveredPatterns": {},
+    "fileIndex": {
+      "components": [],
+      "apiRoutes": [],
+      "tests": [],
+      "configs": []
+    }
+  },
+  "agentResults": []
+}

@@ -21,7 +21,7 @@ Install as a 15-minute cron job on each server:
 
   */15 * * * * /home/ubuntu/codex-reauth/venv/bin/python \\
                /home/ubuntu/codex-reauth/codex_watchdog.py \\
-               >> /home/ubuntu/.openclaw-oauth/watchdog.log 2>&1
+               >> /home/ubuntu/.hermes-oauth/watchdog.log 2>&1
 """
 from __future__ import annotations
 
@@ -55,12 +55,14 @@ REFRESH_BUFFER_HOURS = 0  # reactive: refresh only after the token has actually 
 # refresh there would rotate the shared token and break Hermes. Monitoring is
 # all we want on that host.
 MONITOR_ONLY = os.environ.get("WATCHDOG_MONITOR_ONLY", "") == "1"
+# LEGACY openclaw store (openclaw retired) — fallback for un-migrated hosts only.
+# The live Hermes credential source is ~/.hermes/auth.json (see read_hermes_pool).
 DEFAULT_GLOBS = [
     "~/.openclaw/auth-profiles.json",
     "~/.openclaw/agents/*/agent/auth-profiles.json",
 ]
 OAUTH_CACHE = "~/.openclaw/oauth-token-cache.json"
-ESCALATION_STATE_FILE = os.path.expanduser("~/.openclaw-oauth/watchdog-escalation-state.json")
+ESCALATION_STATE_FILE = os.path.expanduser("~/.hermes-oauth/watchdog-escalation-state.json")
 ESCALATION_ALERT_THRESHOLD = 2
 SLACK_ALERT_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "deploy", "slack-alert.sh")
 PROXY_ENV_FILE = os.path.expanduser("~/.openclaw/residential-proxy.env")
@@ -71,8 +73,8 @@ SERVER_REAUTH_SCRIPT = os.path.join(
 # the disconnect alert has fired. The Mac-side reactive trigger watches for this
 # flag and runs the interactive Mac re-auth flow. Cleared when the server
 # recovers (healthy refresh or successful escalation).
-REAUTH_FLAG_FILE = os.path.expanduser("~/.openclaw-oauth/reauth-requested.flag")
-LOG_DIR = os.path.expanduser("~/.openclaw-oauth")
+REAUTH_FLAG_FILE = os.path.expanduser("~/.hermes-oauth/reauth-requested.flag")
+LOG_DIR = os.path.expanduser("~/.hermes-oauth")
 os.makedirs(LOG_DIR, exist_ok=True)
 
 log = logging.getLogger("codex-watchdog")
@@ -166,16 +168,16 @@ def main() -> int:
         log.warning("refresh failed transiently: %s", e)
         return 2
 
-    # Dual-write: keep both stores in lock-step so Codex CLI itself and openclaw
-    # agents both see fresh tokens after a refresh. write_codex_cli_native is a
-    # no-op if ~/.codex/auth.json doesn't exist on this host.
-    openclaw_updated = write_tokens(paths, tokens)
+    # Dual-write: keep both stores in lock-step so Codex CLI itself and any
+    # legacy openclaw profiles both see fresh tokens after a refresh.
+    # write_codex_cli_native is a no-op if ~/.codex/auth.json doesn't exist here.
+    legacy_profiles_updated = write_tokens(paths, tokens)
     write_token_cache(OAUTH_CACHE, tokens)
     codex_cli_updated = write_codex_cli_native(tokens)
     new_hours = (tokens.expires_ms - now_ms) / 3_600_000
     log.info(
-        "API refresh OK, new access token expires in %.1fh (openclaw=%d codex-cli=%s)",
-        new_hours, openclaw_updated, "yes" if codex_cli_updated else "no",
+        "API refresh OK, new access token expires in %.1fh (legacy-profiles=%d codex-cli=%s)",
+        new_hours, legacy_profiles_updated, "yes" if codex_cli_updated else "no",
     )
 
     # Post-refresh verification: confirm the refresh actually minted a usable

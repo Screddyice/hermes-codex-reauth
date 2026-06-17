@@ -1,7 +1,7 @@
 """Verify read/write contract for Codex CLI 0.128.0+'s native ~/.codex/auth.json.
 
 Locks in:
-  - read returns openclaw-shaped profile when the file is valid
+  - read returns hermes-shaped profile when the file is valid
   - read returns None when missing or malformed
   - write merges into existing file preserving non-token fields
   - write no-ops on missing file unless create_if_missing=True

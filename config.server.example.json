@@ -9,7 +9,7 @@
   "codex": {
     "openai_email": "you@example.com",
     "chrome_path": "/usr/bin/google-chrome-stable",
-    "chrome_profile_dir": "~/.openclaw-oauth/chrome-profile",
+    "chrome_profile_dir": "~/.hermes-oauth/chrome-profile",
     "cdp_port": 9333,
     "callback_host": "127.0.0.1",
     "callback_port": 1455,
@@ -27,10 +27,10 @@
     "oauth_token_cache": "~/.openclaw/oauth-token-cache.json"
   },
   "gateway": {
-    "systemd_user_units": ["openclaw-gateway"]
+    "systemd_user_units": ["hermes-gateway"]
   },
   "logging": {
-    "log_file": "~/.openclaw-oauth/codex-reauth.log",
+    "log_file": "~/.hermes-oauth/codex-reauth.log",
     "level": "INFO"
   }
 }

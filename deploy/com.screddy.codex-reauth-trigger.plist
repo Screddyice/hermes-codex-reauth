@@ -26,8 +26,8 @@
     <true/>
 
     <key>StandardOutPath</key>
-    <string>/Users/screddy/.openclaw-oauth/mac-reauth-trigger.launchd.log</string>
+    <string>/Users/screddy/.hermes-oauth/mac-reauth-trigger.launchd.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/screddy/.openclaw-oauth/mac-reauth-trigger.launchd.log</string>
+    <string>/Users/screddy/.hermes-oauth/mac-reauth-trigger.launchd.log</string>
 </dict>
 </plist>

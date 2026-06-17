@@ -22,9 +22,9 @@ from auth_profiles import write_tokens
 
 
 class _FakeTokens:
-    """Minimal stand-in for CodexTokens — only to_openclaw_profile() is called."""
+    """Minimal stand-in for CodexTokens — only to_hermes_profile() is called."""
 
-    def to_openclaw_profile(self) -> dict:
+    def to_hermes_profile(self) -> dict:
         return {
             "type": "oauth",
             "provider": "openai-codex",

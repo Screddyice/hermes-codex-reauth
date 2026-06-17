@@ -27,16 +27,16 @@ import sys
 import time
 from pathlib import Path
 
-# hostinger runs Hermes (not openclaw-gateway) and codex is not installed there,
+# hostinger runs Hermes (not hermes-gateway) and codex is not installed there,
 # so it self-heals on access_token alone and rarely sets the flag — but it IS in
 # config.mac.json, so the reactive path should still observe its flag if one ever
 # appears rather than being structurally blind to the Hermes box.
 SERVERS = ["neb-server", "cliqk-server", "trc-server", "hostinger"]
-REMOTE_FLAG = "~/.openclaw-oauth/reauth-requested.flag"
+REMOTE_FLAG = "~/.hermes-oauth/reauth-requested.flag"
 REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REAUTH_SCRIPT = os.path.join(REPO_DIR, "codex_reauth_mac.py")
-LOG_FILE = os.path.expanduser("~/.openclaw-oauth/mac-reauth-trigger.log")
-LAST_ATTEMPT_FILE = os.path.expanduser("~/.openclaw-oauth/mac-reauth-last-attempt")
+LOG_FILE = os.path.expanduser("~/.hermes-oauth/mac-reauth-trigger.log")
+LAST_ATTEMPT_FILE = os.path.expanduser("~/.hermes-oauth/mac-reauth-last-attempt")
 THROTTLE_HOURS = 3
 SSH_OPTS = ["-o", "ConnectTimeout=15", "-o", "BatchMode=yes"]
 

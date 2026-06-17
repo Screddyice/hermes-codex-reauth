@@ -39,7 +39,7 @@ class CodexTokens:
     account_id: str | None
     id_token: str | None = None
 
-    def to_openclaw_profile(self) -> dict:
+    def to_hermes_profile(self) -> dict:
         """Serialize into the shape openclaw expects at profile slot
         `openai-codex:codex-cli` inside auth-profiles.json."""
         return {

@@ -1,9 +1,15 @@
-"""Read/write openai-codex tokens into openclaw's auth-profiles.json files
-and into Codex CLI 0.128.0+'s native `~/.codex/auth.json` store.
+"""Read/write openai-codex tokens across the codex auth stores.
 
-Scope: only the `openai-codex:codex-cli` slot in openclaw, and only the
-`tokens` block (plus `last_refresh`) in the Codex CLI native file. Other
-providers and other fields are left alone.
+Stores, in order of current relevance:
+  - Hermes credential pool `~/.hermes/auth.json` — the LIVE store (Hermes is the
+    platform now). Read-only here via `read_hermes_pool` (Hermes owns writes).
+  - Codex CLI 0.128.0+ native `~/.codex/auth.json` — the `tokens` block.
+  - LEGACY openclaw `~/.openclaw/auth-profiles.json` (the `openai-codex:codex-cli`
+    slot) — openclaw is retired; kept only as a fallback for any host not yet
+    migrated. Deliberately NOT relocated into `~/.hermes/` so it can't collide
+    with the live Hermes pool above.
+
+Only the codex token slots are touched; other providers/fields are left alone.
 """
 from __future__ import annotations
 
@@ -20,6 +26,7 @@ from codex_oauth import (
 
 PROFILE_KEY = "openai-codex:codex-cli"
 PROVIDER_NAME = "openai-codex"
+# LEGACY openclaw auth-profiles store (openclaw retired) — fallback only.
 DEFAULT_GLOBS = [
     "~/.openclaw/auth-profiles.json",
     "~/.openclaw/agents/*/agent/auth-profiles.json",
@@ -65,7 +72,7 @@ def write_tokens(paths: list[str], tokens: CodexTokens) -> int:
 
     Returns the number of files successfully updated.
     """
-    new_profile = tokens.to_openclaw_profile()
+    new_profile = tokens.to_hermes_profile()
     updated = 0
     for p in paths:
         try:
@@ -107,7 +114,7 @@ def write_token_cache(cache_path: str, tokens: CodexTokens) -> None:
 
 # ----------------------------- Codex CLI native (~/.codex/auth.json) ---------
 def read_codex_cli_native(path: str = CODEX_CLI_AUTH_PATH) -> dict | None:
-    """Read tokens from Codex CLI's native auth.json, return an openclaw-shaped
+    """Read tokens from Codex CLI's native auth.json, return an hermes-shaped
     profile dict (so callers can treat it identically to read_current's output).
 
     Returns None if the file is missing, malformed, or has no tokens.

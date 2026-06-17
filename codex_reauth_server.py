@@ -74,7 +74,7 @@ DEFAULT_CONFIG = {
         "openai_email": "you@example.com",
         "openai_password": "",  # set in config.server.json (mode 600). Empty = SSO-only flow.
         "chrome_path": "/usr/bin/google-chrome-stable",
-        "chrome_profile_dir": "~/.openclaw-oauth/chrome-profile",
+        "chrome_profile_dir": "~/.hermes-oauth/chrome-profile",
         "cdp_port": 9333,
         "callback_host": "127.0.0.1",
         "callback_port": 1455,
@@ -92,10 +92,10 @@ DEFAULT_CONFIG = {
         "oauth_token_cache": "~/.openclaw/oauth-token-cache.json",
     },
     "gateway": {
-        "systemd_user_units": ["openclaw-gateway"],
+        "systemd_user_units": ["hermes-gateway"],
     },
     "logging": {
-        "log_file": "~/.openclaw-oauth/codex-reauth.log",
+        "log_file": "~/.hermes-oauth/codex-reauth.log",
         "level": "INFO",
     },
 }
@@ -535,13 +535,13 @@ def _jitter(low: int, high: int) -> int:
 
 
 def _dump_debug(page, log: logging.Logger, label: str) -> None:
-    """Save screenshot + page HTML + url/title to ~/.openclaw-oauth/debug/.
+    """Save screenshot + page HTML + url/title to ~/.hermes-oauth/debug/.
 
     Forensic only — we want to know exactly what page Chrome was on when the
     flow timed out. Cheap insurance: each dump is a few hundred KB.
     """
     try:
-        debug_dir = os.path.expanduser("~/.openclaw-oauth/debug")
+        debug_dir = os.path.expanduser("~/.hermes-oauth/debug")
         os.makedirs(debug_dir, exist_ok=True)
         ts = time.strftime("%Y%m%dT%H%M%S")
         prefix = os.path.join(debug_dir, f"{ts}-{label}")

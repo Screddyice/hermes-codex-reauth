@@ -214,7 +214,7 @@ EOF
 
 **Rationale:** Covers the third monitoring layer from the spec: *"codex_reauth_server.py escalation fails 2x consecutive → watchdog posts Slack alert."* Without this, if both the systemd `OnFailure=` hook and the daily health-check miss a failure mode (e.g., the tunnel is up but OpenAI still rejects even the residential IP), re-auth can fail silently until Shawn notices Codex broke.
 
-State is persisted to `~/.openclaw-oauth/watchdog-escalation-state.json` so consecutive failures are tracked across cron runs. Reset to 0 on any success.
+State is persisted to `~/.hermes-oauth/watchdog-escalation-state.json` so consecutive failures are tracked across cron runs. Reset to 0 on any success.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -303,7 +303,7 @@ Expected: **FAIL** — `ESCALATION_STATE_FILE` and `_alert_slack` don't exist ye
 Add these module-level constants near the top of `codex_watchdog.py`, right after the existing `OAUTH_CACHE` line:
 
 ```python
-ESCALATION_STATE_FILE = os.path.expanduser("~/.openclaw-oauth/watchdog-escalation-state.json")
+ESCALATION_STATE_FILE = os.path.expanduser("~/.hermes-oauth/watchdog-escalation-state.json")
 ESCALATION_ALERT_THRESHOLD = 2
 SLACK_ALERT_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "deploy", "slack-alert.sh")
 PROXY_ENV_FILE = os.path.expanduser("~/.openclaw/residential-proxy.env")
@@ -408,7 +408,7 @@ git commit -m "$(cat <<'EOF'
 feat: watchdog alerts Slack after 2 consecutive escalation failures
 
 Persists consecutive-failure count to
-~/.openclaw-oauth/watchdog-escalation-state.json. When the count reaches 2,
+~/.hermes-oauth/watchdog-escalation-state.json. When the count reaches 2,
 the watchdog invokes deploy/slack-alert.sh with context about likely
 causes (proxy down, IP rotated, OpenAI rejection). Counter resets to 0 on
 any successful escalation. Alert failures are non-fatal — the watchdog
@@ -447,8 +447,8 @@ EnvironmentFile=%h/.openclaw/residential-proxy.env
 ExecStart=/usr/local/bin/gost -L socks5://127.0.0.1:1080 -F "socks5://${IPROYAL_USER}:${IPROYAL_PASS}@${IPROYAL_HOST}:${IPROYAL_PORT}"
 Restart=always
 RestartSec=10
-StandardOutput=append:%h/.openclaw-oauth/residential-proxy.log
-StandardError=append:%h/.openclaw-oauth/residential-proxy.log
+StandardOutput=append:%h/.hermes-oauth/residential-proxy.log
+StandardError=append:%h/.hermes-oauth/residential-proxy.log
 OnFailure=residential-proxy-alert.service
 
 [Install]
@@ -706,7 +706,7 @@ fi
 
 # 3. Ensure systemd user dir exists
 mkdir -p "$UNIT_DIR"
-mkdir -p "$HOME/.openclaw-oauth"
+mkdir -p "$HOME/.hermes-oauth"
 
 # 4. Install systemd units
 cp "$DEPLOY_DIR/residential-proxy.service" "$UNIT_DIR/residential-proxy.service"
@@ -745,7 +745,7 @@ fi
 log "tunnel egress verified: $OBSERVED"
 
 # 9. Install daily health-check cron (idempotent)
-CRON_LINE="0 9 * * * $DEPLOY_DIR/health-check.sh >> $HOME/.openclaw-oauth/residential-proxy-healthcheck.log 2>&1"
+CRON_LINE="0 9 * * * $DEPLOY_DIR/health-check.sh >> $HOME/.hermes-oauth/residential-proxy-healthcheck.log 2>&1"
 ( crontab -l 2>/dev/null | grep -vF "$DEPLOY_DIR/health-check.sh"; echo "$CRON_LINE" ) | crontab -
 log "daily health-check cron installed"
 
@@ -1019,7 +1019,7 @@ Expected: `health-check OK (<ip>)`.
 - [ ] **Step 7: Leave it running, watch logs for 1 hour**
 
 ```bash
-ssh neb-server 'tail -F ~/.openclaw-oauth/residential-proxy.log'
+ssh neb-server 'tail -F ~/.hermes-oauth/residential-proxy.log'
 ```
 
 Expected: quiet (no restarts, no errors). Ctrl-C when satisfied.
