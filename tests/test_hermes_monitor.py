@@ -125,3 +125,23 @@ def test_hermes_only_box_monitors_never_refreshes(wd, tmp_path, monkeypatch):
     rc = mod.main()
     assert rc == 0
     assert refreshed["n"] == 0 and escalated["n"] == 0, "Hermes box must be monitored, never refreshed/escalated by us"
+
+
+def test_monitor_only_mode_never_touches_codex_store(wd, monkeypatch):
+    """WATCHDOG_MONITOR_ONLY=1 (the Hermes-box deployment): main() only monitors
+    Hermes and must NOT read or refresh any codex token store — reading/refreshing
+    would risk rotating the shared OpenAI token out from under the live pool."""
+    mod = wd
+    monkeypatch.setattr(mod, "MONITOR_ONLY", True)
+
+    def _boom(*a, **k):
+        raise AssertionError("monitor-only must not touch any codex token store")
+
+    monkeypatch.setattr(mod, "discover_paths", _boom)
+    monkeypatch.setattr(mod, "read_codex_cli_native", _boom)
+    monkeypatch.setattr(mod, "refresh_access_token", _boom)
+    monitored = {"n": 0}
+    monkeypatch.setattr(mod, "_monitor_hermes", lambda now_ms: monitored.__setitem__("n", monitored["n"] + 1))
+    rc = mod.main()
+    assert rc == 0
+    assert monitored["n"] == 1, "monitor-only must run exactly the Hermes monitor"

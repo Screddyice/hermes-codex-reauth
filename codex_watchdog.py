@@ -48,6 +48,13 @@ from codex_oauth import (
 )
 
 REFRESH_BUFFER_HOURS = 0  # reactive: refresh only after the token has actually expired
+# Monitor-only deployment (set WATCHDOG_MONITOR_ONLY=1 in the cron env): the
+# watchdog ONLY checks Hermes health and never reads or refreshes any codex
+# token store. Use this on the Hermes box (neb-brain-hostinger), where a stray
+# ~/.codex/auth.json shares the same OpenAI account as the live Hermes pool — a
+# refresh there would rotate the shared token and break Hermes. Monitoring is
+# all we want on that host.
+MONITOR_ONLY = os.environ.get("WATCHDOG_MONITOR_ONLY", "") == "1"
 DEFAULT_GLOBS = [
     "~/.openclaw/auth-profiles.json",
     "~/.openclaw/agents/*/agent/auth-profiles.json",
@@ -90,6 +97,12 @@ def _is_invalid_grant(err: Exception) -> bool:
 
 def main() -> int:
     now_ms = int(time.time() * 1000)
+    if MONITOR_ONLY:
+        # Hermes box: never touch a codex token store (rotating the shared
+        # OpenAI refresh token would break the live Hermes pool). Just monitor.
+        log.info("monitor-only mode — checking Hermes health, not touching any codex token store")
+        _monitor_hermes(now_ms)
+        return 0
     paths = discover_paths(DEFAULT_GLOBS)
     current = read_current(paths)
     source = "openclaw"
