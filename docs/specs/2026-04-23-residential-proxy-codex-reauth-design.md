@@ -12,7 +12,7 @@ Current workaround: Shawn's Mac runs a reverse SSH SOCKS tunnel (`mac_proxy_tunn
 
 ### Evidence
 
-- `~/.openclaw-oauth/codex-reauth.log` on both servers shows repeated attempts ending with `ERROR no /auth/callback received within timeout (acted_on_email=False)`
+- `~/.hermes-oauth/codex-reauth.log` on both servers shows repeated attempts ending with `ERROR no /auth/callback received within timeout (acted_on_email=False)`
 - Every failed attempt logs `no SOCKS proxy on :1080, using direct connection` — the residential path was not available
 - Most recent attempt on neb-server (2026-04-21) failed the same way
 - Gmail credentials are healthy (valid refresh token for `shawn.reddy1@gmail.com`) — Gmail access is NOT the bottleneck

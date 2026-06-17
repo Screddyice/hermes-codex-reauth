@@ -55,7 +55,7 @@ cp config.server.example.json config.server.json
 #      { "client_id", "client_secret", "refresh_token", "token_uri", "email" }
 
 # 4. Install the watchdog on a 3h cron (recovery escalation handles brief downtime)
-crontab -l 2>/dev/null | { cat; echo "0 */3 * * * $HOME/codex-reauth/venv/bin/python $HOME/codex-reauth/codex_watchdog.py >> $HOME/.openclaw-oauth/watchdog.log 2>&1"; } | crontab -
+crontab -l 2>/dev/null | { cat; echo "0 */3 * * * $HOME/codex-reauth/venv/bin/python $HOME/codex-reauth/codex_watchdog.py >> $HOME/.hermes-oauth/watchdog.log 2>&1"; } | crontab -
 
 # 5. Bring up a residential exit (one of the two patterns above) so the
 #    recovery flow has a non-datacenter IP to use.
@@ -78,7 +78,7 @@ crontab -l | grep codex_watchdog.py
 ~/codex-reauth/venv/bin/python ~/codex-reauth/codex_reauth_server.py
 #    Expect ~25s runtime; final lines should be:
 #      "wrote N auth-profiles.json files + oauth-token-cache.json + codex-cli-native=yes"
-#      "restarted openclaw-gateway"
+#      "restarted hermes-gateway"
 ```
 
 If you hand-seeded `~/.openclaw/auth-profiles.json` from `oauth-token-cache.json` rather than letting `codex_reauth_server.py` create it, double-check that `lastGood` is a **dict** keyed by provider, not a bare string:

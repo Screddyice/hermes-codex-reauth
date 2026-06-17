@@ -47,7 +47,7 @@ fi
 
 # 3. Ensure systemd user dir exists
 mkdir -p "$UNIT_DIR"
-mkdir -p "$HOME/.openclaw-oauth"
+mkdir -p "$HOME/.hermes-oauth"
 
 # 4. Install systemd units
 cp "$DEPLOY_DIR/residential-proxy.service" "$UNIT_DIR/residential-proxy.service"
@@ -93,7 +93,7 @@ fi
 log "tunnel egress verified: $OBSERVED"
 
 # 9. Install daily health-check cron (idempotent)
-CRON_LINE="0 9 * * * $DEPLOY_DIR/health-check.sh >> $HOME/.openclaw-oauth/residential-proxy-healthcheck.log 2>&1"
+CRON_LINE="0 9 * * * $DEPLOY_DIR/health-check.sh >> $HOME/.hermes-oauth/residential-proxy-healthcheck.log 2>&1"
 ( crontab -l 2>/dev/null | grep -vF "$DEPLOY_DIR/health-check.sh"; echo "$CRON_LINE" ) | crontab -
 log "daily health-check cron installed"
 
