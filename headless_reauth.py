@@ -544,9 +544,17 @@ def launch_chrome_cdp(server_name, headed=True):
     if pcfg["enabled"]:
         if pcfg["mode"] == "userpass":
             from proxy_forwarder import CredentialInjectingForwarder
+            # Defensively clear any stale listener (e.g. a previous run's forwarder
+            # that wasn't cleaned up) on the local forwarder port before binding —
+            # SO_REUSEADDR does not help against an actively-listening process.
+            fwd_port = pcfg["local_forwarder_port"]
+            subprocess.run(
+                f"lsof -ti:{fwd_port} 2>/dev/null | xargs kill -9 2>/dev/null",
+                shell=True, capture_output=True,
+            )
             forwarder = CredentialInjectingForwarder(
                 pcfg["host"], pcfg["port"], pcfg["username"], pcfg["password"],
-                local_host="127.0.0.1", local_port=pcfg["local_forwarder_port"],
+                local_host="127.0.0.1", local_port=fwd_port,
             )
             forwarder.start()
             proxy_server = f"http://127.0.0.1:{forwarder.port}"
@@ -805,7 +813,11 @@ def run_claude_reauth(server_name, server, headed=False, dry_run=False):
 
     log(f"[{server_name}] Launching browser for claude.ai OAuth ({email})...")
 
-    chrome_proc, cdp_port, forwarder = launch_chrome_cdp(server_name, headed)
+    try:
+        chrome_proc, cdp_port, forwarder = launch_chrome_cdp(server_name, headed)
+    except OSError as e:
+        # Most commonly a local forwarder bind failure (port already in use).
+        return {"success": False, "message": f"Failed to launch Chrome/proxy forwarder: {e}"}
 
     with sync_playwright() as p:
         try:
@@ -1020,7 +1032,11 @@ def run_chatgpt_reauth(server_name, server, headed=False, dry_run=False):
 
     log(f"[{server_name}] Launching browser for chatgpt.com via Google ({email})...")
 
-    chrome_proc, cdp_port, forwarder = launch_chrome_cdp(server_name, headed)
+    try:
+        chrome_proc, cdp_port, forwarder = launch_chrome_cdp(server_name, headed)
+    except OSError as e:
+        # Most commonly a local forwarder bind failure (port already in use).
+        return {"success": False, "message": f"Failed to launch Chrome/proxy forwarder: {e}"}
 
     with sync_playwright() as p:
         try:
@@ -1315,7 +1331,13 @@ def main():
 
         for attempt in range(1, args.max_attempts + 1):
             log(f"[{server_name}] Attempt {attempt}/{args.max_attempts}")
-            result = run_reauth_for_server(server_name, args.headed, args.dry_run)
+            try:
+                result = run_reauth_for_server(server_name, args.headed, args.dry_run)
+            except Exception as e:
+                # An unhandled exception (e.g. a forwarder bind failure) must fail
+                # only this server's attempt, not abort the entire --all run.
+                log(f"[{server_name}] Unhandled error: {e}")
+                result = {"success": False, "message": f"Unhandled error: {e}"}
 
             if result["success"]:
                 log(f"SUCCESS: {result['message']}")
