@@ -31,5 +31,13 @@
   "slack": {
     "bot_token": "",
     "channel": ""
+  },
+  "proxy": {
+    "enabled": false,
+    "mode": "ip_auth",
+    "endpoint": "p.webshare.io:80",
+    "username": "",
+    "password": "",
+    "local_forwarder_port": 1080
   }
 }

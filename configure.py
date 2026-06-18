@@ -17,7 +17,7 @@ import sys
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
 VALID_SECTIONS = ["role", "provider", "credentials", "distribution", "servers",
-                  "gmail", "slack", "schedule", "all"]
+                  "gmail", "slack", "proxy", "schedule", "all"]
 
 
 def ask_choice(prompt, options):
@@ -185,6 +185,37 @@ def ask_headless(config, env):
     return config
 
 
+def ask_proxy(config):
+    print("\n--- Residential Proxy (Webshare) ---")
+    print("Datacenter server IPs get provider sign-in blocked / verification emails suppressed.")
+    if not ask_yn("Route headless logins through a Webshare residential proxy?", default=False):
+        config["proxy"] = {"enabled": False, "mode": "ip_auth",
+                           "endpoint": "p.webshare.io:80", "username": "",
+                           "password": "", "local_forwarder_port": 1080}
+        return config
+    mode = ask_choice("Webshare auth mode?", [
+        ("IP whitelist (server IP authorized in Webshare dashboard) — recommended", "ip_auth"),
+        ("Username/password (local credential forwarder)", "userpass"),
+    ])
+    proxy = {
+        "enabled": True,
+        "mode": mode,
+        "endpoint": ask_text("Webshare endpoint host:port", default="p.webshare.io:80"),
+        "username": "",
+        "password": "",
+        "local_forwarder_port": 1080,
+    }
+    if mode == "userpass":
+        proxy["username"] = ask_text("Webshare proxy username")
+        proxy["password"] = ask_text("Webshare proxy password")
+        proxy["local_forwarder_port"] = int(ask_text("Local forwarder port", default="1080"))
+    else:
+        print("\n  IP-auth mode: whitelist this server's egress IP in the Webshare dashboard")
+        print("  (Proxy > IP Authorization). See docs/DEPLOY-webshare-proxy.md.")
+    config["proxy"] = proxy
+    return config
+
+
 def ask_notifications(config):
     if not ask_yn("Send Slack alerts on failure?", default=False):
         config["slack"] = {"bot_token": "", "channel": ""}
@@ -312,6 +343,9 @@ def write_config(config, path=None):
                                             "refresh_token": "", "token_uri": "https://oauth2.googleapis.com/token",
                                             "email": ""}})
     config.setdefault("slack", {"bot_token": "", "channel": ""})
+    config.setdefault("proxy", {"enabled": False, "mode": "ip_auth",
+                                "endpoint": "p.webshare.io:80", "username": "",
+                                "password": "", "local_forwarder_port": 1080})
 
     with open(path, "w") as f:
         json.dump(config, f, indent=2)
@@ -330,6 +364,7 @@ SECTION_MAP = {
     "servers": ask_remote_servers,
     "notifications": ask_notifications,
     "slack": ask_notifications,
+    "proxy": ask_proxy,
 }
 
 
@@ -387,6 +422,7 @@ def main():
     config = ask_distribution(config)
     config = ask_remote_servers(config)
     config = ask_headless(config, env)
+    config = ask_proxy(config)
     config = ask_notifications(config)
     config = ask_schedule(config, env)
     install_dependencies(config, env)

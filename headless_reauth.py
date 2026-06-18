@@ -170,6 +170,34 @@ def get_browser_profile_dir(server_name):
     return d
 
 
+def get_proxy_config():
+    """Return the proxy config block with defaults applied.
+
+    Shape: {enabled, mode, endpoint(host:port no scheme), host, port, username,
+    password, local_forwarder_port}. The endpoint is normalized by stripping a
+    leading http://|https:// and splitting host:port, because Chrome wants
+    http://host:port for --proxy-server but the forwarder and curl-style
+    verification want bare host:port.
+    """
+    cfg = get_config().get("proxy", {}) or {}
+    endpoint = (cfg.get("endpoint") or "p.webshare.io:80").strip()
+    for scheme in ("http://", "https://"):
+        if endpoint.startswith(scheme):
+            endpoint = endpoint[len(scheme):]
+    endpoint = endpoint.rstrip("/")
+    host, _, port = endpoint.partition(":")
+    return {
+        "enabled": bool(cfg.get("enabled", False)),
+        "mode": cfg.get("mode", "ip_auth"),
+        "endpoint": endpoint,                  # e.g. "p.webshare.io:80"
+        "host": host,                          # e.g. "p.webshare.io"
+        "port": int(port) if port else 80,
+        "username": cfg.get("username", ""),
+        "password": cfg.get("password", ""),
+        "local_forwarder_port": int(cfg.get("local_forwarder_port", 1080)),
+    }
+
+
 # ============================================================
 # Gmail code reader (optional — for magic link login)
 # ============================================================
@@ -472,11 +500,16 @@ def _wait_for_cloudflare_clearance(page, server_name, max_wait=90):
 # ============================================================
 
 def launch_chrome_cdp(server_name, headed=True):
-    """Launch real Chrome with remote debugging and return (process, port).
+    """Launch real Chrome with remote debugging and return (process, port, forwarder).
 
     Uses real system Chrome instead of Playwright's Chromium to bypass
     Cloudflare Turnstile bot detection. Playwright's launch() injects
     --enable-automation which Cloudflare fingerprints.
+
+    When the proxy config is enabled, also attaches a Webshare residential proxy:
+    ip_auth mode points Chrome directly at the Webshare endpoint; userpass mode
+    starts a local credential-injecting forwarder (returned as the third element)
+    and points Chrome at it. ``forwarder`` is None unless userpass started one.
     """
     chrome_path = get_chrome_path()
     profile_dir = get_browser_profile_dir(server_name)
@@ -506,18 +539,46 @@ def launch_chrome_cdp(server_name, headed=True):
         "--window-size=1280,720",
     ]
 
+    forwarder = None
+    pcfg = get_proxy_config()
+    if pcfg["enabled"]:
+        if pcfg["mode"] == "userpass":
+            from proxy_forwarder import CredentialInjectingForwarder
+            forwarder = CredentialInjectingForwarder(
+                pcfg["host"], pcfg["port"], pcfg["username"], pcfg["password"],
+                local_host="127.0.0.1", local_port=pcfg["local_forwarder_port"],
+            )
+            forwarder.start()
+            proxy_server = f"http://127.0.0.1:{forwarder.port}"
+        else:  # ip_auth
+            proxy_server = f"http://{pcfg['endpoint']}"
+        chrome_args += [
+            f"--proxy-server={proxy_server}",
+            # MANDATORY: keep the OAuth callback (localhost:<callback_port>) and all
+            # loopback OFF the proxy, or the callback HTTP request never reaches our
+            # local callback server and the whole flow fails.
+            "--proxy-bypass-list=localhost;127.0.0.1;[::1];<-loopback>",
+        ]
+        log(f"[{server_name}] Proxy enabled (mode={pcfg['mode']}) -> {proxy_server}")
+
     log(f"[{server_name}] Launching Chrome (CDP port {cdp_port})...")
     proc = subprocess.Popen(chrome_args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(3)
-    return proc, cdp_port
+    return proc, cdp_port, forwarder
 
 
-def cleanup_chrome(browser, chrome_proc):
-    """Clean up browser connection and Chrome process."""
-    try:
-        browser.close()
-    except Exception:
-        pass
+def cleanup_chrome(browser, chrome_proc, forwarder=None):
+    """Clean up browser connection, Chrome process, and (if any) the local proxy forwarder."""
+    if browser is not None:
+        try:
+            browser.close()
+        except Exception:
+            pass
+    if forwarder is not None:
+        try:
+            forwarder.stop()
+        except Exception:
+            pass
     chrome_proc.terminate()
     try:
         chrome_proc.wait(timeout=5)
@@ -744,13 +805,13 @@ def run_claude_reauth(server_name, server, headed=False, dry_run=False):
 
     log(f"[{server_name}] Launching browser for claude.ai OAuth ({email})...")
 
-    chrome_proc, cdp_port = launch_chrome_cdp(server_name, headed)
+    chrome_proc, cdp_port, forwarder = launch_chrome_cdp(server_name, headed)
 
     with sync_playwright() as p:
         try:
             browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{cdp_port}")
         except Exception as e:
-            chrome_proc.terminate()
+            cleanup_chrome(None, chrome_proc, forwarder)
             return {"success": False, "message": f"Failed to connect to Chrome CDP: {e}"}
 
         context = browser.contexts[0] if browser.contexts else browser.new_context()
@@ -908,7 +969,7 @@ def run_claude_reauth(server_name, server, headed=False, dry_run=False):
             save_screenshot(page, f"{server_name}-exception")
             return {"success": False, "message": f"Browser error: {e}"}
         finally:
-            cleanup_chrome(browser, chrome_proc)
+            cleanup_chrome(browser, chrome_proc, forwarder)
 
     # Exchange code for tokens
     log(f"[{server_name}] Exchanging authorization code for tokens...")
@@ -959,13 +1020,13 @@ def run_chatgpt_reauth(server_name, server, headed=False, dry_run=False):
 
     log(f"[{server_name}] Launching browser for chatgpt.com via Google ({email})...")
 
-    chrome_proc, cdp_port = launch_chrome_cdp(server_name, headed)
+    chrome_proc, cdp_port, forwarder = launch_chrome_cdp(server_name, headed)
 
     with sync_playwright() as p:
         try:
             browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{cdp_port}")
         except Exception as e:
-            chrome_proc.terminate()
+            cleanup_chrome(None, chrome_proc, forwarder)
             return {"success": False, "message": f"Failed to connect to Chrome CDP: {e}"}
 
         context = browser.contexts[0] if browser.contexts else browser.new_context()
@@ -1079,7 +1140,7 @@ def run_chatgpt_reauth(server_name, server, headed=False, dry_run=False):
             save_screenshot(page, f"{server_name}-exception")
             return {"success": False, "message": f"Browser error: {e}"}
         finally:
-            cleanup_chrome(browser, chrome_proc)
+            cleanup_chrome(browser, chrome_proc, forwarder)
 
 
 # ============================================================
@@ -1111,8 +1172,9 @@ def run_gemini_reauth(server_name, server, headed=False, dry_run=False):
 
     chrome_proc = None
     browser = None
+    forwarder = None
     try:
-        chrome_proc, cdp_port = launch_chrome_cdp(server_name, headed=headed)
+        chrome_proc, cdp_port, forwarder = launch_chrome_cdp(server_name, headed=headed)
         from playwright.sync_api import sync_playwright
         pw = sync_playwright().start()
         browser = pw.chromium.connect_over_cdp(f"http://localhost:{cdp_port}")
@@ -1193,9 +1255,14 @@ def run_gemini_reauth(server_name, server, headed=False, dry_run=False):
     except Exception as e:
         return {"success": False, "message": f"Gemini reauth error: {e}"}
     finally:
-        if browser:
+        if chrome_proc is not None:
             try:
-                cleanup_chrome(browser, chrome_proc)
+                cleanup_chrome(browser, chrome_proc, forwarder)
+            except Exception:
+                pass
+        elif forwarder is not None:
+            try:
+                forwarder.stop()
             except Exception:
                 pass
 
