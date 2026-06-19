@@ -22,10 +22,33 @@ that. This replaces the retired IPRoyal `gost` SOCKS5 proxy (decommissioned 2026
 The proxy injects at one point — `launch_chrome_cdp` in `headless_reauth.py` — so it
 applies to every provider flow. Two modes:
 
-- **`ip_auth`** (default, recommended): Chrome points straight at `http://p.webshare.io:80`;
-  no credentials on disk. The server's egress IP is whitelisted in the Webshare dashboard.
-- **`userpass`** (fallback): a localhost-only stdlib forwarder (`proxy_forwarder.py`) injects
+- **`ip_auth`**: Chrome points straight at the Webshare rotating endpoint
+  (`http://p.webshare.io:80`); no credentials on disk. The server's egress IP is whitelisted
+  in the Webshare dashboard. **Requires a paid plan** (see verified findings below).
+- **`userpass`**: a localhost-only stdlib forwarder (`proxy_forwarder.py`) injects
   `Proxy-Authorization` toward Webshare; Chrome points at `127.0.0.1:<local_forwarder_port>`.
+  **This is the mode that works on the free tier.**
+
+---
+
+## ⚠️ Verified findings (Hostinger, 2026-06-19, free tier)
+
+Tested from the live box. Do not assume the dashboard defaults match these:
+
+- **Free tier = 10 _datacenter_ proxies, not residential** (Leaseweb/ColoCrossing/ServerMania
+  ASNs). Datacenter IPs may still be suppressed by OpenAI/Anthropic. To actually beat
+  suppression, upgrade to Webshare's **paid residential** plan — then it's a one-line
+  `endpoint` swap, no code change.
+- **The rotating endpoint `p.webshare.io:80` does NOT work on free** — both `ip_auth` and
+  `userpass` against it fail. It's a paid feature. So **`ip_auth` mode is unavailable on free.**
+- **What works on free = `userpass` mode against a _direct proxy_** pulled from
+  `GET https://proxy.webshare.io/api/v2/proxy/list/?mode=direct` (e.g. `31.59.20.176:6754`)
+  with the proxy username/password.
+- IP authorization for the Hostinger egress `2.25.149.69` is already registered via the API
+  (harmless; only used once a paid plan enables the rotating endpoint).
+
+Proven server-only on the box: `proxy_forwarder` routes egress `2.25.149.69`→ the Webshare
+IP, and a headless Chromium with `launch_chrome_cdp`'s exact flags exits via the Webshare IP.
 
 ---
 
@@ -55,15 +78,23 @@ For the Hostinger box, the egress IP is `2.25.149.69`.
 
 ## 2. Username/password fallback (`userpass` mode)
 
-Use this when you can't whitelist a static egress IP.
+Use this when you can't whitelist a static egress IP, **or on the free tier** (where the
+rotating endpoint is unavailable — see verified findings above).
 
-1. In Webshare → **Proxy → Proxy List / Credentials**, copy the proxy username and password.
+1. Get the proxy username/password and a **direct proxy endpoint** (the free-tier path):
+   ```bash
+   curl -s -H "Authorization: Token $WEBSHARE_API_TOKEN" \
+     "https://proxy.webshare.io/api/v2/proxy/list/?mode=direct&page_size=10"
+   # pick a result where "valid": true → use "proxy_address":"port" as the endpoint,
+   # and "username"/"password" as the creds.
+   ```
+   (On a paid plan you can instead use `endpoint: "p.webshare.io:80"` for rotation.)
 2. Put them in `config.json` (gitignored, written `0o600`) and set the mode:
    ```json
    "proxy": {
      "enabled": true,
      "mode": "userpass",
-     "endpoint": "p.webshare.io:80",
+     "endpoint": "31.59.20.176:6754",
      "username": "YOUR_WEBSHARE_USER",
      "password": "YOUR_WEBSHARE_PASS",
      "local_forwarder_port": 1080
