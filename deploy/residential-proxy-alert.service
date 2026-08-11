@@ -1,7 +1,0 @@
-[Unit]
-Description=Slack alert for residential proxy failures
-
-[Service]
-Type=oneshot
-EnvironmentFile=%h/.openclaw/residential-proxy.env
-ExecStart=/bin/bash %h/codex-reauth/deploy/slack-alert.sh residential-proxy "forwarder service has failed or crashed — re-auth will fall back to direct connection which will fail at the 10-day mark. Run the Mac tunnel as manual fallback."
