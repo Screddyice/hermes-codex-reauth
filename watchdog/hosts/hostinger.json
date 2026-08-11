@@ -1,0 +1,76 @@
+{
+  "host_label": "hostinger",
+  "bot_label": "@Screddy_bot",
+
+  "hermes_home": "~/.hermes",
+  "gateway_unit": "hermes-gateway.service",
+
+  "renotify_s": 86400,
+
+  "_deadman_note": "Create a check at healthchecks.io with period 3h + grace 1h, then paste its ping URL here and set enabled to true. Until then nothing detects the watchdog itself going dark, which is what let the 2026-08-05 outage run for six days.",
+  "deadman": {
+    "enabled": false,
+    "ping_url": ""
+  },
+
+  "subject": "Action needed: personal Hermes lost its Codex sign-in (hostinger)",
+  "ticket_title": "Codex sign-in lost — personal Hermes (hostinger)",
+
+  "channels": {
+    "email": {
+      "to": ["shawn@teamnebula.ai"],
+      "key_env": "TMN_COMPOSIO_API_KEY",
+      "composio_user_id": "user_uwgmr"
+    },
+    "linear": {
+      "team": "36388c9e-35ec-49a8-b873-3c01ad457086",
+      "assignee": "27c9c520-8566-453c-8dca-bd1164e72325",
+      "key_env": "TMN_LINEAR_API_KEY"
+    }
+  },
+
+  "runbook": [
+    "A HUMAN MUST DO THIS. It cannot be automated and nothing will",
+    "self-heal: OpenAI now mandates 2FA on sign-in, so the login has to be completed by",
+    "a person at a browser. Until someone runs these steps the bot stays down.",
+    "",
+    "1. SSH to the box:",
+    "   ssh hostinger",
+    "",
+    "2. Start the device-code login (default profile — no --profile flag here):",
+    "   hermes auth add openai-codex --type oauth --no-browser",
+    "",
+    "3. It prints https://auth.openai.com/codex/device plus a short code. Open the URL",
+    "   in any browser, enter the code, sign in, and complete the 2FA challenge.",
+    "   Run it under tmux if your session might drop — the process must stay alive to",
+    "   receive the token, and 2FA makes this step slower than the CLI's default wait.",
+    "   If it gives up before you finish, re-run with a longer --timeout.",
+    "",
+    "4. Confirm it landed (do NOT trust `auth status`, it reports \"logged in\" even when",
+    "   no usable credential exists):",
+    "   hermes auth list          # want: openai-codex (1 credentials)",
+    "",
+    "5. Restart the gateway:",
+    "   systemctl --user restart hermes-gateway.service",
+    "",
+    "6. Verify a real turn:",
+    "   hermes -z \"Reply with exactly one word: PONG\""
+  ],
+
+  "context_note": [
+    "Why this needs a person: the only repair is a full re-login, which OpenAI now gates",
+    "behind 2FA. Nothing will retry it for you. The headless device-code self-heal that",
+    "used to run here was removed on 2026-08-11 precisely because 2FA made it impossible;",
+    "do not wait for anything to recover on its own.",
+    "",
+    "Note there is no longer any scheduled token refresh on this box. codex-keepalive was",
+    "retired with the self-heal, so the running gateway refreshing on use is the only thing",
+    "keeping the token alive. If the gateway is down, the token will age out unrefreshed —",
+    "that is exactly how the 2026-08-05 outage happened.",
+    "",
+    "Use a FRESH authorization, not a copy of the one hermes-tmn holds. The two boxes",
+    "sharing one OAuth lineage is what caused the July outage: whichever box refreshes",
+    "last silently invalidates the other. The credential `label` field is cosmetic —",
+    "compare the refresh-token fingerprint printed in this alert, not labels."
+  ]
+}
