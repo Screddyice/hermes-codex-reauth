@@ -176,7 +176,27 @@ pytest
 
 ## History
 
-`docs/SELF-HEAL-codex-reauth.md` describes the removed self-heal, and
-`watchdog/hosts-deployed/` holds the pre-consolidation scripts exactly as they
-ran on each VM (they had never been in git). Both are kept for archaeology; the
-tag `pre-watchdog-consolidation` marks the last commit before this change.
+The reauth machinery is **deleted from the working tree**, not merely unused —
+17 modules plus the whole `deploy/` directory, and the 6 tests that covered them.
+That includes the Chrome/CDP driver, the Xvfb launcher, the Webshare proxy
+forwarder, the Gmail-OTP reader, and the legacy Mac-trigger flow. Playwright is
+gone from `requirements.txt`; the watchdog is stdlib-only.
+
+Recovering any of it:
+
+| Want | Where |
+|---|---|
+| The self-heal design | `docs/SELF-HEAL-codex-reauth.md` (kept) |
+| The scripts as they ran on each VM | `watchdog/hosts-deployed/` (kept — they had never been in git) |
+| The deleted reauth code | tag `pre-watchdog-consolidation` |
+
+Two on-box cleanups are deliberately **not** done by this repo and must be done
+by hand, because both hold live credentials: the plaintext OpenAI password at
+`~/.openclaw/oai-password`, and the `chrome-auto` browser profile under
+`~/.hermes-oauth/browser-profiles/`, which still contains a logged-in OpenAI web
+session. Wipe those deliberately rather than leaving them to rot.
+
+⚠️ `~/headless-oauth-recovery` on hostinger is **not a git repo** and is where the
+still-running `codex-keepalive` loads its probe from. Deleting it makes `python3`
+exit 2, which that script maps to UNKNOWN → "no action" → **systemd green
+forever**. Archive it; never `rm` it, and only after the keepalive is retired.
