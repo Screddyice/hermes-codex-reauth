@@ -1,128 +1,182 @@
 # hermes-codex-reauth
 
-Headless, unattended re-authentication for OpenAI Codex (ChatGPT-plan) OAuth on remote servers — primarily **Hermes** on `neb-brain-hostinger`, but works for any server running `codex` / `hermes`.
+Monitoring for OpenAI Codex (ChatGPT-plan) OAuth on the Hermes hosts.
 
-When the codex refresh-token chain breaks (OpenAI's refresh token is single-use and rotates on every refresh; concurrent refreshers trip `refresh_token_reused` and the whole token family is invalidated), the model stops working until a browser re-login. This repo automates that re-login on the server so the loop self-heals with no operator involvement.
+> **2026-08-11 — this repo no longer re-authenticates anything.**
+> OpenAI now mandates 2FA on sign-in, which makes unattended device-code reauth
+> impossible by construction: completing a login requires a person at a browser.
+> The headless self-heal that gave this repo its name has been removed. What
+> remains is a **watchdog** — it detects a broken credential quickly and tells a
+> human clearly, and it never mutates anything.
+>
+> The repo name is now a slight misnomer, kept for URL stability.
 
-## Current approach — fully server-side self-heal (2026-06)
+## Why a watchdog and not a fixer
 
-The canonical path is now a **probe-first, self-healing keepalive** that auto-runs a **headless device-code reauth** entirely on the server — no Mac, no laptop browser, no residential-proxy dependency for the common case. See **`docs/SELF-HEAL-codex-reauth.md`** for the full design.
+The codex refresh token is single-use and rotates on every refresh, so two
+processes refreshing the same credential trip `refresh_token_reused` and
+invalidate the whole token family. That is what took both boxes down in July.
+The old design answered this with automation: probe, refresh, and — if the
+refresh chain was dead — drive a headless Chrome through the device-code flow.
 
-| File | Purpose |
+2FA ended that. A login now needs a human, so the only useful thing software can
+do is notice fast and say so. Everything mutating was removed on 2026-08-11:
+
+| Removed | Why |
 |---|---|
-| `codex_auth_probe.py` | Read-only auth check (no token rotation): `BROKEN` (401/invalidated) vs `UNKNOWN` (transient) vs OK. |
-| `restore_reauth.py` | Headless device-code reauth: drives logged-in Chrome to type the `user_code` into the segmented `/codex/device` field + click Continue, then lets hermes' device poll complete. |
-| `run_restore.sh` | Xvfb launcher for `restore_reauth.py` (deploy-location-agnostic). |
-| `deploy/codex-keepalive.sh` | Probe-first self-heal loop (flock; refresh only when expired; auto-reauth on dead refresh token; edge-alert only if that also fails). |
-| `headless_reauth.py`, `proxy_forwarder.py` | Chrome-over-CDP launcher + optional Webshare proxy forwarder used by `restore_reauth.py`. |
+| Headless device-code reauth (Chrome/Xvfb/Gmail-OTP/residential proxy) | 2FA makes it impossible; it could only fail slowly |
+| The `hermes -z` refresh rung | Mutating. Pure-watchdog by decision — all recovery is manual |
+| `codex-keepalive` (30-min loop) | With both rungs gone, its remainder duplicated the watchdog |
 
-This **supersedes** the legacy reactive flow below (watchdog → `codex_reauth_server.py` → Mac fallback → residential proxy), which remains documented for reference.
+**Consequence, stated plainly:** nothing refreshes these tokens on a schedule any
+more. A running gateway refreshes on use, so a *live* bot stays healthy. A bot
+that is down long enough for its access token to age out will not recover on its
+own — it will page you instead. That is the intended trade, and it is exactly the
+2026-08-05 scenario, which previously ran six days unnoticed.
 
-## Legacy architecture (reactive; superseded)
+## What runs
 
-Each server runs two things on a schedule:
+One watchdog per host, on a 3-hourly timer, silent unless something is wrong.
 
-1. **Watchdog** (`codex_watchdog.py`, cron every 3h): cheap check on token TTL. If the access token is still healthy, exit. If it's near expiry, try an API refresh. If the refresh chain is broken (`invalid_grant`), escalate to the recovery flow. (Older docs and the script's docstring suggested 15 min — 3h is the production-tuned cadence with the recovery escalation in place; brief downtime up to one tick is acceptable because the recovery auto-heals it.)
+| Host | User | Auth store it watches | Alerts to |
+|---|---|---|---|
+| `neb-brain-hostinger` (`@Screddy_bot`) | `ubuntu` | `~/.hermes/auth.json` | email + Linear |
+| `hermes-tmn` (GCP, `@Teamnebula_bot`) | `screddy` | `~/.hermes/profiles/tmn/auth.json` | Slack `#tmn-ops` + email |
 
-2. **Recovery** (`codex_reauth_server.py`, invoked by the watchdog on escalation): launches a real Chrome over CDP, walks the OpenAI auth URL, submits the configured email, waits for OpenAI's verification email to arrive in Gmail (via read-only Gmail API), extracts the magic link or 6-digit code, completes the login, catches the auth callback on localhost, exchanges the code for fresh tokens, writes them into the server's `auth-profiles.json`, and restarts the gateway (legacy OpenClaw; now Hermes).
+The two timers are offset 80 minutes so the boxes never alert in the same minute.
 
-A Mac-side companion script (`codex_reauth_mac.py`) runs the same flow from a real desktop browser and pushes fresh tokens to servers via SSH. Used as a manual tier-2 fallback when the headless server flow fails.
+```
+watchdog/
+  codex_health_check.py   canonical, shared by both hosts
+  codex_auth_probe.py     live probe — OPERATOR TOOL, not on any timer
+  hosts/{hostinger,tmn}.json   everything host-specific
+  systemd/                4 units, byte-identical to what is deployed
+  install.sh              --host {hostinger|tmn}
+```
 
-### Dual-write to Codex CLI 0.128.0+
+**Everything host-specific lives in `hosts/*.json`** — auth store, gateway unit,
+channels, and the runbook prose. The script carries no host defaults.
 
-Codex CLI 0.128.0 introduced a dedicated token store at `~/.codex/auth.json` (richer schema with `tokens.id_token`, `tokens.account_id`, `auth_mode`, `last_refresh`). Both the `codex` CLI itself and OpenClaw consume the same OAuth tokens but read them from different files.
+### `hermes_home` has no default, on purpose
 
-To keep both stores in lock-step, every refresh and every fresh login writes to **both**:
+The two scripts this replaced disagreed: `~/.hermes` on one host,
+`~/.hermes/profiles/tmn` on the other. TMN's gateway runs with
+`HERMES_HOME=~/.hermes/profiles/tmn` and its root `~/.hermes/auth.json` is stale
+and unused — so a shared default would silently watch a credential nothing runs
+on and report a confident, wrong `ok`. That was a real defect, fixed 2026-07-29.
 
-- OpenClaw's `auth-profiles.json` (and `oauth-token-cache.json`)
-- Codex CLI's `~/.codex/auth.json` (merged — non-token fields like `auth_mode` are preserved; missing `id_token` on a refresh response keeps the existing one)
+A missing `hermes_home` is therefore a hard failure, not a guess, and a test
+asserts each shipped config resolves to the intended store.
 
-The watchdog also reads from `~/.codex/auth.json` as a fallback if OpenClaw's profile is missing — useful for hosts where `codex login` was run directly (or tokens were pushed there from a Mac) before OpenClaw was configured.
+## Detection
 
-## The datacenter-IP problem
+Local signals only, read straight from `auth.json`. It deliberately does **not**
+trust `hermes auth status`, which on 2026-07-29 reported `logged in` for a
+credential with no refresh token at all.
 
-OpenAI's login page silently rejects new-device attempts from datacenter IPs (AWS, GCP, Azure, etc.) by suppressing email delivery. The headless server flow only works when the server's outbound traffic appears to come from a residential IP.
+Reported `down` when: there is no credential; `last_auth_error` is newer than
+`last_refresh` with `relogin_required` or `refresh_token_reused`; there is no
+refresh token; the access token has expired; **or the gateway unit is not
+active** — codex auth can be perfect while the bot is dead, and nothing used to
+notice.
 
-Two supported patterns:
+Every alert carries a short `lineage=` fingerprint of the refresh token, so two
+hosts sharing one OAuth lineage — the July failure — is visible by inspection
+instead of requiring an incident. The credential `label` field is cosmetic and
+reads the same on both boxes; compare fingerprints.
 
-- **Reverse SSH SOCKS tunnel from a home device** (the original Mac-based approach — see `socks_proxy.py`). The server's Chrome launches with `--proxy-server=socks5://127.0.0.1:1080` and exits through a trusted residential connection.
-- **Static residential proxy service** (recommended for fully unattended operation). A static residential IP (e.g., via IPRoyal) is reachable from both servers via a small `gost` sidecar on `127.0.0.1:1080`. Same code path, no home device required. Covered in `docs/specs/2026-04-23-residential-proxy-codex-reauth-design.md`.
+## Alerting
 
-Either way, `codex_reauth_server.py` auto-detects a SOCKS proxy on `127.0.0.1:1080` and uses it.
+```
+ok   -> down   alert once on every configured channel
+down -> down   quiet for renotify_s (24h), then one reminder, no second ticket
+down -> ok     silent re-arm, no "recovered" message
+unknown        never pages, never changes state
+```
 
-## Quick start
+## Failing loudly
+
+A monitor that fails silently is worse than no monitor, because it also removes
+the suspicion that you are unmonitored. Six paths used to exit 0 with systemd
+green; all are now hard failures (exit 1): unreadable config, unreadable
+`auth.json`, unresolvable secret, Slack `ok:false`, Composio false-success, and
+corrupt state. Most importantly, **"we decided to alert and every channel
+failed" is a failure** — it previously printed the error and exited 0.
+
+### The deadman
+
+No in-process check can detect its own absence. On 2026-08-05 this host's timer
+was disabled and nothing noticed for six days. So each successful run pings an
+external deadman (healthchecks.io), which pages if pings stop.
+
+A failed *delivery* deliberately **withholds** the ping. That makes the deadman
+cover both "the watchdog stopped running" and "it ran but could not tell
+anyone", escalating over a channel that cannot be broken by the same rotated
+secret that just swallowed the alert. An `OnFailure=` unit would only retry the
+channels already known to be dead.
+
+> Set `deadman.ping_url` in each host config and flip `enabled` to `true`.
+> Until then this protection is off, and `install.sh` says so.
+
+## Install
 
 ```bash
-# 1. On each server
-git clone https://github.com/Screddyice/hermes-codex-reauth.git ~/codex-reauth
-cd ~/codex-reauth
-python3 -m venv venv && source venv/bin/activate
-pip install -r requirements.txt
-playwright install chromium
-
-# 2. Copy the example configs and fill them in
-cp config.server.example.json config.server.json
-#   edit: openai_email, chrome_path, systemd unit names
-
-# 3. Seed a Gmail OAuth credential that can read the inbox that receives
-#    OpenAI's verification emails. Store as ~/.openclaw/gmail-oauth-credentials.json:
-#      { "client_id", "client_secret", "refresh_token", "token_uri", "email" }
-
-# 4. Install the watchdog on a 3h cron (recovery escalation handles brief downtime)
-crontab -l 2>/dev/null | { cat; echo "0 */3 * * * $HOME/codex-reauth/venv/bin/python $HOME/codex-reauth/codex_watchdog.py >> $HOME/.hermes-oauth/watchdog.log 2>&1"; } | crontab -
-
-# 5. Bring up a residential exit (one of the two patterns above) so the
-#    recovery flow has a non-datacenter IP to use.
+./watchdog/install.sh --host hostinger    # or --host tmn
 ```
 
-### Bring-up validation checklist
+Idempotent. Never touches `state.json` — a reinstall must not reset an
+in-progress outage and re-arm the edge detector. It **ends in assertions** and
+refuses to report success unless the timer is enabled, actually scheduled,
+lingering is on, and the installed script runs clean.
 
-Before declaring a new server "self-healing," verify all of these. If any fail, the watchdog will eventually go silent on the first refresh-chain break — and you'll find out when an agent stops responding:
+## Verify
 
 ```bash
-# 1. Binaries on PATH
-which google-chrome-stable Xvfb gost
-# 2. Credentials in place
-ls ~/.openclaw/gmail-oauth-credentials.json ~/.openclaw/residential-proxy.env
-# 3. Residential proxy systemd unit running
-systemctl --user is-active residential-proxy.service
-# 4. Watchdog cron present
-crontab -l | grep codex_watchdog.py
-# 5. End-to-end smoke test: real OAuth via Chrome+Xvfb+Gmail+residential proxy
-~/codex-reauth/venv/bin/python ~/codex-reauth/codex_reauth_server.py
-#    Expect ~25s runtime; final lines should be:
-#      "wrote N auth-profiles.json files + oauth-token-cache.json + codex-cli-native=yes"
-#      "restarted hermes-gateway"
+python3 check.py --dry-run                          # detection, no side effects
+python3 check.py --force-down --dry-run             # alert rendering
+python3 check.py --force-down --state-file /tmp/d.json   # real delivery drill
 ```
 
-If you hand-seeded `~/.openclaw/auth-profiles.json` from `oauth-token-cache.json` rather than letting `codex_reauth_server.py` create it, double-check that `lastGood` is a **dict** keyed by provider, not a bare string:
+Always pass `--state-file` for drills. Without it a `--force-down` writes `down`
+into production state, leaving the host inside a 24h quiet window where a
+genuine outage pages nobody.
 
-```json
-"lastGood": { "openai-codex": "openai-codex:codex-cli" }
+Note `--force-down` bypasses `detect()` entirely, so it proves *delivery* only.
+To prove *detection*, point `hermes_home` at a scratch directory holding a
+crafted `auth.json` and a copied `config.yaml` — without the latter the
+applicability guard exits quietly and you get a false pass.
+
+## The probe
+
+`codex_auth_probe.py` makes a real call to OpenAI. It is an **operator tool for
+triage**, run by hand, and is deliberately on no timer.
+
+It used to run every 30 minutes as part of the self-heal, and the keepalive log
+shows the cost: over ~7 weeks, **3 genuine `BROKEN` results against 209
+`UNKNOWN`s — 209 of which were HTTP 429 `usage_limit_reached`**, including a
+continuous 4.6-hour blind window. It was consuming the plan quota it existed to
+protect and classifying its own exhaustion as "transient". All three real
+breakages were caught by local signals for free.
+
+```
+0 OK   1 BROKEN (a human must re-login)   2 UNKNOWN (transient)   3 QUOTA (429)
 ```
 
-`auth_profiles.write_tokens()` normalizes a string lastGood defensively (so the headless flow no longer crashes on the first run), but the canonical shape is still the dict form.
+`QUOTA` is separate from `UNKNOWN` because collapsing them made "we were blind
+for five hours" indistinguishable from health. Any 401/403 is `BROKEN`: the old
+allowlist of error substrings let a reworded OpenAI message fall through to
+`UNKNOWN`. That bias was right when `BROKEN` triggered a destructive reauth; now
+a false page costs nothing and a swallowed 401 costs an outage.
 
-## Files
+## Tests
 
-| File | Purpose |
-|---|---|
-| `codex_watchdog.py` | 15-min scheduled entrypoint; API refresh or escalate |
-| `codex_reauth_server.py` | Headless recovery flow (server side) |
-| `codex_reauth_mac.py` | Manual recovery from a real Mac; pushes tokens to servers via SSH |
-| `codex_oauth.py` | Codex OAuth client (authorize URL, token exchange, refresh) |
-| `auth_profiles.py` | Read/write `auth-profiles.json` (OpenClaw's token store) |
-| `gmail_reader.py` | Read-only Gmail API helper for catching OpenAI verification emails |
-| `socks_proxy.py` | Minimal SOCKS5 server for the reverse-tunnel pattern |
-| `one_shot_reauth.py` | Operator-invoked variant for one-off auth captures |
-| `config.server.example.json` | Template for server-side config |
-| `config.mac.example.json` | Template for Mac-side config |
-| `docs/specs/` | Design documents for major changes |
+```bash
+pytest
+```
 
-## Status
+## History
 
-Production on two servers (NEB / Cliqk). API-level refresh is reliable. Headless recovery is reliable when a residential exit is available; see `docs/specs/2026-04-23-residential-proxy-codex-reauth-design.md` for the current work to make the residential exit always-available.
-
-## License
-
-MIT
+`docs/SELF-HEAL-codex-reauth.md` describes the removed self-heal, and
+`watchdog/hosts-deployed/` holds the pre-consolidation scripts exactly as they
+ran on each VM (they had never been in git). Both are kept for archaeology; the
+tag `pre-watchdog-consolidation` marks the last commit before this change.
