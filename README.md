@@ -96,6 +96,13 @@ down -> ok     silent re-arm, no "recovered" message
 unknown        never pages, never changes state
 ```
 
+Every alert leads with what broke, then the **sign-in link** (`reauth_url` in each
+host config), then that host's own runbook. The link sits near the top because
+buried in step 3 of the prose it was unreadable at the moment it mattered — but
+it is always paired with the caveat that the device page needs the code the CLI
+prints first. An unqualified link is worse than none: it invites opening a page
+you cannot finish, precisely when you are least inclined to read on.
+
 ## Failing loudly
 
 A monitor that fails silently is worse than no monitor, because it also removes

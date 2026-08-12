@@ -3,6 +3,7 @@
   "bot_label": "@Screddy_bot",
   "hermes_home": "~/.hermes",
   "gateway_unit": "hermes-gateway.service",
+  "reauth_url": "https://auth.openai.com/codex/device",
   "renotify_s": 86400,
   "subject": "Action needed: personal Hermes lost its Codex sign-in (hostinger)",
   "ticket_title": "Codex sign-in lost \u2014 personal Hermes (hostinger)",

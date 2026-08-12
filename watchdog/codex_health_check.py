@@ -300,11 +300,28 @@ def _joined(cfg: dict, key: str) -> str:
     return "\n".join(cfg.get(key) or [])
 
 
+def reauth_line(cfg: dict) -> str:
+    """The sign-in URL, surfaced up top where it is actually readable.
+
+    Deliberately paired with the caveat. The device page cannot be completed on
+    its own — it wants a code that only step 1 produces — so an unqualified link
+    at the top of an alert invites opening a page you cannot finish, at exactly
+    the moment you are least inclined to read further.
+    """
+    url = cfg.get("reauth_url")
+    if not url:
+        return ""
+    return (f"Reauth here: {url}\n"
+            f"  (start at step 1 below first — this page needs the device code "
+            f"that the CLI prints)\n\n")
+
+
 def alert_text(cfg: dict, detail: str, ticket: str | None) -> str:
     return (
         f"{cfg['bot_label']} on {cfg['host_label']} can no longer sign in to Codex, "
         f"so it has stopped answering.\n\n"
         f"What the check saw: {detail}\n\n"
+        + reauth_line(cfg)
         + (f"Linear ticket: {ticket}\n\n" if ticket else "")
         + _joined(cfg, "runbook") + "\n\n"
         + _joined(cfg, "context_note") + "\n\n"
@@ -315,11 +332,16 @@ def alert_text(cfg: dict, detail: str, ticket: str | None) -> str:
 
 
 def ticket_body(cfg: dict, detail: str) -> str:
+    url = cfg.get("reauth_url")
+    link = (f"**Reauth here:** {url}\n"
+            f"(start at step 1 — this page needs the device code the CLI prints)\n\n"
+            if url else "")
     return (
         f"The Hermes gateway on `{cfg['host_label']}` can no longer sign in to Codex, "
         f"so `{cfg['bot_label']}` has stopped answering.\n\n"
         f"**What the check saw:** {detail}\n\n"
-        f"### Fix\n\n```\n{_joined(cfg, 'runbook')}\n```\n\n"
+        + link
+        + f"### Fix\n\n```\n{_joined(cfg, 'runbook')}\n```\n\n"
         f"### Context\n\n{_joined(cfg, 'context_note')}\n\n"
         f"_Auto-filed by the {cfg['host_label']} codex-health check._"
     )

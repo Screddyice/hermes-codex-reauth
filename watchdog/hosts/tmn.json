@@ -3,6 +3,7 @@
   "bot_label": "@Teamnebula_bot",
   "hermes_home": "~/.hermes/profiles/tmn",
   "gateway_unit": "hermes-gateway-tmn.service",
+  "reauth_url": "https://auth.openai.com/codex/device",
   "renotify_s": 86400,
   "subject": "Action needed: Team Nebula Hermes lost its Codex sign-in (hermes-tmn)",
   "ticket_title": "Codex sign-in lost \u2014 Team Nebula Hermes (hermes-tmn)",
