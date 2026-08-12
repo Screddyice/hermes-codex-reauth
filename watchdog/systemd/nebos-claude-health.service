@@ -1,0 +1,11 @@
+[Unit]
+Description=NEBOS v2 Claude sign-in check (silent unless re-auth is needed)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-%h/.hermes/profiles/tmn/.env
+EnvironmentFile=-%h/.hermes/.env
+ExecStart=/usr/bin/python3 %h/.hermes/profiles/tmn/claude-health/check.py
+TimeoutStartSec=300

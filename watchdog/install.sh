@@ -26,10 +26,16 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# CHECK_SRC differs per target because the Claude watchdog is a different script,
+# not another config: codex is judged from local auth.json state, Claude only from
+# a live call, since its token is an opaque string with no local metadata.
+CHECK_SRC="$HERE/codex_health_check.py"
 case "$HOST" in
-  hostinger) DEST="$HOME/.hermes/codex-health";               TIMER="hermes-codex-health.timer";     SERVICE="hermes-codex-health.service" ;;
-  tmn)       DEST="$HOME/.hermes/profiles/tmn/codex-health";  TIMER="hermes-codex-health-tmn.timer"; SERVICE="hermes-codex-health-tmn.service" ;;
-  *) echo "usage: $0 --host {hostinger|tmn}" >&2; exit 2 ;;
+  hostinger)    DEST="$HOME/.hermes/codex-health";               TIMER="hermes-codex-health.timer";     SERVICE="hermes-codex-health.service" ;;
+  tmn)          DEST="$HOME/.hermes/profiles/tmn/codex-health";  TIMER="hermes-codex-health-tmn.timer"; SERVICE="hermes-codex-health-tmn.service" ;;
+  nebos-claude) DEST="$HOME/.hermes/profiles/tmn/claude-health"; TIMER="nebos-claude-health.timer";     SERVICE="nebos-claude-health.service"
+                CHECK_SRC="$HERE/claude_health_check.py" ;;
+  *) echo "usage: $0 --host {hostinger|tmn|nebos-claude}" >&2; exit 2 ;;
 esac
 
 CFG_SRC="$HERE/hosts/$HOST.json"
@@ -40,10 +46,14 @@ log() { echo "[install] $*"; }
 
 # --- 1. script + config (never state.json) ---
 mkdir -p "$DEST" "$UNIT_DIR"
-install -m 0755 "$HERE/codex_health_check.py" "$DEST/check.py"
-install -m 0644 "$CFG_SRC"                    "$DEST/config.json"
-install -m 0755 "$HERE/codex_auth_probe.py"   "$DEST/codex_auth_probe.py"
-log "installed check.py + config.json + codex_auth_probe.py -> $DEST"
+install -m 0755 "$CHECK_SRC" "$DEST/check.py"
+install -m 0644 "$CFG_SRC"   "$DEST/config.json"
+# The live probe is a codex triage tool; the Claude watchdog already probes live,
+# so shipping it there would just be a second thing that can rot.
+if [[ "$HOST" != "nebos-claude" ]]; then
+  install -m 0755 "$HERE/codex_auth_probe.py" "$DEST/codex_auth_probe.py"
+fi
+log "installed check.py + config.json -> $DEST"
 
 # --- 2. systemd units ---
 install -m 0644 "$HERE/systemd/$SERVICE" "$UNIT_DIR/$SERVICE"

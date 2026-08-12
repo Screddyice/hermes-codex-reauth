@@ -38,10 +38,11 @@ own — it will page you instead. That is the intended trade, and it is exactly 
 
 One watchdog per host, 4 runs a day, silent unless something is wrong.
 
-| Host | User | Auth store it watches | Alerts to |
+| Target | Credential watched | Runs on | Alerts to |
 |---|---|---|---|
-| `neb-brain-hostinger` (`@Screddy_bot`) | `ubuntu` | `~/.hermes/auth.json` | email + Linear |
-| `hermes-tmn` (GCP, `@Teamnebula_bot`) | `screddy` | `~/.hermes/profiles/tmn/auth.json` | Slack `#tmn-ops` + email |
+| `@Screddy_bot` codex | `~/.hermes/auth.json` | hostinger (`ubuntu`) | email + Linear |
+| `@Teamnebula_bot` codex | `~/.hermes/profiles/tmn/auth.json` | hermes-tmn (`screddy`) | Slack `#tmn-ops` + email |
+| **NEBOS v2 Claude** | `CLAUDE_CODE_OAUTH_TOKEN` in `nebos-dev` Secret Manager | hermes-tmn (`screddy`) | Slack `#tmn-ops` + email |
 
 The two hosts are **interleaved on the half-cycle** — TMN on 00/06/12/18:35, hostinger on
 03/09/15/21:35 — so each box is checked every 6h while the fleet as a whole is
@@ -70,7 +71,42 @@ on and report a confident, wrong `ok`. That was a real defect, fixed 2026-07-29.
 A missing `hermes_home` is therefore a hard failure, not a guess, and a test
 asserts each shipped config resolves to the intended store.
 
-## Detection
+## The Claude watchdog is a different script, on purpose
+
+`claude_health_check.py` watches NEBOS v2's Anthropic credential. It is a
+sibling of the codex watchdog rather than another host config, because
+detection is not the same problem:
+
+* codex keeps structured local state — an `auth.json` with `last_auth_error`
+  and a decodable JWT — so it can be judged without touching the network;
+* a Claude Code OAuth token is an opaque `sk-ant-oat01…` string with **no local
+  metadata at all**. There is nothing to inspect. The only way to know whether
+  it still works is to ask Anthropic.
+
+So it makes one real authenticated call per run. That is affordable here for
+precisely the reason the codex probe was not: it is a 1-token request to the
+cheapest model, four times a day, against an account whose quota is not the
+thing being protected.
+
+Only `401`/`403` counts as down. `429` and `5xx` say nothing about the
+credential, and paging on them trains you to ignore the alert.
+
+**Why it matters:** `nebos-v2`'s deploy wires `CLAUDE_CODE_OAUTH_TOKEN` as its
+only Anthropic credential — `ANTHROPIC_API_KEY` appears in `.env.example` but
+is not in the deploy secrets — so when that token stops authenticating, every
+Claude-backed NEBOS feature stops with it.
+
+It runs on hermes-tmn rather than in `nebos-dev`, because that box already has
+systemd timers and both alert channels, while `nebos-dev` does not even have
+the Cloud Scheduler API enabled. Reading the secret needs
+`roles/secretmanager.secretAccessor` for the hermes-tmn compute service account,
+granted **on that one secret**, not project-wide.
+
+Scope note: this watches the **credential**, not the service. NEBOS can be down
+for reasons unrelated to Claude auth and this check stays quiet through all of
+them.
+
+## Detection (codex)
 
 Local signals only, read straight from `auth.json`. It deliberately does **not**
 trust `hermes auth status`, which on 2026-07-29 reported `logged in` for a
