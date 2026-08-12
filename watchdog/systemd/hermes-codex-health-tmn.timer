@@ -1,10 +1,15 @@
 [Unit]
-Description=Check every 3h that the Hermes tmn Codex sign-in still works
+Description=Check 4x daily that the Hermes tmn Codex sign-in still works
 
 [Timer]
-# 3h is the floor by request — no more frequent than this. Offset from
-# hostinger's check so the two boxes never alert in the same minute.
-OnCalendar=*-*-* 00,03,06,09,12,15,18,21:35:00
+# 4 runs/day per host by request. The two hosts are interleaved on the
+# half-cycle — tmn on 00/06/12/18, hostinger on 03/09/15/21 — so each box is
+# checked every 6h while the fleet as a whole is checked every 3h, and the two
+# can never alert in the same minute.
+#
+# If the deadman is enabled, its healthchecks.io period must be 6h (not 3h) or
+# it will page on every interval.
+OnCalendar=*-*-* 00,06,12,18:35:00
 RandomizedDelaySec=600
 Persistent=true
 

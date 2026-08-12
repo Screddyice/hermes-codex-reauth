@@ -36,14 +36,16 @@ own — it will page you instead. That is the intended trade, and it is exactly 
 
 ## What runs
 
-One watchdog per host, on a 3-hourly timer, silent unless something is wrong.
+One watchdog per host, 4 runs a day, silent unless something is wrong.
 
 | Host | User | Auth store it watches | Alerts to |
 |---|---|---|---|
 | `neb-brain-hostinger` (`@Screddy_bot`) | `ubuntu` | `~/.hermes/auth.json` | email + Linear |
 | `hermes-tmn` (GCP, `@Teamnebula_bot`) | `screddy` | `~/.hermes/profiles/tmn/auth.json` | Slack `#tmn-ops` + email |
 
-The two timers are offset 80 minutes so the boxes never alert in the same minute.
+The two hosts are **interleaved on the half-cycle** — TMN on 00/06/12/18:35, hostinger on
+03/09/15/21:35 — so each box is checked every 6h while the fleet as a whole is
+checked every 3h, and the two can never alert in the same minute.
 
 ```
 watchdog/
