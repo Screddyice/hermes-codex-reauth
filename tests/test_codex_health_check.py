@@ -130,6 +130,31 @@ def test_shipped_host_configs_resolve_to_the_right_auth_store():
     assert tmn["gateway_unit"] != host["gateway_unit"]
 
 
+def test_alert_surfaces_the_reauth_link_with_its_caveat():
+    """The link must be near the top, and must say it needs the device code.
+
+    It was previously buried in step 3 of the runbook prose — unreadable at the
+    moment you actually need it. But an unqualified link is worse than none: the
+    device page cannot be completed without a code the CLI prints first.
+    """
+    for host in ("hostinger", "tmn"):
+        cfg = chk.load_config(WATCHDOG / "hosts" / f"{host}.json")
+        body = chk.alert_text(cfg, "detail", None)
+        assert "https://auth.openai.com/codex/device" in body
+        assert "device code" in body
+
+        # near the top: before the runbook, not buried inside it
+        assert body.index("Reauth here:") < body.index("1. SSH")
+
+        ticket = chk.ticket_body(cfg, "detail")
+        assert "https://auth.openai.com/codex/device" in ticket
+
+
+def test_alert_omits_the_reauth_line_when_no_url_configured(tmp_path):
+    cfg = chk.load_config(write_host(tmp_path, "nolink", "~/.hermes"))
+    assert "Reauth here" not in chk.alert_text(cfg, "detail", None)
+
+
 def test_shipped_configs_carry_their_own_runbook_only():
     """Each host's runbook must not tell an operator to log into the other box."""
     tmn = chk.load_config(WATCHDOG / "hosts" / "tmn.json")
