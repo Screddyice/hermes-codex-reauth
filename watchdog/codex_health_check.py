@@ -91,9 +91,6 @@ def load_config(path: pathlib.Path) -> dict:
     if not (cfg.get("channels") or {}):
         raise Disarmed(f"config {path} declares no alert channels; nothing could page")
 
-    dm = cfg.get("deadman") or {}
-    if dm.get("enabled") and not dm.get("ping_url"):
-        raise Disarmed(f"config {path} enables deadman but sets no ping_url")
     return cfg
 
 
@@ -293,25 +290,6 @@ def linear_create(cfg_ch: dict, title: str, description: str, api_key: str) -> s
     return issue.get("url") or issue.get("identifier") or "(created)"
 
 
-def ping_deadman(cfg: dict) -> str:
-    """Tell the external deadman we ran.
-
-    This is the only thing that catches "the watchdog stopped running" -- a
-    disabled timer, a removed unit, a dead box. No in-process check can detect
-    its own absence, and on 2026-08-05 exactly that went unnoticed for six days.
-
-    A single failed ping is not escalated: the deadman service pages when pings
-    STOP, and it has its own grace period, so double-alarming here would only
-    add noise. A misconfigured URL is therefore self-revealing.
-    """
-    dm = cfg.get("deadman") or {}
-    if not dm.get("enabled"):
-        return "deadman disabled in config"
-    try:
-        with urllib.request.urlopen(dm["ping_url"], timeout=15) as r:
-            return f"deadman ping ok ({r.status})"
-    except Exception as e:
-        return f"deadman ping FAILED ({type(e).__name__}) — the deadman will page if this persists"
 
 
 # --------------------------------------------------------------------------
@@ -388,17 +366,13 @@ def run(args) -> int:
 
     if not args.force_down and not gateway_uses_codex(config_yaml):
         print(f"{cfg['host_label']} gateway is not configured on {PROVIDER} — not applicable, silent")
-        print(ping_deadman(cfg))
         return 0
 
     status, detail = (("down", "forced by --force-down") if args.force_down
                       else detect(auth_path, cfg["gateway_unit"]))
 
     if status == "unknown":
-        # Transient trouble is not a failure of the watchdog itself, so it still
-        # counts as a healthy run for deadman purposes.
         print(f"status=unknown ({detail}) — no action, state untouched")
-        print(ping_deadman(cfg))
         return 0
 
     st = load_state(state_path)
@@ -432,7 +406,6 @@ def run(args) -> int:
                 else:
                     print(f"\n--- EMAIL -> {ch['to']} ---\nSubject: {cfg['subject']}\n\n"
                           f"{alert_text(cfg, detail, None)}")
-        print(ping_deadman(cfg))
         return 0
 
     delivered, failures = 0, []
@@ -493,24 +466,17 @@ def run(args) -> int:
 
     # An outage nobody was told about is indistinguishable from no outage. If we
     # decided to alert and every channel failed, that is a hard failure -- the
-    # version this replaces printed the errors and still exited 0.
-    #
-    # Deliberately do NOT ping the deadman on this path. Skipping the ping is
-    # what makes the deadman cover BOTH "the watchdog stopped running" and "it
-    # ran but could not tell anyone" -- and it escalates through healthchecks.io,
-    # which is the one channel that cannot be broken by the same rotated secret
-    # that just swallowed the alert. An OnFailure= unit here would only retry the
-    # channels we already know are dead.
+    # version this replaces printed the errors and still exited 0. It surfaces in
+    # `systemctl --user status` and the journal; by explicit decision there is no
+    # second escalation channel, so this is the only trace.
     if alert and delivered == 0:
         for f in failures:
             print(f"  DELIVERY FAILURE: {f}", file=sys.stderr)
-        print("ALERTED BUT NOTHING WAS DELIVERED — no one has been told; "
-              "withholding deadman ping so it escalates independently", file=sys.stderr)
+        print("ALERTED BUT NOTHING WAS DELIVERED — no one has been told", file=sys.stderr)
         return 1
 
     for f in failures:
         print(f"  partial delivery failure: {f}", file=sys.stderr)
-    print(ping_deadman(cfg))
     return 0
 
 

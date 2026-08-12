@@ -105,20 +105,28 @@ green; all are now hard failures (exit 1): unreadable config, unreadable
 corrupt state. Most importantly, **"we decided to alert and every channel
 failed" is a failure** — it previously printed the error and exited 0.
 
-### The deadman
+### Known limitation: nothing watches the watcher
 
-No in-process check can detect its own absence. On 2026-08-05 this host's timer
-was disabled and nothing noticed for six days. So each successful run pings an
-external deadman (healthchecks.io), which pages if pings stop.
+**By explicit decision (2026-08-12), there is no deadman and no liveness
+heartbeat.** The only notifications this system produces are "codex is actually
+broken". Every alert means something is genuinely wrong — nothing pings you to
+say it is still alive.
 
-A failed *delivery* deliberately **withholds** the ping. That makes the deadman
-cover both "the watchdog stopped running" and "it ran but could not tell
-anyone", escalating over a channel that cannot be broken by the same rotated
-secret that just swallowed the alert. An `OnFailure=` unit would only retry the
-channels already known to be dead.
+The cost is real and worth stating plainly, because it has already happened
+once: no in-process check can detect its own absence, so if a timer gets
+disabled — as `hermes-codex-health.timer` was on 2026-08-04 — the silence is
+indistinguishable from health. That outage ran six days. A deadman was built,
+tested, and then removed rather than left switched off, because disabled code
+rots and an installer that nags about an unwanted feature is noise.
 
-> Set `deadman.ping_url` in each host config and flip `enabled` to `true`.
-> Until then this protection is off, and `install.sh` says so.
+Same reasoning rules out `OnFailure=`: it would only retry the channels already
+known to be dead. A failed delivery therefore surfaces **only** as a non-zero
+exit in `systemctl --user status` and the journal.
+
+If that trade is ever revisited, the mechanism is small — a single HTTP GET at
+the end of a successful run — and `git log` has the removed implementation.
+Note the check would need a **6h** period to match the per-host cadence; 3h
+would page every interval.
 
 ## Install
 

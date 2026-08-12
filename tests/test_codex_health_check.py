@@ -112,13 +112,6 @@ def test_config_with_no_channels_is_fatal(tmp_path):
         chk.load_config(cfg)
 
 
-def test_deadman_enabled_without_url_is_fatal(tmp_path):
-    cfg = write_host(tmp_path, "dm", "~/.hermes",
-                     deadman={"enabled": True, "ping_url": ""})
-    with pytest.raises(chk.Disarmed, match="deadman"):
-        chk.load_config(cfg)
-
-
 def test_shipped_host_configs_resolve_to_the_right_auth_store():
     """Regression guard for the exact defect fixed on 2026-07-29.
 
@@ -263,7 +256,6 @@ def host(tmp_path, monkeypatch):
     (home / "auth.json").write_text(json.dumps(auth_doc()))
     cfg = write_host(tmp_path, "h1", str(home))
     monkeypatch.setattr(chk, "env_val", lambda name, hh: "key-present")
-    monkeypatch.setattr(chk, "ping_deadman", lambda cfg: "deadman disabled in config")
     sent = []
     monkeypatch.setattr(chk, "send_email", lambda ch, s, b, k: sent.append(b))
     return {"cfg": cfg, "home": home, "state": tmp_path / "state.json", "sent": sent}
@@ -323,26 +315,6 @@ def test_alert_with_every_channel_failing_exits_nonzero(host, monkeypatch):
     assert chk.run(Args(host["cfg"], host["state"])) == 1
 
 
-def test_failed_delivery_withholds_the_deadman_ping(host, monkeypatch):
-    """Silence toward the deadman is the escalation.
-
-    Pinging on this path would tell the deadman everything is fine while the
-    alert went nowhere. Withholding it makes healthchecks.io page over a channel
-    that cannot be broken by the same rotated secret that swallowed the alert.
-    """
-    pings = []
-    monkeypatch.setattr(chk, "ping_deadman", lambda cfg: pings.append(1) or "pinged")
-
-    (host["home"] / "auth.json").write_text(json.dumps(auth_doc(refresh=None)))
-    monkeypatch.setattr(chk, "env_val", lambda name, hh: "")
-    assert chk.run(Args(host["cfg"], host["state"])) == 1
-    assert pings == []                                  # withheld
-
-    # ...but a healthy run still pings, or the deadman would page constantly.
-    (host["home"] / "auth.json").write_text(json.dumps(auth_doc()))
-    monkeypatch.setattr(chk, "env_val", lambda name, hh: "key-present")
-    assert chk.run(Args(host["cfg"], host["state"])) == 0
-    assert pings == [1]
 
 
 def test_dry_run_never_writes_state(host):
