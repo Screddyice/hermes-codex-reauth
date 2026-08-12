@@ -1,33 +1,24 @@
 {
   "host_label": "hermes-tmn",
   "bot_label": "@Teamnebula_bot",
-
   "hermes_home": "~/.hermes/profiles/tmn",
   "gateway_unit": "hermes-gateway-tmn.service",
-
   "renotify_s": 86400,
-
-  "_deadman_note": "Create a check at healthchecks.io with period 6h + grace 1h (match the per-host cadence — a 3h period against a 6h timer pages every interval), then paste its ping URL here and set enabled to true. This host has NO fallback provider, so a silent watchdog here means a totally dead company bot with nobody told.",
-  "deadman": {
-    "enabled": false,
-    "ping_url": ""
-  },
-
   "subject": "Action needed: Team Nebula Hermes lost its Codex sign-in (hermes-tmn)",
-  "ticket_title": "Codex sign-in lost — Team Nebula Hermes (hermes-tmn)",
-
+  "ticket_title": "Codex sign-in lost \u2014 Team Nebula Hermes (hermes-tmn)",
   "channels": {
     "slack": {
       "channel": "C09FLJDCAJD",
       "token_env": "SLACK_BOT_TOKEN"
     },
     "email": {
-      "to": ["shawn@teamnebula.ai"],
+      "to": [
+        "shawn@teamnebula.ai"
+      ],
       "key_env": "TMN_COMPOSIO_API_KEY",
       "composio_user_id": "user_uwgmr"
     }
   },
-
   "runbook": [
     "A HUMAN MUST DO THIS. It cannot be automated and nothing will",
     "self-heal: OpenAI now mandates 2FA on sign-in, so the login has to be completed",
@@ -36,13 +27,13 @@
     "1. SSH to the VM:",
     "   gcloud compute ssh hermes-tmn --project teamnebula-os --zone us-central1-a --tunnel-through-iap",
     "",
-    "2. Start the device-code login. BOTH the env var and the flag matter — without",
+    "2. Start the device-code login. BOTH the env var and the flag matter \u2014 without",
     "   them the credential lands in the default profile, which the gateway never reads:",
     "   HERMES_HOME=$HOME/.hermes/profiles/tmn hermes --profile tmn auth add openai-codex --type oauth --no-browser",
     "",
     "3. It prints https://auth.openai.com/codex/device plus a short code. Open the URL",
     "   in any browser, enter the code, sign in, and complete the 2FA challenge.",
-    "   Run it under tmux if your session might drop — the process must stay alive to",
+    "   Run it under tmux if your session might drop \u2014 the process must stay alive to",
     "   receive the token, and 2FA makes this step slower than the CLI's default wait.",
     "   If it gives up before you finish, re-run with a longer --timeout.",
     "",
@@ -56,7 +47,6 @@
     "6. Verify a real turn:",
     "   hermes --profile tmn -z \"Reply with exactly one word: PONG\""
   ],
-
   "context_note": [
     "Why this needs a person: the only repair is a full re-login, which OpenAI now gates",
     "behind 2FA. There is no unattended path back. Do not wait for it to recover by itself.",
@@ -66,7 +56,7 @@
     "Treat it as higher urgency than the personal box.",
     "",
     "Use a FRESH authorization, not a copy of the one hostinger holds. Both boxes previously",
-    "shared one OAuth lineage, and whichever refreshes last silently invalidates the other —",
+    "shared one OAuth lineage, and whichever refreshes last silently invalidates the other \u2014",
     "that is what caused the July outage. The credential `label` field is cosmetic and reads",
     "the same on both boxes; compare the refresh-token fingerprint printed in this alert."
   ]

@@ -91,9 +91,4 @@ if [[ "$fail" -ne 0 ]]; then
   exit 1
 fi
 
-DEADMAN="$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("deadman",{}).get("enabled"))' "$DEST/config.json")"
-if [[ "$DEADMAN" != "True" ]]; then
-  log "NOTE  deadman is disabled — nothing yet detects this watchdog going dark."
-  log "      Add a healthchecks.io ping_url to $DEST/config.json and re-run."
-fi
 log "install complete on $HOST"
