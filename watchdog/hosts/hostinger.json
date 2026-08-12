@@ -7,7 +7,7 @@
 
   "renotify_s": 86400,
 
-  "_deadman_note": "Create a check at healthchecks.io with period 3h + grace 1h, then paste its ping URL here and set enabled to true. Until then nothing detects the watchdog itself going dark, which is what let the 2026-08-05 outage run for six days.",
+  "_deadman_note": "Create a check at healthchecks.io with period 6h + grace 1h (match the per-host cadence — a 3h period against a 6h timer pages every interval), then paste its ping URL here and set enabled to true. Until then nothing detects the watchdog itself going dark, which is what let the 2026-08-05 outage run for six days.",
   "deadman": {
     "enabled": false,
     "ping_url": ""

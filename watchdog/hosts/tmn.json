@@ -7,7 +7,7 @@
 
   "renotify_s": 86400,
 
-  "_deadman_note": "Create a check at healthchecks.io with period 3h + grace 1h, then paste its ping URL here and set enabled to true. This host has NO fallback provider, so a silent watchdog here means a totally dead company bot with nobody told.",
+  "_deadman_note": "Create a check at healthchecks.io with period 6h + grace 1h (match the per-host cadence — a 3h period against a 6h timer pages every interval), then paste its ping URL here and set enabled to true. This host has NO fallback provider, so a silent watchdog here means a totally dead company bot with nobody told.",
   "deadman": {
     "enabled": false,
     "ping_url": ""
