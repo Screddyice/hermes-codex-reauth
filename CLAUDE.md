@@ -64,6 +64,15 @@ is precisely the class of mistake this repo exists to catch. There is a test.
 **A local failure outranks the peer watch.** The peer is only consulted when this
 box's own verdict is `ok`. Reporting a dark peer while this box's credential is
 broken buries the more urgent problem.
+**The observer alerts only when EVERY peer is dark.** While one Hermes box is up
+it already reports its dark partner, so alerting from `neb-ops-gcp` as well would
+page twice for one event. Widening it to "any peer dark" would look like more
+coverage and deliver only noise.
+
+**Observer mode is not a loophole in the `hermes_home` rule.** It is exempt purely
+because it inspects no credential; any config without `mode: observer` must still
+hard-fail with no auth store. There is a test asserting both halves.
+
 
 **Do not put the live probe back on a timer.** It ran every 30 minutes under the
 old design and produced 3 real detections against 209 quota-exhaustion errors,
@@ -114,12 +123,3 @@ See: `.claude-harness/sessions/{session-id}/context.json` and `.claude-harness/f
 - `memory/semantic/` - Project knowledge (persistent)
 - `memory/procedural/` - Success/failure patterns (append-only)
 - `memory/learned/` - Rules from user corrections (append-only)
-
-**The observer alerts only when EVERY peer is dark.** While one Hermes box is up
-it already reports its dark partner, so alerting from `neb-ops-gcp` as well would
-page twice for one event. Widening it to "any peer dark" would look like more
-coverage and deliver only noise.
-
-**Observer mode is not a loophole in the `hermes_home` rule.** It is exempt purely
-because it inspects no credential; any config without `mode: observer` must still
-hard-fail with no auth store. There is a test asserting both halves.
