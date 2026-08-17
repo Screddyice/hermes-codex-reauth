@@ -35,7 +35,8 @@ case "$HOST" in
   tmn)          DEST="$HOME/.hermes/profiles/tmn/codex-health";  TIMER="hermes-codex-health-tmn.timer"; SERVICE="hermes-codex-health-tmn.service"; NOTIFY="hermes-codex-health-tmn-notify.service"; BEAT="hermes-codex-heartbeat-tmn.service" ;;
   nebos-claude) DEST="$HOME/.hermes/profiles/tmn/claude-health"; TIMER="nebos-claude-health.timer";     SERVICE="nebos-claude-health.service";     NOTIFY="nebos-claude-health-notify.service"
                 CHECK_SRC="$HERE/claude_health_check.py" ;;
-  *) echo "usage: $0 --host {hostinger|tmn|nebos-claude}" >&2; exit 2 ;;
+  neb-ops)      DEST="$HOME/.watchdog-observer";                 TIMER="codex-observer.timer";          SERVICE="codex-observer.service";          NOTIFY="codex-observer-notify.service" ;;
+  *) echo "usage: $0 --host {hostinger|tmn|nebos-claude|neb-ops}" >&2; exit 2 ;;
 esac
 
 CFG_SRC="$HERE/hosts/$HOST.json"
@@ -50,7 +51,7 @@ install -m 0755 "$CHECK_SRC" "$DEST/check.py"
 install -m 0644 "$CFG_SRC"   "$DEST/config.json"
 # The live probe is a codex triage tool; the Claude watchdog already probes live,
 # so shipping it there would just be a second thing that can rot.
-if [[ "$HOST" != "nebos-claude" ]]; then
+if [[ "$HOST" != "nebos-claude" && "$HOST" != "neb-ops" ]]; then
   install -m 0755 "$HERE/codex_auth_probe.py" "$DEST/codex_auth_probe.py"
 fi
 # The last-resort escalator lives beside the check it backs up, and reads that

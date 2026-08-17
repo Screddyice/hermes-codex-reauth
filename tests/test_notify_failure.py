@@ -290,3 +290,20 @@ def test_install_ships_and_starts_the_heartbeat():
     assert 'install -m 0755 "$HERE/heartbeat_server.py"' in sh
     assert 'systemctl --user enable "$BEAT"' in sh
     assert "heartbeat server" in sh
+
+
+def test_env_beside_the_script_is_used_when_there_is_no_hermes_home(tmp_path, sent, monkeypatch):
+    """The observer host has no auth store and keeps its .env next to check.py.
+
+    Without this the escalator looked only under ~/.hermes and ~/, which do not
+    exist on that box, so it could never have fired. install.sh caught it.
+    """
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("TELEGRAM_HOME_CHANNEL", raising=False)
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({"host_label": "neb-ops-gcp", "mode": "observer"}))
+    (tmp_path / ".env").write_text("TELEGRAM_BOT_TOKEN=obs-token\nTELEGRAM_HOME_CHANNEL=42\n")
+    monkeypatch.setattr(nf, "HOME", tmp_path / "nowhere")
+
+    assert nf.run(Args(cfg)) == 0
+    assert sent[0]["token"] == "obs-token" and sent[0]["chat"] == "42"

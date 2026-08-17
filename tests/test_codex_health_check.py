@@ -554,6 +554,7 @@ class Args:
         self.no_email = kw.get("no_email", False)
         self.no_slack = kw.get("no_slack", False)
         self.no_linear = kw.get("no_linear", False)
+        self.no_telegram = kw.get("no_telegram", False)
 
 
 @pytest.fixture
@@ -706,3 +707,125 @@ def test_non_codex_gateway_is_quiet_but_unreadable_config_is_loud(tmp_path):
 
     with pytest.raises(chk.Disarmed):
         chk.gateway_uses_codex(tmp_path / "absent.yaml")
+
+
+# --------------------------------------------------------------------------
+# observer host — the backstop for BOTH boxes dark
+# --------------------------------------------------------------------------
+
+def obs_cfg(**over):
+    cfg = {"host_label": "neb-ops-gcp", "mode": "observer",
+           "peers": [
+               {"label": "hostinger", "bot_label": "@Screddy_bot",
+                "url": "http://100.98.215.63:8299/heartbeat", "stale_after_s": 46800},
+               {"label": "hermes-tmn", "bot_label": "@Teamnebula_bot",
+                "url": "http://100.126.215.66:8299/heartbeat", "stale_after_s": 46800},
+           ],
+           "channels": {"telegram": {"chat_id": "1", "token_env": "TELEGRAM_BOT_TOKEN"}}}
+    cfg.update(over)
+    return cfg
+
+
+def peers_aged(monkeypatch, ages):
+    """ages maps peer label -> heartbeat age in seconds (None = unreachable)."""
+    import contextlib, io, json as _json
+    by_url = {"http://100.98.215.63:8299/heartbeat": "hostinger",
+              "http://100.126.215.66:8299/heartbeat": "hermes-tmn"}
+
+    def opener(url, timeout=0):
+        age = ages[by_url[url]]
+        if age is None:
+            raise OSError("unreachable")
+        body = _json.dumps({"host": by_url[url], "at": int(time.time()) - age}).encode()
+        return contextlib.closing(io.BytesIO(body))
+    monkeypatch.setattr(chk.urllib.request, "urlopen", opener)
+
+
+def test_observer_stays_silent_while_one_box_is_alive(monkeypatch):
+    """A single dark box is already reported by its live peer.
+
+    Alerting here too would page twice for one event, which is the noise this
+    repo keeps refusing to add.
+    """
+    peers_aged(monkeypatch, {"hostinger": 60, "hermes-tmn": 99 * 3600})
+    status, _, _ = chk.observe_peers(obs_cfg(), {})
+    assert status == "ok"
+
+
+def test_observer_alerts_when_every_box_is_dark(monkeypatch):
+    peers_aged(monkeypatch, {"hostinger": 99 * 3600, "hermes-tmn": 99 * 3600})
+    status, detail, _ = chk.observe_peers(obs_cfg(), {})
+    assert status == "peer"
+    assert "every watched box is dark" in detail
+    assert "hostinger" in detail and "hermes-tmn" in detail
+
+
+def test_observer_unreachable_peers_still_need_two_misses(monkeypatch):
+    peers_aged(monkeypatch, {"hostinger": None, "hermes-tmn": None})
+
+    status, _, fails = chk.observe_peers(obs_cfg(), {})
+    assert status == "ok"                      # first miss on each, not evidence
+    assert fails == {"hostinger": 1, "hermes-tmn": 1}
+
+    status, _, fails = chk.observe_peers(obs_cfg(), fails)
+    assert status == "peer"
+    assert fails == {"hostinger": 2, "hermes-tmn": 2}
+
+
+def test_observer_config_needs_no_auth_store_but_others_still_do(tmp_path):
+    """Observer mode must not become a back door around the hermes_home rule."""
+    p = tmp_path / "obs.json"
+    p.write_text(json.dumps(obs_cfg()))
+    cfg = chk.load_config(p)                    # no hermes_home, and that is fine
+    assert cfg["mode"] == "observer"
+
+    p.write_text(json.dumps(obs_cfg(mode=None)))
+    with pytest.raises(chk.Disarmed, match="hermes_home"):
+        chk.load_config(p)
+
+    p.write_text(json.dumps(obs_cfg(peers=[])))
+    with pytest.raises(chk.Disarmed, match="watches no peers"):
+        chk.load_config(p)
+
+
+def test_shipped_observer_config_watches_both_boxes_over_the_tailnet():
+    cfg = chk.load_config(WATCHDOG / "hosts" / "neb-ops.json")
+    assert cfg["mode"] == "observer"
+    assert sorted(p["label"] for p in cfg["peers"]) == ["hermes-tmn", "hostinger"]
+    for peer in cfg["peers"]:
+        assert "://100." in peer["url"]
+    # telegram only: this box holds no Composio or Slack credential, and giving it
+    # one would put a broader secret on a third machine
+    assert list(cfg["channels"]) == ["telegram"]
+    assert "hermes_home" not in cfg
+
+
+def test_observer_run_does_not_require_an_auth_store(tmp_path, monkeypatch):
+    """Regression: run() resolved hermes_home before branching on mode.
+
+    load_config accepted the observer config and then run() raised KeyError on
+    cfg["hermes_home"]. Caught by install.sh's dry-run assertion on 2026-08-17,
+    which is the only reason it did not ship.
+    """
+    peers_aged(monkeypatch, {"hostinger": 60, "hermes-tmn": 60})
+    cfg_path = tmp_path / "obs.json"
+    cfg_path.write_text(json.dumps(obs_cfg()))
+    sent = []
+    monkeypatch.setattr(chk, "telegram_post", lambda ch, text, tok: sent.append(text))
+    monkeypatch.setattr(chk, "env_val", lambda name, hh: "tok")
+
+    rc = chk.run(Args(cfg_path, tmp_path / "state.json"))
+    assert rc == 0 and sent == []               # both peers fresh, stays quiet
+
+
+def test_observer_alert_reaches_telegram(tmp_path, monkeypatch):
+    peers_aged(monkeypatch, {"hostinger": 99 * 3600, "hermes-tmn": 99 * 3600})
+    cfg_path = tmp_path / "obs.json"
+    cfg_path.write_text(json.dumps(obs_cfg()))
+    sent = []
+    monkeypatch.setattr(chk, "telegram_post", lambda ch, text, tok: sent.append(text))
+    monkeypatch.setattr(chk, "env_val", lambda name, hh: "tok")
+
+    assert chk.run(Args(cfg_path, tmp_path / "state.json")) == 0
+    assert len(sent) == 1
+    assert "every watched box is dark" in sent[0]

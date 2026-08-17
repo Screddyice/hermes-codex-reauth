@@ -144,9 +144,13 @@ def send_telegram(token: str, chat_id: str, text: str, thread_id: str = "") -> N
 def run(args) -> int:
     cfg_path = pathlib.Path(args.config).expanduser() if args.config else HERE / "config.json"
     cfg = read_config(cfg_path)
-    hermes_home = None
     if cfg.get("hermes_home"):
         hermes_home = pathlib.Path(os.path.expanduser(cfg["hermes_home"]))
+    else:
+        # No Hermes home: either the config is unreadable, or this is the observer
+        # host, which has no auth store and keeps its .env beside the script. Look
+        # there before the Hermes paths, which on that box do not exist at all.
+        hermes_home = cfg_path.parent if cfg_path.parent.is_dir() else HERE
 
     token = env_val("TELEGRAM_BOT_TOKEN", hermes_home)
     chat = env_val("TELEGRAM_HOME_CHANNEL", hermes_home)

@@ -43,6 +43,7 @@ One watchdog per host, 4 runs a day, silent unless something is wrong.
 | `@Screddy_bot` codex | `~/.hermes/auth.json` | hostinger (`ubuntu`) | email |
 | `@Teamnebula_bot` codex | `~/.hermes/profiles/tmn/auth.json` | hermes-tmn (`screddy`) | Slack `#tmn-ops` + email |
 | **NEBOS v2 Claude** | `CLAUDE_CODE_OAUTH_TOKEN` in `nebos-dev` Secret Manager | hermes-tmn (`screddy`) | Slack `#tmn-ops` + email |
+| **both watchdogs** | the two heartbeats, over the tailnet | neb-ops-gcp (observer) | Telegram DM |
 
 The two hosts are **interleaved on the half-cycle** — TMN on 00/06/12/18:35, hostinger on
 03/09/15/21:35 — so each box is checked every 6h while the fleet as a whole is
@@ -54,9 +55,9 @@ watchdog/
   notify_failure.py       last-resort escalator, fired by OnFailure=
   heartbeat_server.py     serves this box's heartbeat to its peer, tailnet only
   codex_auth_probe.py     live probe — OPERATOR TOOL, not on any timer
-  hosts/{hostinger,tmn}.json   everything host-specific
-  systemd/                9 units, byte-identical to what is deployed
-  install.sh              --host {hostinger|tmn|nebos-claude}
+  hosts/{hostinger,tmn,neb-ops}.json   everything host-specific
+  systemd/                12 units, byte-identical to what is deployed
+  install.sh              --host {hostinger|tmn|nebos-claude|neb-ops}
 ```
 
 **Everything host-specific lives in `hosts/*.json`** — auth store, gateway unit,
@@ -275,9 +276,32 @@ different and unwanted signal. The peer watch answers that: it adds no vendor, n
 account, and no new signal type, because a dark peer is reported through the same
 "something is broken" channels as everything else.
 
-**What it still does not cover:** both boxes dark at the same time. That is a
-strictly smaller hole than before, when either box going dark was invisible, and
-closing it needs the external observer that was declined.
+### The backstop: neb-ops-gcp
+
+Mutual watching leaves one hole — both boxes dark at once, with no one left to
+report it. `neb-ops-gcp` closes it. It is a third always-on host already on the
+tailnet, it holds no Hermes credential and checks none, and it reads both
+heartbeats four times a day on `01,07,13,19:35`, offset from both Hermes hosts so
+a fleet-wide outage surfaces within about 90 minutes.
+
+**It alerts only when EVERY watched box is dark.** While one box is up, that box
+already reports its dark partner, and a second alert for the same event is the
+noise this repo keeps refusing to add. A test pins that behaviour, and the drill
+below confirmed it live.
+
+It alerts by Telegram DM, and that is a deliberate choice of secret: the observer
+needed some credential, and a bot token can only speak as a bot Shawn owns, where
+`TMN_COMPOSIO_API_KEY` could send mail as him. Telegram also keeps working when
+both boxes are off, being a cloud API that does not care whether either gateway
+runs. The token lives in `~/.watchdog-observer/.env`, mode 600.
+
+Observer mode is not a loophole in the `hermes_home` rule. A config with no
+`mode: observer` still hard-fails without an auth store; the observer is exempt
+only because it inspects no credential. Both halves have tests.
+
+**What remains uncovered:** all three hosts dark at once. Nothing watches the
+observer, so if it dies, coverage silently degrades to the mutual watch, which
+still catches any single box going dark. It is a backstop, not a root of trust.
 
 The heartbeat server binds the tailnet address from `tailscale ip -4` and refuses
 to start without one. It never falls back to `0.0.0.0`: hostinger has a public IP,

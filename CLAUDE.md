@@ -114,3 +114,12 @@ See: `.claude-harness/sessions/{session-id}/context.json` and `.claude-harness/f
 - `memory/semantic/` - Project knowledge (persistent)
 - `memory/procedural/` - Success/failure patterns (append-only)
 - `memory/learned/` - Rules from user corrections (append-only)
+
+**The observer alerts only when EVERY peer is dark.** While one Hermes box is up
+it already reports its dark partner, so alerting from `neb-ops-gcp` as well would
+page twice for one event. Widening it to "any peer dark" would look like more
+coverage and deliver only noise.
+
+**Observer mode is not a loophole in the `hermes_home` rule.** It is exempt purely
+because it inspects no credential; any config without `mode: observer` must still
+hard-fail with no auth store. There is a test asserting both halves.
