@@ -282,6 +282,69 @@ def quota_blocked(auth: dict, now: float | None = None,
                   f"window resets {when}")
 
 
+def write_heartbeat(path: pathlib.Path, cfg: dict, status: str) -> None:
+    """Record that this check ran, for the peer box to read.
+
+    Written on every completed run, including failing ones: the peer is watching
+    whether the check RUNS, which is a different question from what it found. A
+    box that is correctly reporting a broken credential is alive.
+
+    Never fatal. A heartbeat that cannot be written is worth a line on stderr, not
+    a dead watchdog -- the local verdict is the more important product.
+    """
+    try:
+        path.write_text(json.dumps({
+            "host": cfg.get("host_label", ""),
+            "unit": cfg.get("gateway_unit", ""),
+            "status": status,
+            "at": int(time.time()),
+        }))
+    except Exception as e:
+        print(f"  heartbeat not written ({type(e).__name__}: {e})", file=sys.stderr)
+
+
+def read_peer(cfg: dict, prev_fails: int) -> tuple[str, str, int]:
+    """Has the peer box's watchdog run recently?
+
+    Returns (verdict, detail, consecutive_failures) where verdict is one of
+    ok / peer / unknown.
+
+    Two failure shapes, treated differently on purpose:
+
+    * The heartbeat is READABLE but old -- the peer box is up and something
+      stopped its check. That is unambiguous, so it alerts on the first sighting.
+    * The heartbeat is UNREACHABLE -- could be the peer being down, could be a
+      DERP relay hiccup on a tailnet that already routes these two boxes
+      indirectly. One miss is not evidence, so it takes two consecutive runs
+      (~12h at the 6h cadence) before it pages.
+    """
+    peer = cfg.get("peer") or {}
+    if not peer.get("url"):
+        return "ok", "", 0
+
+    label = peer.get("label") or "peer"
+    stale_after = int(peer.get("stale_after_s", 46800))    # 13h: two 6h runs + grace
+    try:
+        with urllib.request.urlopen(peer["url"], timeout=20) as r:
+            hb = json.loads(r.read())
+    except Exception as e:
+        fails = prev_fails + 1
+        msg = (f"{label} heartbeat unreachable ({type(e).__name__}), "
+               f"{fails} consecutive")
+        if fails >= 2:
+            return "peer", (f"{msg} — the peer box is unreachable or its watchdog "
+                            f"is gone, so nothing is watching {peer.get('bot_label', label)}"), fails
+        return "unknown", msg, fails
+
+    age = int(time.time()) - int(hb.get("at") or 0)
+    if age > stale_after:
+        hrs = age / 3600.0
+        return "peer", (f"{label} last ran {hrs:.1f}h ago (limit "
+                        f"{stale_after / 3600:.0f}h) — its watchdog stopped running, "
+                        f"so nothing is watching {peer.get('bot_label', label)}"), 0
+    return "ok", f"{label} heartbeat {age // 60}m old", 0
+
+
 def gateway_active(unit: str) -> tuple[bool, str]:
     """Is the gateway actually running? Codex auth can be perfect while the bot is dead."""
     try:
@@ -433,6 +496,10 @@ def subject(cfg: dict, status: str) -> str:
         return cfg.get("quota_subject") or (
             f"Action needed: {cfg['bot_label']} is out of Codex quota "
             f"({cfg['host_label']})")
+    if status == "peer":
+        peer = cfg.get("peer") or {}
+        return (f"Action needed: the watchdog on {peer.get('label', 'the peer box')} "
+                f"has gone quiet")
     return cfg["subject"]
 
 
@@ -440,6 +507,9 @@ def ticket_title(cfg: dict, status: str) -> str:
     if status == "quota":
         return cfg.get("quota_ticket_title") or (
             f"Codex quota exhausted — {cfg['bot_label']} ({cfg['host_label']})")
+    if status == "peer":
+        peer = cfg.get("peer") or {}
+        return f"Watchdog silent on {peer.get('label', 'peer box')} — reported by {cfg['host_label']}"
     return cfg["ticket_title"]
 
 
@@ -457,6 +527,42 @@ def reauth_line(cfg: dict) -> str:
     return (f"Reauth here: {url}\n"
             f"  (start at step 1 below first — this page needs the device code "
             f"that the CLI prints)\n\n")
+
+
+PEER_REMEDY = [
+    "This alert is about the OTHER box. Nothing is wrong with the credential on",
+    "the host that sent it.",
+    "",
+    "The peer's watchdog has stopped running, so that bot is now unmonitored —",
+    "whatever breaks there next will go unreported. Check, on the peer:",
+    "",
+    "  systemctl --user status <its health timer>",
+    "  systemctl --user list-timers | grep health",
+    "  journalctl --user -u <its health service> -n 50",
+    "",
+    "Most likely: the timer was disabled or never re-enabled after maintenance",
+    "(2026-08-04), the box is off, or lingering was lost so its user units never",
+    "started at boot.",
+]
+
+
+def peer_alert_text(cfg: dict, detail: str, ticket: str | None) -> str:
+    """Alert body for a dark peer. Deliberately not the sign-in prose.
+
+    Sending the reauth runbook here would point an operator at the wrong machine
+    entirely, which is worse than saying nothing.
+    """
+    peer = cfg.get("peer") or {}
+    return (
+        f"The watchdog on {peer.get('label', 'the peer box')} has gone quiet. "
+        f"Reported by {cfg['host_label']}, whose own check is fine.\n\n"
+        f"What the check saw: {detail}\n\n"
+        + (f"Linear ticket: {ticket}\n\n" if ticket else "")
+        + "\n".join(PEER_REMEDY) + "\n\n"
+        "You will not get another message about this for 24 hours, and none at all "
+        "once it is reporting again.\n\n"
+        f"-- Automated check on {cfg['host_label']} (codex-health, peer watch)."
+    )
 
 
 QUOTA_REMEDY = [
@@ -497,6 +603,8 @@ def quota_alert_text(cfg: dict, detail: str, ticket: str | None) -> str:
 def alert_text(cfg: dict, detail: str, ticket: str | None, status: str = "down") -> str:
     if status == "quota":
         return quota_alert_text(cfg, detail, ticket)
+    if status == "peer":
+        return peer_alert_text(cfg, detail, ticket)
     return (
         f"{cfg['bot_label']} on {cfg['host_label']} can no longer sign in to Codex, "
         f"so it has stopped answering.\n\n"
@@ -512,6 +620,15 @@ def alert_text(cfg: dict, detail: str, ticket: str | None, status: str = "down")
 
 
 def ticket_body(cfg: dict, detail: str, status: str = "down") -> str:
+    if status == "peer":
+        peer = cfg.get("peer") or {}
+        return (
+            f"The watchdog on `{peer.get('label', 'the peer box')}` has stopped "
+            f"reporting. Filed by `{cfg['host_label']}`, whose own check is healthy.\n\n"
+            f"**What the check saw:** {detail}\n\n"
+            f"### Fix\n\n```\n" + "\n".join(PEER_REMEDY) + "\n```\n\n"
+            f"_Auto-filed by the {cfg['host_label']} codex-health check._"
+        )
     if status == "quota":
         return (
             f"`{cfg['bot_label']}` on `{cfg['host_label']}` is out of Codex quota, so it "
@@ -583,13 +700,28 @@ def run(args) -> int:
     status, detail = (("down", "forced by --force-down") if args.force_down
                       else detect(auth_path, cfg["gateway_unit"]))
 
-    if status == "unknown":
-        print(f"status=unknown ({detail}) — no action, state untouched")
-        return 0
-
     st = load_state(state_path)
     prev = st.get("status", "ok")
     now = int(time.time())
+
+    # The peer watch runs only when this box is healthy. With a local failure in
+    # hand, the peer is the less urgent of two problems and would bury it.
+    peer_fails = int(st.get("peer_fails", 0))
+    if status == "ok" and not args.force_peer:
+        pstatus, pdetail, peer_fails = read_peer(cfg, peer_fails)
+        if pstatus == "peer":
+            status, detail = "peer", pdetail
+        elif pstatus == "unknown":
+            print(f"peer: {pdetail} — not paging on one miss")
+        elif pdetail:
+            print(f"peer: {pdetail}")
+    elif args.force_peer:
+        status, detail = "peer", "forced by --force-peer"
+    st["peer_fails"] = peer_fails
+
+    if status == "unknown":
+        print(f"status=unknown ({detail}) — no action, state untouched")
+        return 0
 
     alert = False
     if status != "ok":
@@ -686,6 +818,10 @@ def run(args) -> int:
     st["status"] = status
     save_state(state_path, st)
 
+    # Written last and unconditionally: the peer is asking "did this check run",
+    # not "did it like what it found".
+    write_heartbeat(state_path.parent / "heartbeat.json", cfg, status)
+
     # An outage nobody was told about is indistinguishable from no outage. If we
     # decided to alert and every channel failed, that is a hard failure -- the
     # version this replaces printed the errors and still exited 0. It surfaces in
@@ -713,6 +849,8 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--force-down", action="store_true",
                     help="exercise the alert path (bypasses detection entirely)")
+    ap.add_argument("--force-peer", action="store_true",
+                    help="exercise the peer-down alert path (bypasses the peer fetch)")
     ap.add_argument("--no-email", action="store_true")
     ap.add_argument("--no-slack", action="store_true")
     ap.add_argument("--no-linear", action="store_true")

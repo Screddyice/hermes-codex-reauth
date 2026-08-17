@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import pathlib
+import sys
 
 import pytest
 
@@ -253,3 +254,39 @@ def test_install_ships_the_notifier_and_asserts_the_wiring():
     assert 'install -m 0644 "$HERE/systemd/$NOTIFY"' in sh
     assert "-p OnFailure --value" in sh
     assert "notify_failure.py" in sh and "--dry-run" in sh
+
+
+# --------------------------------------------------------------------------
+# heartbeat server — the peer's only view of this box
+# --------------------------------------------------------------------------
+
+hb = _load("heartbeat_server")
+
+
+def test_refuses_to_start_without_a_tailnet_address(monkeypatch, capsys):
+    """Falling back to 0.0.0.0 would publish this on hostinger's public IP.
+
+    A monitoring tool that quietly opens a public port is the kind of mistake
+    this repo exists to prevent, so no-tailnet-address is fatal.
+    """
+    monkeypatch.setattr(hb, "tailnet_ip", lambda: "")
+    monkeypatch.setattr(sys, "argv", ["heartbeat_server.py", "--file", "/tmp/x.json"])
+    assert hb.main() == 1
+    assert "REFUSING TO START" in capsys.readouterr().err
+
+
+def test_units_bind_the_heartbeat_to_the_documented_port():
+    for unit in ("hermes-codex-heartbeat.service", "hermes-codex-heartbeat-tmn.service"):
+        body = (WATCHDOG / "systemd" / unit).read_text()
+        assert "heartbeat_server.py" in body
+        assert "--port 8299" in body
+        assert "Restart=always" in body
+        # no --bind override: the server must resolve the tailnet address itself
+        assert "--bind" not in body
+
+
+def test_install_ships_and_starts_the_heartbeat():
+    sh = (WATCHDOG / "install.sh").read_text()
+    assert 'install -m 0755 "$HERE/heartbeat_server.py"' in sh
+    assert 'systemctl --user enable "$BEAT"' in sh
+    assert "heartbeat server" in sh

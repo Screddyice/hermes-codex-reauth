@@ -31,8 +31,8 @@ done
 # a live call, since its token is an opaque string with no local metadata.
 CHECK_SRC="$HERE/codex_health_check.py"
 case "$HOST" in
-  hostinger)    DEST="$HOME/.hermes/codex-health";               TIMER="hermes-codex-health.timer";     SERVICE="hermes-codex-health.service";     NOTIFY="hermes-codex-health-notify.service" ;;
-  tmn)          DEST="$HOME/.hermes/profiles/tmn/codex-health";  TIMER="hermes-codex-health-tmn.timer"; SERVICE="hermes-codex-health-tmn.service"; NOTIFY="hermes-codex-health-tmn-notify.service" ;;
+  hostinger)    DEST="$HOME/.hermes/codex-health";               TIMER="hermes-codex-health.timer";     SERVICE="hermes-codex-health.service";     NOTIFY="hermes-codex-health-notify.service";     BEAT="hermes-codex-heartbeat.service" ;;
+  tmn)          DEST="$HOME/.hermes/profiles/tmn/codex-health";  TIMER="hermes-codex-health-tmn.timer"; SERVICE="hermes-codex-health-tmn.service"; NOTIFY="hermes-codex-health-tmn-notify.service"; BEAT="hermes-codex-heartbeat-tmn.service" ;;
   nebos-claude) DEST="$HOME/.hermes/profiles/tmn/claude-health"; TIMER="nebos-claude-health.timer";     SERVICE="nebos-claude-health.service";     NOTIFY="nebos-claude-health-notify.service"
                 CHECK_SRC="$HERE/claude_health_check.py" ;;
   *) echo "usage: $0 --host {hostinger|tmn|nebos-claude}" >&2; exit 2 ;;
@@ -56,18 +56,27 @@ fi
 # The last-resort escalator lives beside the check it backs up, and reads that
 # check's config.json for host labels and hermes_home.
 install -m 0755 "$HERE/notify_failure.py" "$DEST/notify_failure.py"
+# The peer watch: this host serves its own heartbeat, and reads the other box's.
+if [[ -n "${BEAT:-}" ]]; then
+  install -m 0755 "$HERE/heartbeat_server.py" "$DEST/heartbeat_server.py"
+fi
 log "installed check.py + config.json + notify_failure.py -> $DEST"
 
 # --- 2. systemd units ---
 install -m 0644 "$HERE/systemd/$SERVICE" "$UNIT_DIR/$SERVICE"
 install -m 0644 "$HERE/systemd/$TIMER"   "$UNIT_DIR/$TIMER"
 install -m 0644 "$HERE/systemd/$NOTIFY"  "$UNIT_DIR/$NOTIFY"
+[[ -n "${BEAT:-}" ]] && install -m 0644 "$HERE/systemd/$BEAT" "$UNIT_DIR/$BEAT"
 systemctl --user daemon-reload
-log "installed units $SERVICE + $TIMER + $NOTIFY"
+log "installed units $SERVICE + $TIMER + $NOTIFY${BEAT:+ + $BEAT}"
 
 # --- 3. enable ---
 systemctl --user enable "$TIMER" >/dev/null
 systemctl --user start  "$TIMER"
+if [[ -n "${BEAT:-}" ]]; then
+  systemctl --user enable "$BEAT" >/dev/null
+  systemctl --user restart "$BEAT"
+fi
 
 # A monotonic timer (OnUnitActiveSec) can end up enabled+active with NO next
 # elapse when the service has not run recently — that is how a re-enabled timer
@@ -106,6 +115,25 @@ if OUT="$(/usr/bin/python3 "$DEST/notify_failure.py" --unit "$SERVICE" --dry-run
 else
   log "FAIL  escalator cannot resolve TELEGRAM_BOT_TOKEN / TELEGRAM_HOME_CHANNEL:"
   echo "$OUT" | sed 's/^/          /'; fail=1
+fi
+
+# The heartbeat is what the OTHER box reads to know this one is alive, so a
+# silently dead server here disables the peer's only view of this host.
+if [[ -n "${BEAT:-}" ]]; then
+  sleep 1
+  check "heartbeat server" "$(systemctl --user is-active "$BEAT" 2>&1)" "active"
+  TSIP="$(tailscale ip -4 2>/dev/null | head -1)"
+  if [[ -n "$TSIP" ]] && curl -fsS -m 8 "http://$TSIP:8299/heartbeat" >/dev/null 2>&1; then
+    log "OK    heartbeat reachable on http://$TSIP:8299/heartbeat"
+  else
+    # A missing heartbeat.json before the first run is expected, so only a dead
+    # listener counts as failure here.
+    if [[ -n "$TSIP" ]] && curl -sS -m 8 -o /dev/null -w '%{http_code}' "http://$TSIP:8299/heartbeat" 2>/dev/null | grep -q '^[0-9]'; then
+      log "OK    heartbeat listener up on $TSIP:8299 (no heartbeat written yet)"
+    else
+      log "FAIL  heartbeat not reachable on $TSIP:8299"; fail=1
+    fi
+  fi
 fi
 
 # Prove the installed script actually runs and resolves the intended credential.

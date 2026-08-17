@@ -52,9 +52,10 @@ checked every 3h, and the two can never alert in the same minute.
 watchdog/
   codex_health_check.py   canonical, shared by both hosts
   notify_failure.py       last-resort escalator, fired by OnFailure=
+  heartbeat_server.py     serves this box's heartbeat to its peer, tailnet only
   codex_auth_probe.py     live probe — OPERATOR TOOL, not on any timer
   hosts/{hostinger,tmn}.json   everything host-specific
-  systemd/                7 units, byte-identical to what is deployed
+  systemd/                9 units, byte-identical to what is deployed
   install.sh              --host {hostinger|tmn|nebos-claude}
 ```
 
@@ -240,12 +241,55 @@ wording rather than staying silent when `config.json` is unreadable. `install.sh
 dry-runs it on every deploy, so a notifier that could never fire fails the install
 instead of waiting to disappoint you.
 
-### Known limitation: nothing watches the watcher
+## The two boxes watch each other
 
-**By explicit decision (2026-08-12), there is no deadman and no liveness
-heartbeat.** The only notifications this system produces are "codex is actually
-broken". Every alert means something is genuinely wrong — nothing pings you to
-say it is still alive.
+`OnFailure=` needs a run to hook, so it cannot fire for a check that never runs.
+That gap is covered by a mutual peer watch, added 2026-08-17: each check writes a
+heartbeat, serves it on the tailnet, and reads its peer's. A box that stops
+reporting gets called out by the other one, through channels that already work.
+
+```
+hostinger  ──reads──▶ http://100.126.215.66:8299/heartbeat  (hermes-tmn)
+hermes-tmn ──reads──▶ http://100.98.215.63:8299/heartbeat   (hostinger)
+```
+
+Two failure shapes, handled differently on purpose:
+
+| What the peer looks like | Verdict | Why |
+|---|---|---|
+| Heartbeat readable, older than 13h | `peer`, alerts at once | The box is up and its check stopped. Unambiguous. |
+| Heartbeat unreachable | `unknown`, then `peer` on the second miss | These two boxes route over a DERP relay, so one miss is not evidence |
+
+13h is two 6h cycles plus grace. A local failure outranks the peer watch: a broken
+credential here beats a dark box over there, and burying the former under the
+latter would be a regression.
+
+The peer alert deliberately shares no prose with the sign-in alert. It says which
+box went quiet, that the reporting box is fine, and where to look — pointing an
+operator at a re-login on the wrong machine is worse than saying nothing.
+
+**Why not healthchecks.io.** A deadman was built and removed on 2026-08-12, and it
+had never actually run: both host configs shipped `enabled: false` with an empty
+`ping_url`. The objection then was that a service which pages when pings stop is a
+different and unwanted signal. The peer watch answers that: it adds no vendor, no
+account, and no new signal type, because a dark peer is reported through the same
+"something is broken" channels as everything else.
+
+**What it still does not cover:** both boxes dark at the same time. That is a
+strictly smaller hole than before, when either box going dark was invisible, and
+closing it needs the external observer that was declined.
+
+The heartbeat server binds the tailnet address from `tailscale ip -4` and refuses
+to start without one. It never falls back to `0.0.0.0`: hostinger has a public IP,
+and a monitoring tool that quietly opens a public port is the failure this repo
+exists to prevent. The payload carries no secrets — host label, unit, timestamp,
+last verdict.
+
+### Known limitation: nothing watches the watcher, alone
+
+**By explicit decision (2026-08-12), there is no external deadman.** The only
+notifications this system produces are "something is actually broken". Nothing
+pings you to say it is still alive; the peer box is what notices silence now.
 
 The cost is real and worth stating plainly, because it has already happened
 once: no in-process check can detect its own absence, so if a timer gets

@@ -411,6 +411,121 @@ def test_quota_prose_falls_back_when_a_host_config_predates_it(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# peer watch — the case OnFailure= cannot reach: a check that never runs
+# --------------------------------------------------------------------------
+
+def peer_cfg(url="http://peer.invalid/heartbeat", **over):
+    cfg = {"peer": {"label": "hermes-tmn", "bot_label": "@Teamnebula_bot",
+                    "url": url, "stale_after_s": 46800}}
+    cfg["peer"].update(over)
+    return cfg
+
+
+def fake_peer(monkeypatch, *, age_s=None, raises=None):
+    """Stand in for the peer's HTTP heartbeat endpoint."""
+    import contextlib, io, json as _json
+
+    def opener(url, timeout=0):
+        if raises:
+            raise raises
+        body = _json.dumps({"host": "hermes-tmn", "status": "ok",
+                            "at": int(time.time()) - age_s}).encode()
+        return contextlib.closing(io.BytesIO(body))
+    monkeypatch.setattr(chk.urllib.request, "urlopen", opener)
+
+
+def test_fresh_peer_heartbeat_is_ok(monkeypatch):
+    fake_peer(monkeypatch, age_s=600)
+    status, detail, fails = chk.read_peer(peer_cfg(), 0)
+    assert status == "ok" and fails == 0
+    assert "10m old" in detail
+
+
+def test_stale_peer_heartbeat_alerts_immediately(monkeypatch):
+    """Readable but old means the peer box is up and its check stopped. No ambiguity."""
+    fake_peer(monkeypatch, age_s=14 * 3600)
+    status, detail, _ = chk.read_peer(peer_cfg(), 0)
+    assert status == "peer"
+    assert "14.0h ago" in detail
+    assert "@Teamnebula_bot" in detail
+
+
+def test_unreachable_peer_needs_two_misses_before_paging(monkeypatch):
+    """These two boxes route over a DERP relay, so one miss is not evidence."""
+    fake_peer(monkeypatch, raises=OSError("connection refused"))
+
+    status, detail, fails = chk.read_peer(peer_cfg(), 0)
+    assert status == "unknown" and fails == 1
+    assert "1 consecutive" in detail
+
+    status, detail, fails = chk.read_peer(peer_cfg(), fails)
+    assert status == "peer" and fails == 2
+    assert "unreachable" in detail
+
+
+def test_recovered_peer_resets_the_failure_count(monkeypatch):
+    fake_peer(monkeypatch, age_s=60)
+    status, _, fails = chk.read_peer(peer_cfg(), 1)
+    assert status == "ok" and fails == 0
+
+
+def test_no_peer_configured_is_silent():
+    assert chk.read_peer({}, 0) == ("ok", "", 0)
+
+
+def test_local_failure_outranks_the_peer_watch(host, monkeypatch):
+    """A broken credential here beats a dark box over there."""
+    fake_peer(monkeypatch, age_s=99 * 3600)
+    cfg = json.loads(pathlib.Path(host["cfg"]).read_text())
+    cfg.update(peer_cfg())
+    pathlib.Path(host["cfg"]).write_text(json.dumps(cfg))
+    (host["home"] / "auth.json").write_text(json.dumps(auth_doc(refresh=None)))
+
+    chk.run(Args(host["cfg"], host["state"]))
+    assert "can no longer sign in" in host["sent"][0]
+    assert "has gone quiet" not in host["sent"][0]
+
+
+def test_peer_alert_points_at_the_other_box_not_a_relogin():
+    """Sending the sign-in runbook here would aim an operator at the wrong machine."""
+    cfg = chk.load_config(WATCHDOG / "hosts" / "hostinger.json")
+    body = chk.alert_text(cfg, "detail", None, "peer")
+    assert "auth.openai.com/codex/device" not in body
+    assert "OTHER box" in body
+    assert cfg["peer"]["label"] in body
+    assert "whose own check is fine" in body
+
+    assert "auth.openai.com/codex/device" not in chk.ticket_body(cfg, "d", "peer")
+    assert "gone quiet" in chk.subject(cfg, "peer")
+
+
+def test_heartbeat_is_written_on_every_completed_run(host):
+    """The peer asks whether the check RAN, not whether it liked what it found."""
+    hb = pathlib.Path(host["state"]).parent / "heartbeat.json"
+
+    chk.run(Args(host["cfg"], host["state"]))
+    first = json.loads(hb.read_text())
+    assert first["status"] == "ok" and first["at"] > 0
+
+    (host["home"] / "auth.json").write_text(json.dumps(auth_doc(refresh=None)))
+    chk.run(Args(host["cfg"], host["state"]))
+    assert json.loads(hb.read_text())["status"] == "down"
+
+
+def test_shipped_configs_point_at_each_other_over_the_tailnet():
+    host = chk.load_config(WATCHDOG / "hosts" / "hostinger.json")
+    tmn = chk.load_config(WATCHDOG / "hosts" / "tmn.json")
+
+    assert host["peer"]["label"] == "hermes-tmn"
+    assert tmn["peer"]["label"] == "hostinger"
+    # tailnet addresses only — a public IP here would route monitoring over the
+    # internet and would keep working if Tailscale died, hiding a real fault.
+    for cfg in (host, tmn):
+        assert "://100." in cfg["peer"]["url"], cfg["peer"]["url"]
+        assert cfg["peer"]["stale_after_s"] >= 2 * 6 * 3600
+
+
+# --------------------------------------------------------------------------
 # state
 # --------------------------------------------------------------------------
 
@@ -435,6 +550,7 @@ class Args:
         self.config, self.state_file = str(config), str(state_file)
         self.dry_run = kw.get("dry_run", False)
         self.force_down = kw.get("force_down", False)
+        self.force_peer = kw.get("force_peer", False)
         self.no_email = kw.get("no_email", False)
         self.no_slack = kw.get("no_slack", False)
         self.no_linear = kw.get("no_linear", False)

@@ -56,6 +56,15 @@ because its token is a different secret from a different vendor: a
 escalator working. Swapping it for a second email would silently undo the whole
 point.
 
+**The heartbeat server binds the tailnet address, never `0.0.0.0`.** hostinger has
+a public IP. `heartbeat_server.py` resolves the bind from `tailscale ip -4` and
+exits 1 when it cannot, because a monitoring tool that quietly opens a public port
+is precisely the class of mistake this repo exists to catch. There is a test.
+
+**A local failure outranks the peer watch.** The peer is only consulted when this
+box's own verdict is `ok`. Reporting a dark peer while this box's credential is
+broken buries the more urgent problem.
+
 **Do not put the live probe back on a timer.** It ran every 30 minutes under the
 old design and produced 3 real detections against 209 quota-exhaustion errors,
 consuming the plan quota it existed to protect. The README has the numbers.
