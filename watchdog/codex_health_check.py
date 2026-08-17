@@ -44,8 +44,11 @@ Alerting:
 EXIT CODES -- a watchdog that fails silently is worse than no watchdog, so every
 way this can stop working is loud:
   0  ran correctly (healthy, quiet, or alert fully delivered)
-  1  DISARMED or delivery failed -- something needs a human. Paired with
-     OnFailure= in the systemd unit.
+  1  DISARMED or delivery failed -- something needs a human. The unit's
+     OnFailure= fires notify_failure.py, which escalates over Telegram. That
+     directive was described here from the start and was not actually present in
+     any unit until 2026-08-17, so for months this exit code reached stderr and
+     stopped there.
 """
 from __future__ import annotations
 

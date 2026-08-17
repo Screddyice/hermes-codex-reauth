@@ -31,9 +31,9 @@ done
 # a live call, since its token is an opaque string with no local metadata.
 CHECK_SRC="$HERE/codex_health_check.py"
 case "$HOST" in
-  hostinger)    DEST="$HOME/.hermes/codex-health";               TIMER="hermes-codex-health.timer";     SERVICE="hermes-codex-health.service" ;;
-  tmn)          DEST="$HOME/.hermes/profiles/tmn/codex-health";  TIMER="hermes-codex-health-tmn.timer"; SERVICE="hermes-codex-health-tmn.service" ;;
-  nebos-claude) DEST="$HOME/.hermes/profiles/tmn/claude-health"; TIMER="nebos-claude-health.timer";     SERVICE="nebos-claude-health.service"
+  hostinger)    DEST="$HOME/.hermes/codex-health";               TIMER="hermes-codex-health.timer";     SERVICE="hermes-codex-health.service";     NOTIFY="hermes-codex-health-notify.service" ;;
+  tmn)          DEST="$HOME/.hermes/profiles/tmn/codex-health";  TIMER="hermes-codex-health-tmn.timer"; SERVICE="hermes-codex-health-tmn.service"; NOTIFY="hermes-codex-health-tmn-notify.service" ;;
+  nebos-claude) DEST="$HOME/.hermes/profiles/tmn/claude-health"; TIMER="nebos-claude-health.timer";     SERVICE="nebos-claude-health.service";     NOTIFY="nebos-claude-health-notify.service"
                 CHECK_SRC="$HERE/claude_health_check.py" ;;
   *) echo "usage: $0 --host {hostinger|tmn|nebos-claude}" >&2; exit 2 ;;
 esac
@@ -53,13 +53,17 @@ install -m 0644 "$CFG_SRC"   "$DEST/config.json"
 if [[ "$HOST" != "nebos-claude" ]]; then
   install -m 0755 "$HERE/codex_auth_probe.py" "$DEST/codex_auth_probe.py"
 fi
-log "installed check.py + config.json -> $DEST"
+# The last-resort escalator lives beside the check it backs up, and reads that
+# check's config.json for host labels and hermes_home.
+install -m 0755 "$HERE/notify_failure.py" "$DEST/notify_failure.py"
+log "installed check.py + config.json + notify_failure.py -> $DEST"
 
 # --- 2. systemd units ---
 install -m 0644 "$HERE/systemd/$SERVICE" "$UNIT_DIR/$SERVICE"
 install -m 0644 "$HERE/systemd/$TIMER"   "$UNIT_DIR/$TIMER"
+install -m 0644 "$HERE/systemd/$NOTIFY"  "$UNIT_DIR/$NOTIFY"
 systemctl --user daemon-reload
-log "installed units $SERVICE + $TIMER"
+log "installed units $SERVICE + $TIMER + $NOTIFY"
 
 # --- 3. enable ---
 systemctl --user enable "$TIMER" >/dev/null
@@ -86,6 +90,23 @@ check "linger"        "$(loginctl show-user "$USER" -p Linger --value 2>/dev/nul
 
 NEXT="$(systemctl --user show "$TIMER" -p NextElapseUSecRealtime --value)"
 if [[ -n "$NEXT" ]]; then log "OK    next elapse = $NEXT"; else log "FAIL  timer has no scheduled next run"; fail=1; fi
+
+# The OnFailure wiring is the whole point of the escalator, and a missing
+# directive is invisible until the day it was supposed to fire. Assert it.
+if systemctl --user show "$SERVICE" -p OnFailure --value | grep -q "$NOTIFY"; then
+  log "OK    OnFailure = $NOTIFY"
+else
+  log "FAIL  $SERVICE has no OnFailure=$NOTIFY"; fail=1
+fi
+
+# Prove the escalator can resolve its own credentials. It is the last thing that
+# will ever speak, so "it was never going to work" must surface at install time.
+if OUT="$(/usr/bin/python3 "$DEST/notify_failure.py" --unit "$SERVICE" --dry-run 2>&1 | head -1)"; then
+  log "OK    escalator ready: $OUT"
+else
+  log "FAIL  escalator cannot resolve TELEGRAM_BOT_TOKEN / TELEGRAM_HOME_CHANNEL:"
+  echo "$OUT" | sed 's/^/          /'; fail=1
+fi
 
 # Prove the installed script actually runs and resolves the intended credential.
 if OUT="$(/usr/bin/python3 "$DEST/check.py" --dry-run --state-file /tmp/install-probe-$$.json 2>&1)"; then

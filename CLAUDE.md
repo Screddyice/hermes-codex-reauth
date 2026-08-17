@@ -44,6 +44,18 @@ hard failure. There is a test for this — do not relax it.
 and exits 0 is a way for the watchdog to go blind while systemd stays green,
 which is exactly how a six-day outage went unnoticed. Raise `Disarmed` instead.
 
+**`notify_failure.py` must not import the health checks.** It is the last thing
+that speaks when a check cannot report, so it carries its own config read and env
+resolution and stays stdlib-only. A last resort that depends on the component
+which just failed is not a last resort. A test asserts the absence of those
+imports.
+
+**Its transport must stay independent of the alert channels.** Telegram is chosen
+because its token is a different secret from a different vendor: a
+`TMN_COMPOSIO_API_KEY` rotation kills hostinger's only channel and leaves the
+escalator working. Swapping it for a second email would silently undo the whole
+point.
+
 **Do not put the live probe back on a timer.** It ran every 30 minutes under the
 old design and produced 3 real detections against 209 quota-exhaustion errors,
 consuming the plan quota it existed to protect. The README has the numbers.

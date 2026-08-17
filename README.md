@@ -51,10 +51,11 @@ checked every 3h, and the two can never alert in the same minute.
 ```
 watchdog/
   codex_health_check.py   canonical, shared by both hosts
+  notify_failure.py       last-resort escalator, fired by OnFailure=
   codex_auth_probe.py     live probe — OPERATOR TOOL, not on any timer
   hosts/{hostinger,tmn}.json   everything host-specific
-  systemd/                4 units, byte-identical to what is deployed
-  install.sh              --host {hostinger|tmn}
+  systemd/                7 units, byte-identical to what is deployed
+  install.sh              --host {hostinger|tmn|nebos-claude}
 ```
 
 **Everything host-specific lives in `hosts/*.json`** — auth store, gateway unit,
@@ -207,6 +208,38 @@ green; all are now hard failures (exit 1): unreadable config, unreadable
 corrupt state. Most importantly, **"we decided to alert and every channel
 failed" is a failure** — it previously printed the error and exited 0.
 
+## When the watchdog cannot report
+
+Every check unit carries `OnFailure=`, which fires `notify_failure.py` and sends
+you a Telegram DM. It covers every non-zero exit: DISARMED, "alerted but nothing
+was delivered", a crash, a timeout. Those are the cases where the check knows
+something is wrong and cannot say so through its own channels.
+
+This existed only as a claim until 2026-08-17. The check's docstring said exit 1
+was "paired with `OnFailure=` in the systemd unit"; no unit had ever carried the
+directive. A failed delivery wrote to stderr, marked the unit failed, and stopped
+there — findable by running `systemctl --user status`, which nobody runs while
+everything looks fine. `install.sh` now reads back `OnFailure` from the installed
+unit and refuses to report success without it.
+
+**Why Telegram.** The escalation has to use a transport that cannot fail for the
+same reason the primary did. A second email address would not qualify: both
+authenticate with `TMN_COMPOSIO_API_KEY`, so one rotation takes out both. The
+Hermes Telegram bot token is a different secret from a different vendor, it is
+already on both boxes, and it fails visibly — if that token dies, the bot stops
+answering and you know within minutes.
+
+It matters most on hostinger, which alerts through email alone. If that Composio
+key rotates away, `env_val` returns empty and the run exits 1 having told nobody.
+Now it exits 1 *and* DMs you.
+
+`notify_failure.py` imports nothing from the health checks, on purpose. A last
+resort that depends on the component which just failed is not a last resort, so it
+carries its own config read, its own env resolution, and degrades to generic
+wording rather than staying silent when `config.json` is unreadable. `install.sh`
+dry-runs it on every deploy, so a notifier that could never fire fails the install
+instead of waiting to disappoint you.
+
 ### Known limitation: nothing watches the watcher
 
 **By explicit decision (2026-08-12), there is no deadman and no liveness
@@ -221,9 +254,16 @@ indistinguishable from health. That outage ran six days. A deadman was built,
 tested, and then removed rather than left switched off, because disabled code
 rots and an installer that nags about an unwanted feature is noise.
 
-Same reasoning rules out `OnFailure=`: it would only retry the channels already
-known to be dead. A failed delivery therefore surfaces **only** as a non-zero
-exit in `systemctl --user status` and the journal.
+`OnFailure=` was ruled out here on the same reasoning, on the grounds that it
+would only retry the channels already known to be dead. **That was reversed on
+2026-08-17**, because the objection holds only for a retry. Escalating over a
+transport with a different secret and a different vendor is not a retry: when the
+Composio key is what broke, a Telegram DM is unaffected. See "When the watchdog
+cannot report" above.
+
+What remains true is the part this does not solve. `OnFailure=` needs a run to
+hook, so it cannot fire for a check that never runs. The 2026-08-04 disabled-timer
+case would still go six days unnoticed, and only a deadman closes that.
 
 If that trade is ever revisited, the mechanism is small — a single HTTP GET at
 the end of a successful run — and `git log` has the removed implementation.
