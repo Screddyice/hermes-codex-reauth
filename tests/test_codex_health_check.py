@@ -186,6 +186,30 @@ def test_alert_omits_the_reauth_line_when_no_url_configured(tmp_path):
     assert "Reauth here" not in chk.alert_text(cfg, "detail", None)
 
 
+def test_company_alerts_reach_the_team_and_personal_ones_do_not():
+    """Set 2026-08-17: outages page Shawn, Ian and Abraham — except @Screddy_bot.
+
+    Shawn's personal assistant going down is not an Ian or Abraham problem, and
+    routing it to them trains three people to ignore the channel.
+    """
+    team = {"shawn@teamnebula.ai", "ian@teamnebula.ai", "abraham@teamnebula.ai"}
+
+    for host in ("tmn", "nebos-claude"):
+        # read as JSON: nebos-claude.json is the Claude watchdog's config and has
+        # no hermes_home, so the codex loader rightly refuses it
+        cfg = json.loads((WATCHDOG / "hosts" / f"{host}.json").read_text())
+        assert set(cfg["channels"]["email"]["to"]) == team, host
+
+    personal = chk.load_config(WATCHDOG / "hosts" / "hostinger.json")
+    assert personal["channels"]["email"]["to"] == ["shawn@teamnebula.ai"]
+    assert "ian@teamnebula.ai" not in personal["channels"]["email"]["to"]
+
+    # The backstop covers both bots, so it must reach further than Shawn's DM.
+    obs = chk.load_config(WATCHDOG / "hosts" / "neb-ops.json")
+    assert sorted(obs["channels"]) == ["slack", "telegram"]
+    assert obs["channels"]["slack"]["channel"] == "C09FLJDCAJD"
+
+
 def test_shipped_codex_hosts_route_alerts_per_host():
     """Routing set by instruction on 2026-08-17, and different per box.
 
@@ -202,7 +226,7 @@ def test_shipped_codex_hosts_route_alerts_per_host():
     assert sorted(tmn["channels"]) == ["email", "slack"]
     assert tmn["channels"]["slack"]["channel"] == "C09FLJDCAJD"        # #tmn-ops
     assert tmn["channels"]["slack"]["token_env"] == "SLACK_BOT_TOKEN"
-    assert tmn["channels"]["email"]["to"] == ["shawn@teamnebula.ai"]
+    assert "shawn@teamnebula.ai" in tmn["channels"]["email"]["to"]
 
     # The personal box must not page the team channel.
     assert "slack" not in host["channels"]
@@ -794,9 +818,10 @@ def test_shipped_observer_config_watches_both_boxes_over_the_tailnet():
     assert sorted(p["label"] for p in cfg["peers"]) == ["hermes-tmn", "hostinger"]
     for peer in cfg["peers"]:
         assert "://100." in peer["url"]
-    # telegram only: this box holds no Composio or Slack credential, and giving it
-    # one would put a broader secret on a third machine
-    assert list(cfg["channels"]) == ["telegram"]
+    # telegram reaches Shawn; slack #tmn-ops reaches the team. Composio is still
+    # kept off this box — it could send mail as Shawn, a broader secret than either.
+    assert sorted(cfg["channels"]) == ["slack", "telegram"]
+    assert "email" not in cfg["channels"]
     assert "hermes_home" not in cfg
 
 
