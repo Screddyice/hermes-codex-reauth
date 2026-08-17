@@ -186,6 +186,19 @@ def test_alert_omits_the_reauth_line_when_no_url_configured(tmp_path):
     assert "Reauth here" not in chk.alert_text(cfg, "detail", None)
 
 
+def test_shipped_codex_hosts_alert_only_to_the_ops_channel():
+    """Slack #tmn-ops is the only channel, by instruction (2026-08-17).
+
+    Both boxes previously also mailed via Composio, and hostinger filed a Linear
+    ticket. Alerts now land in one place so there is one thing to watch.
+    """
+    for host in ("hostinger", "tmn"):
+        cfg = chk.load_config(WATCHDOG / "hosts" / f"{host}.json")
+        assert list(cfg["channels"]) == ["slack"], f"{host} must alert to slack only"
+        assert cfg["channels"]["slack"]["channel"] == "C09FLJDCAJD"   # #tmn-ops
+        assert cfg["channels"]["slack"]["token_env"] == "SLACK_BOT_TOKEN"
+
+
 def test_shipped_configs_carry_their_own_runbook_only():
     """Each host's runbook must not tell an operator to log into the other box."""
     tmn = chk.load_config(WATCHDOG / "hosts" / "tmn.json")

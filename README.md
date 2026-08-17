@@ -40,8 +40,8 @@ One watchdog per host, 4 runs a day, silent unless something is wrong.
 
 | Target | Credential watched | Runs on | Alerts to |
 |---|---|---|---|
-| `@Screddy_bot` codex | `~/.hermes/auth.json` | hostinger (`ubuntu`) | email + Linear |
-| `@Teamnebula_bot` codex | `~/.hermes/profiles/tmn/auth.json` | hermes-tmn (`screddy`) | Slack `#tmn-ops` + email |
+| `@Screddy_bot` codex | `~/.hermes/auth.json` | hostinger (`ubuntu`) | Slack `#tmn-ops` |
+| `@Teamnebula_bot` codex | `~/.hermes/profiles/tmn/auth.json` | hermes-tmn (`screddy`) | Slack `#tmn-ops` |
 | **NEBOS v2 Claude** | `CLAUDE_CODE_OAUTH_TOKEN` in `nebos-dev` Secret Manager | hermes-tmn (`screddy`) | Slack `#tmn-ops` + email |
 
 The two hosts are **interleaved on the half-cycle** — TMN on 00/06/12/18:35, hostinger on
@@ -164,6 +164,17 @@ A broken sign-in outranks quota: with both wrong you get `down`, because quota i
 moot until the credential can call at all.
 
 ## Alerting
+
+Both codex hosts alert to **Slack `#tmn-ops` and nowhere else** (2026-08-17, by
+instruction). hostinger previously mailed through Composio and filed a Linear
+ticket; tmn mailed as well. One destination means one place to watch.
+
+Read the trade before adding a second channel back: a single channel is a single
+point of failure, and Slack is exactly what failed on 2026-08-17. An app reinstall
+dropped the bot from `#tmn-ops`, so `chat.postMessage` returned `not_in_channel`
+and any alert would have gone nowhere. That case is loud rather than silent (the
+run exits 1 and systemd records it), but nobody gets told. If the bot leaves the
+channel again, alerting is down until it rejoins.
 
 ```
 ok    -> down/quota   alert once on every configured channel
