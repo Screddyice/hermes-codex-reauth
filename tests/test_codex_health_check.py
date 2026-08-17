@@ -186,17 +186,26 @@ def test_alert_omits_the_reauth_line_when_no_url_configured(tmp_path):
     assert "Reauth here" not in chk.alert_text(cfg, "detail", None)
 
 
-def test_shipped_codex_hosts_alert_only_to_the_ops_channel():
-    """Slack #tmn-ops is the only channel, by instruction (2026-08-17).
+def test_shipped_codex_hosts_route_alerts_per_host():
+    """Routing set by instruction on 2026-08-17, and different per box.
 
-    Both boxes previously also mailed via Composio, and hostinger filed a Linear
-    ticket. Alerts now land in one place so there is one thing to watch.
+    hostinger (@Screddy_bot) is Shawn's own assistant, so it emails him and does
+    not post to the team channel. hermes-tmn (@Teamnebula_bot) is company
+    infrastructure with no fallback provider, so it does both. Linear ticketing
+    was dropped from hostinger in the same pass.
     """
-    for host in ("hostinger", "tmn"):
-        cfg = chk.load_config(WATCHDOG / "hosts" / f"{host}.json")
-        assert list(cfg["channels"]) == ["slack"], f"{host} must alert to slack only"
-        assert cfg["channels"]["slack"]["channel"] == "C09FLJDCAJD"   # #tmn-ops
-        assert cfg["channels"]["slack"]["token_env"] == "SLACK_BOT_TOKEN"
+    host = chk.load_config(WATCHDOG / "hosts" / "hostinger.json")
+    assert list(host["channels"]) == ["email"]
+    assert host["channels"]["email"]["to"] == ["shawn@teamnebula.ai"]
+
+    tmn = chk.load_config(WATCHDOG / "hosts" / "tmn.json")
+    assert sorted(tmn["channels"]) == ["email", "slack"]
+    assert tmn["channels"]["slack"]["channel"] == "C09FLJDCAJD"        # #tmn-ops
+    assert tmn["channels"]["slack"]["token_env"] == "SLACK_BOT_TOKEN"
+    assert tmn["channels"]["email"]["to"] == ["shawn@teamnebula.ai"]
+
+    # The personal box must not page the team channel.
+    assert "slack" not in host["channels"]
 
 
 def test_shipped_configs_carry_their_own_runbook_only():

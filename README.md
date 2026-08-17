@@ -40,8 +40,8 @@ One watchdog per host, 4 runs a day, silent unless something is wrong.
 
 | Target | Credential watched | Runs on | Alerts to |
 |---|---|---|---|
-| `@Screddy_bot` codex | `~/.hermes/auth.json` | hostinger (`ubuntu`) | Slack `#tmn-ops` |
-| `@Teamnebula_bot` codex | `~/.hermes/profiles/tmn/auth.json` | hermes-tmn (`screddy`) | Slack `#tmn-ops` |
+| `@Screddy_bot` codex | `~/.hermes/auth.json` | hostinger (`ubuntu`) | email |
+| `@Teamnebula_bot` codex | `~/.hermes/profiles/tmn/auth.json` | hermes-tmn (`screddy`) | Slack `#tmn-ops` + email |
 | **NEBOS v2 Claude** | `CLAUDE_CODE_OAUTH_TOKEN` in `nebos-dev` Secret Manager | hermes-tmn (`screddy`) | Slack `#tmn-ops` + email |
 
 The two hosts are **interleaved on the half-cycle** — TMN on 00/06/12/18:35, hostinger on
@@ -165,16 +165,18 @@ moot until the credential can call at all.
 
 ## Alerting
 
-Both codex hosts alert to **Slack `#tmn-ops` and nowhere else** (2026-08-17, by
-instruction). hostinger previously mailed through Composio and filed a Linear
-ticket; tmn mailed as well. One destination means one place to watch.
+Routing differs per box, set on 2026-08-17. `@Screddy_bot` on hostinger is Shawn's
+own assistant, so it emails him and stays out of the team channel. `@Teamnebula_bot`
+on hermes-tmn is company infrastructure with no fallback provider, so it posts to
+Slack `#tmn-ops` **and** emails. hostinger's Linear ticketing was dropped in the
+same pass.
 
-Read the trade before adding a second channel back: a single channel is a single
-point of failure, and Slack is exactly what failed on 2026-08-17. An app reinstall
-dropped the bot from `#tmn-ops`, so `chat.postMessage` returned `not_in_channel`
-and any alert would have gone nowhere. That case is loud rather than silent (the
-run exits 1 and systemd records it), but nobody gets told. If the bot leaves the
-channel again, alerting is down until it rejoins.
+hostinger now has a single channel, so read the failure mode: if the Composio key
+rotates away, `env_val` returns empty, and the run exits 1 with nothing delivered.
+That is loud in the journal and silent to you, and nothing watches the watcher.
+tmn survives losing either channel, which is the reason it keeps two: on 2026-08-17
+a Slack app reinstall dropped the bot from `#tmn-ops` and `chat.postMessage` would
+have returned `not_in_channel`.
 
 ```
 ok    -> down/quota   alert once on every configured channel

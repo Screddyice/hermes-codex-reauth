@@ -8,9 +8,12 @@
   "subject": "Action needed: personal Hermes lost its Codex sign-in (hostinger)",
   "ticket_title": "Codex sign-in lost \u2014 personal Hermes (hostinger)",
   "channels": {
-    "slack": {
-      "channel": "C09FLJDCAJD",
-      "token_env": "SLACK_BOT_TOKEN"
+    "email": {
+      "to": [
+        "shawn@teamnebula.ai"
+      ],
+      "key_env": "TMN_COMPOSIO_API_KEY",
+      "composio_user_id": "user_uwgmr"
     }
   },
   "runbook": [
