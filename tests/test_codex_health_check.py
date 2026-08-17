@@ -41,26 +41,57 @@ chk = _load("codex_health_check")
 # helpers
 # --------------------------------------------------------------------------
 
-def jwt_with_exp(exp: int | None) -> str:
+def jwt_with_exp(exp: int | None, plan: str | None = None) -> str:
     """A syntactically valid JWT carrying just the claims detect() reads."""
-    claims = {"https://api.openai.com/auth": {"chatgpt_account_id": "acct-test"}}
+    auth = {"chatgpt_account_id": "acct-test"}
+    if plan is not None:
+        auth["chatgpt_plan_type"] = plan
+    claims = {"https://api.openai.com/auth": auth}
     if exp is not None:
         claims["exp"] = exp
     payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
     return f"header.{payload}.sig"
 
 
+def pool_entry(*, label="cred-1", exhausted=True, reset_offset=+3600,
+               status_age_s=60, code=429, in_message=True) -> dict:
+    """A credential_pool entry shaped like the ones Hermes actually writes.
+
+    Mirrors the real record from the 2026-08-17 incident: last_status
+    "exhausted", last_error_code 429, and the 429 body stored as a Python repr
+    (not JSON) with resets_at inside it.
+    """
+    e = {"id": label, "label": label, "auth_type": "oauth",
+         "last_status_at": time.time() - status_age_s}
+    if not exhausted:
+        e["last_status"] = "ok"
+        return e
+    e["last_status"] = "exhausted"
+    e["last_error_code"] = code
+    reset = int(time.time()) + reset_offset if reset_offset is not None else None
+    body = ("Error code: 429 - {'error': {'type': 'usage_limit_reached', "
+            "'message': 'The usage limit has been reached', 'plan_type': 'plus'"
+            + (f", 'resets_at': {reset}" if (reset and in_message) else "")
+            + "}}")
+    e["last_error_message"] = body
+    return e
+
+
 def auth_doc(*, refresh="rt-aaa", exp_offset=+86400, last_error=None,
-             last_refresh="2026-08-01T00:00:00Z", empty=False) -> dict:
+             last_refresh="2026-08-01T00:00:00Z", empty=False,
+             pool=None, plan=None) -> dict:
     if empty:
         return {"providers": {}, "credential_pool": {}}
     exp = int(time.time()) + exp_offset if exp_offset is not None else None
-    prov = {"tokens": {"access_token": jwt_with_exp(exp)}, "last_refresh": last_refresh}
+    prov = {"tokens": {"access_token": jwt_with_exp(exp, plan)}, "last_refresh": last_refresh}
     if refresh:
         prov["tokens"]["refresh_token"] = refresh
     if last_error:
         prov["last_auth_error"] = last_error
-    return {"providers": {"openai-codex": prov}}
+    doc = {"providers": {"openai-codex": prov}}
+    if pool is not None:
+        doc["credential_pool"] = {"openai-codex": pool}
+    return doc
 
 
 def write_host(tmp_path, name: str, hermes_home, **overrides) -> pathlib.Path:
@@ -155,6 +186,28 @@ def test_alert_omits_the_reauth_line_when_no_url_configured(tmp_path):
     assert "Reauth here" not in chk.alert_text(cfg, "detail", None)
 
 
+def test_shipped_codex_hosts_route_alerts_per_host():
+    """Routing set by instruction on 2026-08-17, and different per box.
+
+    hostinger (@Screddy_bot) is Shawn's own assistant, so it emails him and does
+    not post to the team channel. hermes-tmn (@Teamnebula_bot) is company
+    infrastructure with no fallback provider, so it does both. Linear ticketing
+    was dropped from hostinger in the same pass.
+    """
+    host = chk.load_config(WATCHDOG / "hosts" / "hostinger.json")
+    assert list(host["channels"]) == ["email"]
+    assert host["channels"]["email"]["to"] == ["shawn@teamnebula.ai"]
+
+    tmn = chk.load_config(WATCHDOG / "hosts" / "tmn.json")
+    assert sorted(tmn["channels"]) == ["email", "slack"]
+    assert tmn["channels"]["slack"]["channel"] == "C09FLJDCAJD"        # #tmn-ops
+    assert tmn["channels"]["slack"]["token_env"] == "SLACK_BOT_TOKEN"
+    assert tmn["channels"]["email"]["to"] == ["shawn@teamnebula.ai"]
+
+    # The personal box must not page the team channel.
+    assert "slack" not in host["channels"]
+
+
 def test_shipped_configs_carry_their_own_runbook_only():
     """Each host's runbook must not tell an operator to log into the other box."""
     tmn = chk.load_config(WATCHDOG / "hosts" / "tmn.json")
@@ -240,6 +293,121 @@ def test_lineage_is_stable_and_distinguishes_credentials():
     assert chk.lineage("rt-aaa") == chk.lineage("rt-aaa")
     assert chk.lineage("rt-aaa") != chk.lineage("rt-bbb")
     assert chk.lineage("") == "none"
+
+
+# --------------------------------------------------------------------------
+# quota — the blind spot that let 2026-08-15..17 read as "healthy"
+# --------------------------------------------------------------------------
+
+def test_exhausted_pool_is_quota_not_ok(tmp_path):
+    """The regression this whole change exists for.
+
+    For three days the credential refreshed perfectly, the gateway was active,
+    and every user message got the canned rate-limit reply — and this check
+    printed "status=ok healthy" through all of it.
+    """
+    (tmp_path / "auth.json").write_text(json.dumps(auth_doc(pool=[pool_entry()])))
+    status, detail = chk.detect(tmp_path / "auth.json", "u.service")
+    assert status == "quota"
+    assert "out of quota" in detail
+    assert "signing in again will not help" in detail
+
+
+def test_quota_is_distinct_from_down_so_the_advice_can_differ(tmp_path):
+    """quota must not be reported as `down`; the two need opposite responses."""
+    (tmp_path / "auth.json").write_text(json.dumps(auth_doc(pool=[pool_entry()])))
+    assert chk.detect(tmp_path / "auth.json", "u.service")[0] != "down"
+
+
+def test_spent_window_stops_paging_by_itself(tmp_path):
+    """resets_at in the past means the window rolled — stale evidence, not an outage."""
+    (tmp_path / "auth.json").write_text(json.dumps(
+        auth_doc(pool=[pool_entry(reset_offset=-3600)])))
+    assert chk.detect(tmp_path / "auth.json", "u.service")[0] == "ok"
+
+
+def test_one_usable_pooled_credential_means_no_alert(tmp_path):
+    """The pool is a failover set: one live entry and the bot still answers."""
+    (tmp_path / "auth.json").write_text(json.dumps(auth_doc(
+        pool=[pool_entry(label="dead"), pool_entry(label="live", exhausted=False)])))
+    assert chk.detect(tmp_path / "auth.json", "u.service")[0] == "ok"
+
+
+def test_exhausted_with_no_reset_time_falls_back_to_recency(tmp_path):
+    """No resets_at to judge by: fresh evidence pages, ancient evidence does not.
+
+    A live exhaustion re-stamps last_status_at on every attempt, so this cannot
+    swallow a real outage — it only stops an old record paging forever.
+    """
+    fresh = pool_entry(reset_offset=None, in_message=False, status_age_s=60)
+    (tmp_path / "auth.json").write_text(json.dumps(auth_doc(pool=[fresh])))
+    assert chk.detect(tmp_path / "auth.json", "u.service")[0] == "quota"
+
+    old = pool_entry(reset_offset=None, in_message=False,
+                     status_age_s=chk.QUOTA_STALE_S + 600)
+    (tmp_path / "auth.json").write_text(json.dumps(auth_doc(pool=[old])))
+    assert chk.detect(tmp_path / "auth.json", "u.service")[0] == "ok"
+
+
+def test_broken_signin_outranks_quota(tmp_path):
+    """With both broken, report the sign-in: quota is moot until it can call at all."""
+    (tmp_path / "auth.json").write_text(json.dumps(
+        auth_doc(refresh=None, pool=[pool_entry()])))
+    status, detail = chk.detect(tmp_path / "auth.json", "u.service")
+    assert status == "down" and "NO refresh token" in detail
+
+
+def test_plan_is_context_only_and_never_the_trigger(tmp_path):
+    """A free plan is surfaced in the detail line but must not page on its own.
+
+    The claim is baked at issuance and lags a plan change: on 2026-08-17 it read
+    `free` while the upgraded account was already serving traffic.
+    """
+    (tmp_path / "auth.json").write_text(json.dumps(auth_doc(plan="free")))
+    status, detail = chk.detect(tmp_path / "auth.json", "u.service")
+    assert status == "ok"
+    assert "plan=free" in detail
+
+
+def test_quota_reset_parsed_from_the_python_repr_body():
+    """Hermes stores the 429 body as a repr, not JSON, so it is matched not parsed."""
+    reset = int(time.time()) + 1234
+    e = {"last_status": "exhausted", "last_error_code": 429,
+         "last_error_message": "Error code: 429 - {'error': {'resets_at': %d}}" % reset}
+    assert chk._reset_at_of(e) == float(reset)
+
+
+def test_quota_alert_never_offers_the_reauth_link():
+    """The core lesson of 2026-08-17: two device-code logins were completed against
+    an exhausted plan. Offering the link here is offering the wrong action."""
+    for host in ("hostinger", "tmn"):
+        cfg = chk.load_config(WATCHDOG / "hosts" / f"{host}.json")
+        body = chk.alert_text(cfg, "detail", None, "quota")
+        assert "auth.openai.com/codex/device" not in body
+        assert "NOT a sign-in problem" in body
+        assert "out of Codex quota" in body
+
+        ticket = chk.ticket_body(cfg, "detail", "quota")
+        assert "auth.openai.com/codex/device" not in ticket
+
+        # and the sign-in alert is unchanged — it still leads with the link
+        assert "auth.openai.com/codex/device" in chk.alert_text(cfg, "detail", None)
+
+
+def test_quota_subject_and_title_do_not_claim_a_lost_signin():
+    for host in ("hostinger", "tmn"):
+        cfg = chk.load_config(WATCHDOG / "hosts" / f"{host}.json")
+        assert "quota" in chk.subject(cfg, "quota").lower()
+        assert "sign-in" not in chk.subject(cfg, "quota").lower()
+        assert "quota" in chk.ticket_title(cfg, "quota").lower()
+        assert chk.subject(cfg, "down") == cfg["subject"]
+
+
+def test_quota_prose_falls_back_when_a_host_config_predates_it(tmp_path):
+    """An un-migrated host must still page, just with generic wording."""
+    cfg = chk.load_config(write_host(tmp_path, "old", "~/.hermes"))
+    assert "out of Codex quota" in chk.subject(cfg, "quota")
+    assert "NOT a sign-in problem" in chk.alert_text(cfg, "d", None, "quota")
 
 
 # --------------------------------------------------------------------------
@@ -340,6 +508,48 @@ def test_alert_with_every_channel_failing_exits_nonzero(host, monkeypatch):
     assert chk.run(Args(host["cfg"], host["state"])) == 1
 
 
+
+
+def test_quota_outage_alerts_once_then_goes_quiet(host):
+    (host["home"] / "auth.json").write_text(json.dumps(auth_doc(pool=[pool_entry()])))
+
+    assert chk.run(Args(host["cfg"], host["state"])) == 0
+    assert len(host["sent"]) == 1
+    assert "out of Codex quota" in host["sent"][0]
+    assert json.loads(host["state"].read_text())["status"] == "quota"
+
+    assert chk.run(Args(host["cfg"], host["state"])) == 0
+    assert len(host["sent"]) == 1                     # quiet window holds
+
+
+def test_failure_kind_change_re_alerts_inside_the_quiet_window(host):
+    """An auth outage that becomes a quota outage must page again.
+
+    Inheriting the earlier alert's silence would leave "go re-login" standing as
+    the last instruction given, for a problem a re-login cannot fix.
+    """
+    (host["home"] / "auth.json").write_text(json.dumps(auth_doc(refresh=None)))
+    chk.run(Args(host["cfg"], host["state"]))
+    assert len(host["sent"]) == 1
+    assert "can no longer sign in" in host["sent"][0]
+
+    (host["home"] / "auth.json").write_text(json.dumps(auth_doc(pool=[pool_entry()])))
+    chk.run(Args(host["cfg"], host["state"]))
+    assert len(host["sent"]) == 2                     # not silenced by the window
+    assert "out of Codex quota" in host["sent"][1]
+    assert "NOT a sign-in problem" in host["sent"][1]
+
+
+def test_quota_recovery_is_silent_and_rearms(host):
+    (host["home"] / "auth.json").write_text(json.dumps(auth_doc(pool=[pool_entry()])))
+    chk.run(Args(host["cfg"], host["state"]))
+    assert len(host["sent"]) == 1
+
+    (host["home"] / "auth.json").write_text(json.dumps(
+        auth_doc(pool=[pool_entry(reset_offset=-60)])))
+    chk.run(Args(host["cfg"], host["state"]))
+    assert len(host["sent"]) == 1                     # no "recovered" message
+    assert json.loads(host["state"].read_text())["status"] == "ok"
 
 
 def test_dry_run_never_writes_state(host):

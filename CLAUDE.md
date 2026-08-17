@@ -48,6 +48,22 @@ which is exactly how a six-day outage went unnoticed. Raise `Disarmed` instead.
 old design and produced 3 real detections against 209 quota-exhaustion errors,
 consuming the plan quota it existed to protect. The README has the numbers.
 
+**Quota detection stays passive.** The scheduled check reads exhaustion from the
+`credential_pool` records Hermes already writes to `auth.json` (`last_status:
+exhausted`, `last_error_code: 429`, `resets_at` in the stored 429 body). It costs
+no network call. If you are tempted to improve it by scheduling the probe, that is
+the mistake the rule above describes.
+
+**Keep `quota` a separate verdict from `down`, and keep `reauth_url` out of quota
+prose.** They need opposite actions. A `down` alert says complete a device-code
+login; during the 2026-08-15..17 outage two logins were completed against an
+exhausted plan and fixed nothing. A test asserts the device URL never appears in a
+quota alert or ticket.
+
+**Never page on `chatgpt_plan_type` alone.** The claim is baked at token issuance
+and lags a plan change, so it read `free` while the upgraded account was already
+serving. Print it as context; trigger on the 429 record.
+
 **Deploy is by copy, never `git pull`.** Neither box has git credentials for this
 private repo: `tar` + `scp` / `gcloud compute scp` + `install.sh`.
 

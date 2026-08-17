@@ -60,5 +60,20 @@
     "shared one OAuth lineage, and whichever refreshes last silently invalidates the other \u2014",
     "that is what caused the July outage. The credential `label` field is cosmetic and reads",
     "the same on both boxes; compare the refresh-token fingerprint printed in this alert."
+  ],
+  "quota_subject": "Action needed: Team Nebula Hermes is out of Codex quota (hermes-tmn)",
+  "quota_ticket_title": "Codex quota exhausted \u2014 Team Nebula Hermes (hermes-tmn)",
+  "quota_note": [
+    "This box has NO fallback provider (fallback_providers is empty), so an exhausted plan",
+    "means @Teamnebula_bot answers nothing at all \u2014 every message gets the canned",
+    "\"model provider is rate-limiting\" reply.",
+    "",
+    "@Teamnebula_bot and @Screddy_bot are on SEPARATE ChatGPT accounts. Check which one this",
+    "credential is attached to before upgrading anything: on 2026-08-15 the tmn credential was",
+    "signed in through \"Continue with Google\" onto an account with no plan at all, and the",
+    "device page reuses whatever ChatGPT session the browser already has \u2014 so it re-attached",
+    "the same free account twice without ever showing an account picker. Use a private window.",
+    "",
+    "Plus caps are a 7-day rolling window, so a reset can be days out, not hours."
   ]
 }

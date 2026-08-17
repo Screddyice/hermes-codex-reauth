@@ -40,7 +40,7 @@ One watchdog per host, 4 runs a day, silent unless something is wrong.
 
 | Target | Credential watched | Runs on | Alerts to |
 |---|---|---|---|
-| `@Screddy_bot` codex | `~/.hermes/auth.json` | hostinger (`ubuntu`) | email + Linear |
+| `@Screddy_bot` codex | `~/.hermes/auth.json` | hostinger (`ubuntu`) | email |
 | `@Teamnebula_bot` codex | `~/.hermes/profiles/tmn/auth.json` | hermes-tmn (`screddy`) | Slack `#tmn-ops` + email |
 | **NEBOS v2 Claude** | `CLAUDE_CODE_OAUTH_TOKEN` in `nebos-dev` Secret Manager | hermes-tmn (`screddy`) | Slack `#tmn-ops` + email |
 
@@ -123,14 +123,73 @@ hosts sharing one OAuth lineage — the July failure — is visible by inspectio
 instead of requiring an incident. The credential `label` field is cosmetic and
 reads the same on both boxes; compare fingerprints.
 
+The `ok` line also prints `plan=` from the access-token claims. That is context,
+never a trigger: the claim is baked at token issuance, so it lags a plan change.
+On 2026-08-17 it still read `free` for minutes after the account was upgraded and
+the API was already serving traffic. Paging on it would have paged through a
+working bot.
+
+## Quota is a second verdict, not a kind of `down`
+
+Added 2026-08-17, after `@Teamnebula_bot` spent three days answering every message
+with the canned "model provider is rate-limiting" reply while this check printed
+`status=ok healthy` four times a day. The credential refreshed on schedule, the
+gateway unit stayed active, and every signal the check knew how to read was
+genuinely fine. The plan behind the credential had dropped to the free tier and
+returned `HTTP 429 usage_limit_reached` on every call.
+
+`quota` is deliberately not folded into `down`, because the two need opposite
+responses. A `down` alert tells you to complete a device-code login. During that
+outage two logins were completed against the exhausted plan before anyone read the
+429 body, and both landed on the same account the browser was already signed into.
+So the quota alert omits `reauth_url` and says outright that a re-login will change
+nothing. A test asserts the device URL never appears in quota prose.
+
+**How it detects, without spending the thing it protects.** Passively, from the
+`credential_pool` entries Hermes already writes: `last_status: exhausted`,
+`last_error_code: 429`, and the 429 body carrying `resets_at`. No network call and
+no quota. The live probe stays off every timer for the reason recorded below (it
+ran every 30 minutes and burned the quota it existed to watch), and satisfying this
+gap with a scheduled probe would repeat that mistake.
+
+Three rules keep it honest:
+
+| Situation | Verdict | Why |
+|---|---|---|
+| Every pooled credential blocked | `quota` | The pool is a failover set. One usable entry and the bot still answers. |
+| `resets_at` in the past | `ok` | The window rolled. A spent record stops paging by itself. |
+| Blocked, no `resets_at`, last error older than `QUOTA_STALE_S` (6h) | `ok` | A live exhaustion re-stamps `last_status_at` on every attempt, so this cannot swallow a real outage. |
+
+A broken sign-in outranks quota: with both wrong you get `down`, because quota is
+moot until the credential can call at all.
+
 ## Alerting
 
+Routing differs per box, set on 2026-08-17. `@Screddy_bot` on hostinger is Shawn's
+own assistant, so it emails him and stays out of the team channel. `@Teamnebula_bot`
+on hermes-tmn is company infrastructure with no fallback provider, so it posts to
+Slack `#tmn-ops` **and** emails. hostinger's Linear ticketing was dropped in the
+same pass.
+
+hostinger now has a single channel, so read the failure mode: if the Composio key
+rotates away, `env_val` returns empty, and the run exits 1 with nothing delivered.
+That is loud in the journal and silent to you, and nothing watches the watcher.
+tmn survives losing either channel, which is the reason it keeps two: on 2026-08-17
+a Slack app reinstall dropped the bot from `#tmn-ops` and `chat.postMessage` would
+have returned `not_in_channel`.
+
 ```
-ok   -> down   alert once on every configured channel
-down -> down   quiet for renotify_s (24h), then one reminder, no second ticket
-down -> ok     silent re-arm, no "recovered" message
-unknown        never pages, never changes state
+ok    -> down/quota   alert once on every configured channel
+same  -> same         quiet for renotify_s (24h), then one reminder, no second ticket
+down  -> quota        alerts again, even inside the quiet window
+fail  -> ok           silent re-arm, no "recovered" message
+unknown               never pages, never changes state
 ```
+
+A change of failure kind breaks the quiet window on purpose. Inheriting the earlier
+alert's silence would leave "go re-login" standing as the last instruction given,
+for a problem no login fixes. That transition also files its own Linear ticket
+rather than reusing the one whose body says to sign in again.
 
 Every alert leads with what broke, then the **sign-in link** (`reauth_url` in each
 host config), then that host's own runbook. The link sits near the top because
@@ -220,6 +279,26 @@ for five hours" indistinguishable from health. Any 401/403 is `BROKEN`: the old
 allowlist of error substrings let a reworded OpenAI message fall through to
 `UNKNOWN`. That bias was right when `BROKEN` triggered a destructive reauth; now
 a false page costs nothing and a swallowed 401 costs an outage.
+
+The probe knowing about `QUOTA` while the timer could not see it is what left the
+three-day gap: the one component that recognised exhaustion ran only when someone
+typed it. The scheduled check now reads the same condition from `auth.json`, so the
+probe keeps its triage role and stays off the timer.
+
+One thing the probe still gives you that `auth.json` cannot: **live headroom.** A
+successful call returns the window and how much of it is spent, which is a warning
+before exhaustion rather than a page after it.
+
+```
+x-codex-active-limit: premium
+x-codex-primary-window-minutes: 10080          # 7-day rolling window
+x-codex-primary-over-secondary-limit-percent: 0   # spent so far
+x-codex-primary-reset-at: 1787587961
+x-codex-credits-unlimited: False
+```
+
+Reading those on a timer would mean a scheduled probe, so they stay a triage tool.
+Run the probe by hand when you want to know how much room is left.
 
 ## Tests
 

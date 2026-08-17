@@ -14,11 +14,6 @@
       ],
       "key_env": "TMN_COMPOSIO_API_KEY",
       "composio_user_id": "user_uwgmr"
-    },
-    "linear": {
-      "team": "36388c9e-35ec-49a8-b873-3c01ad457086",
-      "assignee": "27c9c520-8566-453c-8dca-bd1164e72325",
-      "key_env": "TMN_LINEAR_API_KEY"
     }
   },
   "runbook": [
@@ -63,5 +58,16 @@
     "sharing one OAuth lineage is what caused the July outage: whichever box refreshes",
     "last silently invalidates the other. The credential `label` field is cosmetic \u2014",
     "compare the refresh-token fingerprint printed in this alert, not labels."
+  ],
+  "quota_subject": "Action needed: personal Hermes is out of Codex quota (hostinger)",
+  "quota_ticket_title": "Codex quota exhausted — personal Hermes (hostinger)",
+  "quota_note": [
+    "This box has a local Ollama fallback configured, so an exhausted plan degrades",
+    "@Screddy_bot rather than killing it outright. Lower urgency than the same alert from",
+    "hermes-tmn, which has no fallback at all.",
+    "",
+    "@Screddy_bot and @Teamnebula_bot are on SEPARATE ChatGPT accounts — confirm which one",
+    "this credential is attached to before changing a plan. The refresh-token fingerprint in",
+    "this alert identifies the credential; the account itself is in the access-token claims."
   ]
 }
