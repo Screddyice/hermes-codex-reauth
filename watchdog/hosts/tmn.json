@@ -6,7 +6,7 @@
   "reauth_url": "https://auth.openai.com/codex/device",
   "renotify_s": 86400,
   "subject": "Action needed: Team Nebula Hermes lost its Codex sign-in (hermes-tmn)",
-  "ticket_title": "Codex sign-in lost \u2014 Team Nebula Hermes (hermes-tmn)",
+  "ticket_title": "Codex sign-in lost — Team Nebula Hermes (hermes-tmn)",
   "channels": {
     "slack": {
       "channel": "C09FLJDCAJD",
@@ -28,13 +28,13 @@
     "1. SSH to the VM:",
     "   gcloud compute ssh hermes-tmn --project teamnebula-os --zone us-central1-a --tunnel-through-iap",
     "",
-    "2. Start the device-code login. BOTH the env var and the flag matter \u2014 without",
+    "2. Start the device-code login. BOTH the env var and the flag matter — without",
     "   them the credential lands in the default profile, which the gateway never reads:",
     "   HERMES_HOME=$HOME/.hermes/profiles/tmn hermes --profile tmn auth add openai-codex --type oauth --no-browser",
     "",
     "3. It prints https://auth.openai.com/codex/device plus a short code. Open the URL",
     "   in any browser, enter the code, sign in, and complete the 2FA challenge.",
-    "   Run it under tmux if your session might drop \u2014 the process must stay alive to",
+    "   Run it under tmux if your session might drop — the process must stay alive to",
     "   receive the token, and 2FA makes this step slower than the CLI's default wait.",
     "   If it gives up before you finish, re-run with a longer --timeout.",
     "",
@@ -57,23 +57,29 @@
     "Treat it as higher urgency than the personal box.",
     "",
     "Use a FRESH authorization, not a copy of the one hostinger holds. Both boxes previously",
-    "shared one OAuth lineage, and whichever refreshes last silently invalidates the other \u2014",
+    "shared one OAuth lineage, and whichever refreshes last silently invalidates the other —",
     "that is what caused the July outage. The credential `label` field is cosmetic and reads",
     "the same on both boxes; compare the refresh-token fingerprint printed in this alert."
   ],
   "quota_subject": "Action needed: Team Nebula Hermes is out of Codex quota (hermes-tmn)",
-  "quota_ticket_title": "Codex quota exhausted \u2014 Team Nebula Hermes (hermes-tmn)",
+  "quota_ticket_title": "Codex quota exhausted — Team Nebula Hermes (hermes-tmn)",
   "quota_note": [
     "This box has NO fallback provider (fallback_providers is empty), so an exhausted plan",
-    "means @Teamnebula_bot answers nothing at all \u2014 every message gets the canned",
+    "means @Teamnebula_bot answers nothing at all — every message gets the canned",
     "\"model provider is rate-limiting\" reply.",
     "",
     "@Teamnebula_bot and @Screddy_bot are on SEPARATE ChatGPT accounts. Check which one this",
     "credential is attached to before upgrading anything: on 2026-08-15 the tmn credential was",
     "signed in through \"Continue with Google\" onto an account with no plan at all, and the",
-    "device page reuses whatever ChatGPT session the browser already has \u2014 so it re-attached",
+    "device page reuses whatever ChatGPT session the browser already has — so it re-attached",
     "the same free account twice without ever showing an account picker. Use a private window.",
     "",
     "Plus caps are a 7-day rolling window, so a reset can be days out, not hours."
-  ]
+  ],
+  "peer": {
+    "label": "hostinger",
+    "bot_label": "@Screddy_bot",
+    "url": "http://100.98.215.63:8299/heartbeat",
+    "stale_after_s": 46800
+  }
 }

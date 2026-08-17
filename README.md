@@ -43,6 +43,7 @@ One watchdog per host, 4 runs a day, silent unless something is wrong.
 | `@Screddy_bot` codex | `~/.hermes/auth.json` | hostinger (`ubuntu`) | email |
 | `@Teamnebula_bot` codex | `~/.hermes/profiles/tmn/auth.json` | hermes-tmn (`screddy`) | Slack `#tmn-ops` + email |
 | **NEBOS v2 Claude** | `CLAUDE_CODE_OAUTH_TOKEN` in `nebos-dev` Secret Manager | hermes-tmn (`screddy`) | Slack `#tmn-ops` + email |
+| **both watchdogs** | the two heartbeats, over the tailnet | neb-ops-gcp (observer) | Telegram DM |
 
 The two hosts are **interleaved on the half-cycle** — TMN on 00/06/12/18:35, hostinger on
 03/09/15/21:35 — so each box is checked every 6h while the fleet as a whole is
@@ -51,10 +52,12 @@ checked every 3h, and the two can never alert in the same minute.
 ```
 watchdog/
   codex_health_check.py   canonical, shared by both hosts
+  notify_failure.py       last-resort escalator, fired by OnFailure=
+  heartbeat_server.py     serves this box's heartbeat to its peer, tailnet only
   codex_auth_probe.py     live probe — OPERATOR TOOL, not on any timer
-  hosts/{hostinger,tmn}.json   everything host-specific
-  systemd/                4 units, byte-identical to what is deployed
-  install.sh              --host {hostinger|tmn}
+  hosts/{hostinger,tmn,neb-ops}.json   everything host-specific
+  systemd/                12 units, byte-identical to what is deployed
+  install.sh              --host {hostinger|tmn|nebos-claude|neb-ops}
 ```
 
 **Everything host-specific lives in `hosts/*.json`** — auth store, gateway unit,
@@ -207,12 +210,110 @@ green; all are now hard failures (exit 1): unreadable config, unreadable
 corrupt state. Most importantly, **"we decided to alert and every channel
 failed" is a failure** — it previously printed the error and exited 0.
 
-### Known limitation: nothing watches the watcher
+## When the watchdog cannot report
 
-**By explicit decision (2026-08-12), there is no deadman and no liveness
-heartbeat.** The only notifications this system produces are "codex is actually
-broken". Every alert means something is genuinely wrong — nothing pings you to
-say it is still alive.
+Every check unit carries `OnFailure=`, which fires `notify_failure.py` and sends
+you a Telegram DM. It covers every non-zero exit: DISARMED, "alerted but nothing
+was delivered", a crash, a timeout. Those are the cases where the check knows
+something is wrong and cannot say so through its own channels.
+
+This existed only as a claim until 2026-08-17. The check's docstring said exit 1
+was "paired with `OnFailure=` in the systemd unit"; no unit had ever carried the
+directive. A failed delivery wrote to stderr, marked the unit failed, and stopped
+there — findable by running `systemctl --user status`, which nobody runs while
+everything looks fine. `install.sh` now reads back `OnFailure` from the installed
+unit and refuses to report success without it.
+
+**Why Telegram.** The escalation has to use a transport that cannot fail for the
+same reason the primary did. A second email address would not qualify: both
+authenticate with `TMN_COMPOSIO_API_KEY`, so one rotation takes out both. The
+Hermes Telegram bot token is a different secret from a different vendor, it is
+already on both boxes, and it fails visibly — if that token dies, the bot stops
+answering and you know within minutes.
+
+It matters most on hostinger, which alerts through email alone. If that Composio
+key rotates away, `env_val` returns empty and the run exits 1 having told nobody.
+Now it exits 1 *and* DMs you.
+
+`notify_failure.py` imports nothing from the health checks, on purpose. A last
+resort that depends on the component which just failed is not a last resort, so it
+carries its own config read, its own env resolution, and degrades to generic
+wording rather than staying silent when `config.json` is unreadable. `install.sh`
+dry-runs it on every deploy, so a notifier that could never fire fails the install
+instead of waiting to disappoint you.
+
+## The two boxes watch each other
+
+`OnFailure=` needs a run to hook, so it cannot fire for a check that never runs.
+That gap is covered by a mutual peer watch, added 2026-08-17: each check writes a
+heartbeat, serves it on the tailnet, and reads its peer's. A box that stops
+reporting gets called out by the other one, through channels that already work.
+
+```
+hostinger  ──reads──▶ http://100.126.215.66:8299/heartbeat  (hermes-tmn)
+hermes-tmn ──reads──▶ http://100.98.215.63:8299/heartbeat   (hostinger)
+```
+
+Two failure shapes, handled differently on purpose:
+
+| What the peer looks like | Verdict | Why |
+|---|---|---|
+| Heartbeat readable, older than 13h | `peer`, alerts at once | The box is up and its check stopped. Unambiguous. |
+| Heartbeat unreachable | `unknown`, then `peer` on the second miss | These two boxes route over a DERP relay, so one miss is not evidence |
+
+13h is two 6h cycles plus grace. A local failure outranks the peer watch: a broken
+credential here beats a dark box over there, and burying the former under the
+latter would be a regression.
+
+The peer alert deliberately shares no prose with the sign-in alert. It says which
+box went quiet, that the reporting box is fine, and where to look — pointing an
+operator at a re-login on the wrong machine is worse than saying nothing.
+
+**Why not healthchecks.io.** A deadman was built and removed on 2026-08-12, and it
+had never actually run: both host configs shipped `enabled: false` with an empty
+`ping_url`. The objection then was that a service which pages when pings stop is a
+different and unwanted signal. The peer watch answers that: it adds no vendor, no
+account, and no new signal type, because a dark peer is reported through the same
+"something is broken" channels as everything else.
+
+### The backstop: neb-ops-gcp
+
+Mutual watching leaves one hole — both boxes dark at once, with no one left to
+report it. `neb-ops-gcp` closes it. It is a third always-on host already on the
+tailnet, it holds no Hermes credential and checks none, and it reads both
+heartbeats four times a day on `01,07,13,19:35`, offset from both Hermes hosts so
+a fleet-wide outage surfaces within about 90 minutes.
+
+**It alerts only when EVERY watched box is dark.** While one box is up, that box
+already reports its dark partner, and a second alert for the same event is the
+noise this repo keeps refusing to add. A test pins that behaviour, and the drill
+below confirmed it live.
+
+It alerts by Telegram DM, and that is a deliberate choice of secret: the observer
+needed some credential, and a bot token can only speak as a bot Shawn owns, where
+`TMN_COMPOSIO_API_KEY` could send mail as him. Telegram also keeps working when
+both boxes are off, being a cloud API that does not care whether either gateway
+runs. The token lives in `~/.watchdog-observer/.env`, mode 600.
+
+Observer mode is not a loophole in the `hermes_home` rule. A config with no
+`mode: observer` still hard-fails without an auth store; the observer is exempt
+only because it inspects no credential. Both halves have tests.
+
+**What remains uncovered:** all three hosts dark at once. Nothing watches the
+observer, so if it dies, coverage silently degrades to the mutual watch, which
+still catches any single box going dark. It is a backstop, not a root of trust.
+
+The heartbeat server binds the tailnet address from `tailscale ip -4` and refuses
+to start without one. It never falls back to `0.0.0.0`: hostinger has a public IP,
+and a monitoring tool that quietly opens a public port is the failure this repo
+exists to prevent. The payload carries no secrets — host label, unit, timestamp,
+last verdict.
+
+### Known limitation: nothing watches the watcher, alone
+
+**By explicit decision (2026-08-12), there is no external deadman.** The only
+notifications this system produces are "something is actually broken". Nothing
+pings you to say it is still alive; the peer box is what notices silence now.
 
 The cost is real and worth stating plainly, because it has already happened
 once: no in-process check can detect its own absence, so if a timer gets
@@ -221,9 +322,16 @@ indistinguishable from health. That outage ran six days. A deadman was built,
 tested, and then removed rather than left switched off, because disabled code
 rots and an installer that nags about an unwanted feature is noise.
 
-Same reasoning rules out `OnFailure=`: it would only retry the channels already
-known to be dead. A failed delivery therefore surfaces **only** as a non-zero
-exit in `systemctl --user status` and the journal.
+`OnFailure=` was ruled out here on the same reasoning, on the grounds that it
+would only retry the channels already known to be dead. **That was reversed on
+2026-08-17**, because the objection holds only for a retry. Escalating over a
+transport with a different secret and a different vendor is not a retry: when the
+Composio key is what broke, a Telegram DM is unaffected. See "When the watchdog
+cannot report" above.
+
+What remains true is the part this does not solve. `OnFailure=` needs a run to
+hook, so it cannot fire for a check that never runs. The 2026-08-04 disabled-timer
+case would still go six days unnoticed, and only a deadman closes that.
 
 If that trade is ever revisited, the mechanism is small — a single HTTP GET at
 the end of a successful run — and `git log` has the removed implementation.

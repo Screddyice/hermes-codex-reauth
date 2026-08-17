@@ -44,8 +44,11 @@ Alerting:
 EXIT CODES -- a watchdog that fails silently is worse than no watchdog, so every
 way this can stop working is loud:
   0  ran correctly (healthy, quiet, or alert fully delivered)
-  1  DISARMED or delivery failed -- something needs a human. Paired with
-     OnFailure= in the systemd unit.
+  1  DISARMED or delivery failed -- something needs a human. The unit's
+     OnFailure= fires notify_failure.py, which escalates over Telegram. That
+     directive was described here from the start and was not actually present in
+     any unit until 2026-08-17, so for months this exit code reached stderr and
+     stopped there.
 """
 from __future__ import annotations
 
@@ -101,14 +104,25 @@ def load_config(path: pathlib.Path) -> dict:
     except Exception as e:
         raise Disarmed(f"cannot read config {path}: {type(e).__name__}: {e}")
 
-    if not cfg.get("hermes_home"):
-        raise Disarmed(
-            f"config {path} has no 'hermes_home'. Refusing to guess: the wrong "
-            f"auth store yields a confident false 'ok'."
-        )
-    for key in ("host_label", "gateway_unit"):
-        if not cfg.get(key):
-            raise Disarmed(f"config {path} is missing required key {key!r}")
+    # An observer watches other boxes and has no local credential of its own, so
+    # hermes_home and gateway_unit do not apply to it. This is NOT a default for
+    # hermes_home: every host that actually checks a credential must still name
+    # its auth store, because the wrong store yields a confident false "ok".
+    observer = cfg.get("mode") == "observer"
+    if observer:
+        if not cfg.get("peers"):
+            raise Disarmed(f"config {path} is an observer but watches no peers")
+        if not cfg.get("host_label"):
+            raise Disarmed(f"config {path} is missing required key 'host_label'")
+    else:
+        if not cfg.get("hermes_home"):
+            raise Disarmed(
+                f"config {path} has no 'hermes_home'. Refusing to guess: the wrong "
+                f"auth store yields a confident false 'ok'."
+            )
+        for key in ("host_label", "gateway_unit"):
+            if not cfg.get(key):
+                raise Disarmed(f"config {path} is missing required key {key!r}")
     if not (cfg.get("channels") or {}):
         raise Disarmed(f"config {path} declares no alert channels; nothing could page")
 
@@ -279,6 +293,96 @@ def quota_blocked(auth: dict, now: float | None = None,
                   f"window resets {when}")
 
 
+def write_heartbeat(path: pathlib.Path, cfg: dict, status: str) -> None:
+    """Record that this check ran, for the peer box to read.
+
+    Written on every completed run, including failing ones: the peer is watching
+    whether the check RUNS, which is a different question from what it found. A
+    box that is correctly reporting a broken credential is alive.
+
+    Never fatal. A heartbeat that cannot be written is worth a line on stderr, not
+    a dead watchdog -- the local verdict is the more important product.
+    """
+    try:
+        path.write_text(json.dumps({
+            "host": cfg.get("host_label", ""),
+            "unit": cfg.get("gateway_unit", ""),
+            "status": status,
+            "at": int(time.time()),
+        }))
+    except Exception as e:
+        print(f"  heartbeat not written ({type(e).__name__}: {e})", file=sys.stderr)
+
+
+def read_peer(cfg: dict, prev_fails: int) -> tuple[str, str, int]:
+    """Has the peer box's watchdog run recently?
+
+    Returns (verdict, detail, consecutive_failures) where verdict is one of
+    ok / peer / unknown.
+
+    Two failure shapes, treated differently on purpose:
+
+    * The heartbeat is READABLE but old -- the peer box is up and something
+      stopped its check. That is unambiguous, so it alerts on the first sighting.
+    * The heartbeat is UNREACHABLE -- could be the peer being down, could be a
+      DERP relay hiccup on a tailnet that already routes these two boxes
+      indirectly. One miss is not evidence, so it takes two consecutive runs
+      (~12h at the 6h cadence) before it pages.
+    """
+    peer = cfg.get("peer") or {}
+    if not peer.get("url"):
+        return "ok", "", 0
+
+    label = peer.get("label") or "peer"
+    stale_after = int(peer.get("stale_after_s", 46800))    # 13h: two 6h runs + grace
+    try:
+        with urllib.request.urlopen(peer["url"], timeout=20) as r:
+            hb = json.loads(r.read())
+    except Exception as e:
+        fails = prev_fails + 1
+        msg = (f"{label} heartbeat unreachable ({type(e).__name__}), "
+               f"{fails} consecutive")
+        if fails >= 2:
+            return "peer", (f"{msg} — the peer box is unreachable or its watchdog "
+                            f"is gone, so nothing is watching {peer.get('bot_label', label)}"), fails
+        return "unknown", msg, fails
+
+    age = int(time.time()) - int(hb.get("at") or 0)
+    if age > stale_after:
+        hrs = age / 3600.0
+        return "peer", (f"{label} last ran {hrs:.1f}h ago (limit "
+                        f"{stale_after / 3600:.0f}h) — its watchdog stopped running, "
+                        f"so nothing is watching {peer.get('bot_label', label)}"), 0
+    return "ok", f"{label} heartbeat {age // 60}m old", 0
+
+
+def observe_peers(cfg: dict, fails: dict) -> tuple[str, str, dict]:
+    """Backstop for the one case the mutual watch cannot cover: BOTH boxes dark.
+
+    Alerts only when every watched peer is dark. While one box is still up, that
+    box already reports its dark partner, and a second alert for the same event is
+    the noise this repo keeps refusing to add.
+
+    Consequence worth stating: nothing watches the observer. If it dies, coverage
+    silently degrades to the mutual watch, which is where things stood before it
+    existed. It is a backstop, not a root of trust.
+    """
+    peers = cfg.get("peers") or []
+    verdicts, dark, details = {}, [], []
+    for peer in peers:
+        label = peer.get("label") or peer.get("url", "peer")
+        status, detail, n = read_peer({"peer": peer}, int(fails.get(label, 0)))
+        verdicts[label] = n
+        details.append(f"{label}: {detail or status}")
+        if status == "peer":
+            dark.append(label)
+
+    if peers and len(dark) == len(peers):
+        return "peer", ("every watched box is dark — " + "; ".join(details) +
+                        ". Nothing is monitoring either Hermes bot."), verdicts
+    return "ok", "; ".join(details), verdicts
+
+
 def gateway_active(unit: str) -> tuple[bool, str]:
     """Is the gateway actually running? Codex auth can be perfect while the bot is dead."""
     try:
@@ -386,6 +490,30 @@ def slack_post(cfg_ch: dict, text: str, token: str) -> None:
         raise RuntimeError("slack error: " + json.dumps(resp)[:300])
 
 
+def telegram_post(cfg_ch: dict, text: str, token: str) -> None:
+    """Send an alert as a Telegram DM.
+
+    Carried for the observer host, which holds no Composio or Slack credential.
+    A bot token is the narrowest secret that can reach Shawn from a third box: it
+    can only speak as a bot he owns, where TMN_COMPOSIO_API_KEY could send mail as
+    him. It also keeps working when both Hermes boxes are off, since Telegram is a
+    cloud API and does not care whether either gateway is running.
+    """
+    payload = {"chat_id": cfg_ch["chat_id"], "text": text,
+               "disable_web_page_preview": True}
+    if cfg_ch.get("thread_id"):
+        payload["message_thread_id"] = int(cfg_ch["thread_id"])
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{token}/sendMessage",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=30) as r:
+        resp = json.loads(r.read())
+    if not resp.get("ok"):
+        raise RuntimeError("telegram error: " + json.dumps(resp)[:300])
+
+
 def linear_create(cfg_ch: dict, title: str, description: str, api_key: str) -> str:
     query = """
     mutation IssueCreate($teamId: String!, $title: String!, $description: String!, $assigneeId: String!) {
@@ -430,6 +558,10 @@ def subject(cfg: dict, status: str) -> str:
         return cfg.get("quota_subject") or (
             f"Action needed: {cfg['bot_label']} is out of Codex quota "
             f"({cfg['host_label']})")
+    if status == "peer":
+        peer = cfg.get("peer") or {}
+        return (f"Action needed: the watchdog on {peer.get('label', 'the peer box')} "
+                f"has gone quiet")
     return cfg["subject"]
 
 
@@ -437,6 +569,9 @@ def ticket_title(cfg: dict, status: str) -> str:
     if status == "quota":
         return cfg.get("quota_ticket_title") or (
             f"Codex quota exhausted — {cfg['bot_label']} ({cfg['host_label']})")
+    if status == "peer":
+        peer = cfg.get("peer") or {}
+        return f"Watchdog silent on {peer.get('label', 'peer box')} — reported by {cfg['host_label']}"
     return cfg["ticket_title"]
 
 
@@ -454,6 +589,42 @@ def reauth_line(cfg: dict) -> str:
     return (f"Reauth here: {url}\n"
             f"  (start at step 1 below first — this page needs the device code "
             f"that the CLI prints)\n\n")
+
+
+PEER_REMEDY = [
+    "This alert is about the OTHER box. Nothing is wrong with the credential on",
+    "the host that sent it.",
+    "",
+    "The peer's watchdog has stopped running, so that bot is now unmonitored —",
+    "whatever breaks there next will go unreported. Check, on the peer:",
+    "",
+    "  systemctl --user status <its health timer>",
+    "  systemctl --user list-timers | grep health",
+    "  journalctl --user -u <its health service> -n 50",
+    "",
+    "Most likely: the timer was disabled or never re-enabled after maintenance",
+    "(2026-08-04), the box is off, or lingering was lost so its user units never",
+    "started at boot.",
+]
+
+
+def peer_alert_text(cfg: dict, detail: str, ticket: str | None) -> str:
+    """Alert body for a dark peer. Deliberately not the sign-in prose.
+
+    Sending the reauth runbook here would point an operator at the wrong machine
+    entirely, which is worse than saying nothing.
+    """
+    peer = cfg.get("peer") or {}
+    return (
+        f"The watchdog on {peer.get('label', 'the peer box')} has gone quiet. "
+        f"Reported by {cfg['host_label']}, whose own check is fine.\n\n"
+        f"What the check saw: {detail}\n\n"
+        + (f"Linear ticket: {ticket}\n\n" if ticket else "")
+        + "\n".join(PEER_REMEDY) + "\n\n"
+        "You will not get another message about this for 24 hours, and none at all "
+        "once it is reporting again.\n\n"
+        f"-- Automated check on {cfg['host_label']} (codex-health, peer watch)."
+    )
 
 
 QUOTA_REMEDY = [
@@ -494,6 +665,8 @@ def quota_alert_text(cfg: dict, detail: str, ticket: str | None) -> str:
 def alert_text(cfg: dict, detail: str, ticket: str | None, status: str = "down") -> str:
     if status == "quota":
         return quota_alert_text(cfg, detail, ticket)
+    if status == "peer":
+        return peer_alert_text(cfg, detail, ticket)
     return (
         f"{cfg['bot_label']} on {cfg['host_label']} can no longer sign in to Codex, "
         f"so it has stopped answering.\n\n"
@@ -509,6 +682,15 @@ def alert_text(cfg: dict, detail: str, ticket: str | None, status: str = "down")
 
 
 def ticket_body(cfg: dict, detail: str, status: str = "down") -> str:
+    if status == "peer":
+        peer = cfg.get("peer") or {}
+        return (
+            f"The watchdog on `{peer.get('label', 'the peer box')}` has stopped "
+            f"reporting. Filed by `{cfg['host_label']}`, whose own check is healthy.\n\n"
+            f"**What the check saw:** {detail}\n\n"
+            f"### Fix\n\n```\n" + "\n".join(PEER_REMEDY) + "\n```\n\n"
+            f"_Auto-filed by the {cfg['host_label']} codex-health check._"
+        )
     if status == "quota":
         return (
             f"`{cfg['bot_label']}` on `{cfg['host_label']}` is out of Codex quota, so it "
@@ -563,30 +745,76 @@ def save_state(path: pathlib.Path, s: dict) -> None:
 
 def run(args) -> int:
     cfg = load_config(pathlib.Path(args.config).expanduser())
-    hermes_home = pathlib.Path(os.path.expanduser(cfg["hermes_home"]))
-    auth_path = hermes_home / "auth.json"
-    config_yaml = hermes_home / "config.yaml"
+    # An observer has no auth store. Its secrets live beside the script, so point
+    # env_val's .env search there rather than at a Hermes home it does not have.
+    if cfg.get("mode") == "observer":
+        hermes_home = HERE
+        auth_path = config_yaml = None
+    else:
+        hermes_home = pathlib.Path(os.path.expanduser(cfg["hermes_home"]))
+        auth_path = hermes_home / "auth.json"
+        config_yaml = hermes_home / "config.yaml"
     state_path = pathlib.Path(args.state_file).expanduser() if args.state_file else HERE / "state.json"
     renotify_s = int(cfg.get("renotify_s", 24 * 3600))
 
     # Always say which credential was inspected. Reading the wrong auth store is
     # the highest-consequence bug available here and it is invisible otherwise.
-    print(f"host={cfg['host_label']} auth={auth_path} state={state_path}")
+    print(f"host={cfg['host_label']} auth={auth_path or '(observer: none)'} state={state_path}")
 
-    if not args.force_down and not gateway_uses_codex(config_yaml):
+    observer = cfg.get("mode") == "observer"
+
+    if not observer and not args.force_down and not gateway_uses_codex(config_yaml):
         print(f"{cfg['host_label']} gateway is not configured on {PROVIDER} — not applicable, silent")
-        return 0
-
-    status, detail = (("down", "forced by --force-down") if args.force_down
-                      else detect(auth_path, cfg["gateway_unit"]))
-
-    if status == "unknown":
-        print(f"status=unknown ({detail}) — no action, state untouched")
         return 0
 
     st = load_state(state_path)
     prev = st.get("status", "ok")
     now = int(time.time())
+
+    if observer:
+        if args.force_peer:
+            status, detail = "peer", "forced by --force-peer"
+        else:
+            status, detail, obs_fails = observe_peers(cfg, st.get("peer_fails") or {})
+            st["peer_fails"] = obs_fails
+            print(f"observer: {detail}")
+        peer_fails = st.get("peer_fails") or {}
+        return _decide_and_deliver(args, cfg, hermes_home, st, state_path,
+                                   prev, status, detail, now, renotify_s)
+
+    status, detail = (("down", "forced by --force-down") if args.force_down
+                      else detect(auth_path, cfg["gateway_unit"]))
+
+    # The peer watch runs only when this box is healthy. With a local failure in
+    # hand, the peer is the less urgent of two problems and would bury it.
+    peer_fails = int(st.get("peer_fails", 0))
+    if status == "ok" and not args.force_peer:
+        pstatus, pdetail, peer_fails = read_peer(cfg, peer_fails)
+        if pstatus == "peer":
+            status, detail = "peer", pdetail
+        elif pstatus == "unknown":
+            print(f"peer: {pdetail} — not paging on one miss")
+        elif pdetail:
+            print(f"peer: {pdetail}")
+    elif args.force_peer:
+        status, detail = "peer", "forced by --force-peer"
+    st["peer_fails"] = peer_fails
+
+    return _decide_and_deliver(args, cfg, hermes_home, st, state_path,
+                               prev, status, detail, now, renotify_s)
+
+
+def _decide_and_deliver(args, cfg, hermes_home, st, state_path, prev, status,
+                        detail, now, renotify_s) -> int:
+    """The edge-triggered state machine and delivery, shared by both paths.
+
+    Extracted when the observer host arrived: it reaches the same alerting rules
+    by a different route (it has no credential to inspect), and duplicating this
+    logic would let the two drift until one of them stopped paging.
+    """
+    if status == "unknown":
+        print(f"status=unknown ({detail}) — no action, state untouched")
+        return 0
 
     alert = False
     if status != "ok":
@@ -609,13 +837,13 @@ def run(args) -> int:
     if args.dry_run:
         print(f"status={status} prev={prev} detail={detail!r} action={why}")
         if alert:
-            for name in ("slack", "email", "linear"):
+            for name in ("slack", "email", "linear", "telegram"):
                 ch = channels.get(name)
                 if not ch or getattr(args, f"no_{name}"):
                     continue
                 if name == "linear":
                     print(f"\n--- LINEAR -> team {ch['team']} ---\n{ticket_title(cfg, status)}")
-                elif name == "slack":
+                elif name in ("slack", "telegram"):
                     print(f"\n--- SLACK -> {ch['channel']} ---\n"
                           f"{alert_text(cfg, detail, None, status)}")
                 else:
@@ -659,6 +887,19 @@ def run(args) -> int:
                 except Exception as e:
                     failures.append(f"slack: {type(e).__name__}: {e}")
 
+        ch = channels.get("telegram")
+        if ch and not args.no_telegram:
+            tok = env_val(ch["token_env"], hermes_home)
+            if not tok:
+                failures.append(f"telegram: {ch['token_env']} unresolvable")
+            else:
+                try:
+                    telegram_post(ch, alert_text(cfg, detail, ticket, status), tok)
+                    delivered += 1
+                    print(f"telegram -> {ch['chat_id']}")
+                except Exception as e:
+                    failures.append(f"telegram: {type(e).__name__}: {e}")
+
         ch = channels.get("email")
         if ch and not args.no_email:
             key = env_val(ch["key_env"], hermes_home)
@@ -682,6 +923,10 @@ def run(args) -> int:
 
     st["status"] = status
     save_state(state_path, st)
+
+    # Written last and unconditionally: the peer is asking "did this check run",
+    # not "did it like what it found".
+    write_heartbeat(state_path.parent / "heartbeat.json", cfg, status)
 
     # An outage nobody was told about is indistinguishable from no outage. If we
     # decided to alert and every channel failed, that is a hard failure -- the
@@ -710,9 +955,12 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--force-down", action="store_true",
                     help="exercise the alert path (bypasses detection entirely)")
+    ap.add_argument("--force-peer", action="store_true",
+                    help="exercise the peer-down alert path (bypasses the peer fetch)")
     ap.add_argument("--no-email", action="store_true")
     ap.add_argument("--no-slack", action="store_true")
     ap.add_argument("--no-linear", action="store_true")
+    ap.add_argument("--no-telegram", action="store_true")
     args = ap.parse_args()
     try:
         return run(args)

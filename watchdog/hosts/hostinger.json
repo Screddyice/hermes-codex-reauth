@@ -6,7 +6,7 @@
   "reauth_url": "https://auth.openai.com/codex/device",
   "renotify_s": 86400,
   "subject": "Action needed: personal Hermes lost its Codex sign-in (hostinger)",
-  "ticket_title": "Codex sign-in lost \u2014 personal Hermes (hostinger)",
+  "ticket_title": "Codex sign-in lost — personal Hermes (hostinger)",
   "channels": {
     "email": {
       "to": [
@@ -24,12 +24,12 @@
     "1. SSH to the box:",
     "   ssh hostinger",
     "",
-    "2. Start the device-code login (default profile \u2014 no --profile flag here):",
+    "2. Start the device-code login (default profile — no --profile flag here):",
     "   hermes auth add openai-codex --type oauth --no-browser",
     "",
     "3. It prints https://auth.openai.com/codex/device plus a short code. Open the URL",
     "   in any browser, enter the code, sign in, and complete the 2FA challenge.",
-    "   Run it under tmux if your session might drop \u2014 the process must stay alive to",
+    "   Run it under tmux if your session might drop — the process must stay alive to",
     "   receive the token, and 2FA makes this step slower than the CLI's default wait.",
     "   If it gives up before you finish, re-run with a longer --timeout.",
     "",
@@ -51,12 +51,12 @@
     "",
     "Note there is no longer any scheduled token refresh on this box. codex-keepalive was",
     "retired with the self-heal, so the running gateway refreshing on use is the only thing",
-    "keeping the token alive. If the gateway is down, the token will age out unrefreshed \u2014",
+    "keeping the token alive. If the gateway is down, the token will age out unrefreshed —",
     "that is exactly how the 2026-08-05 outage happened.",
     "",
     "Use a FRESH authorization, not a copy of the one hermes-tmn holds. The two boxes",
     "sharing one OAuth lineage is what caused the July outage: whichever box refreshes",
-    "last silently invalidates the other. The credential `label` field is cosmetic \u2014",
+    "last silently invalidates the other. The credential `label` field is cosmetic —",
     "compare the refresh-token fingerprint printed in this alert, not labels."
   ],
   "quota_subject": "Action needed: personal Hermes is out of Codex quota (hostinger)",
@@ -69,5 +69,11 @@
     "@Screddy_bot and @Teamnebula_bot are on SEPARATE ChatGPT accounts — confirm which one",
     "this credential is attached to before changing a plan. The refresh-token fingerprint in",
     "this alert identifies the credential; the account itself is in the access-token claims."
-  ]
+  ],
+  "peer": {
+    "label": "hermes-tmn",
+    "bot_label": "@Teamnebula_bot",
+    "url": "http://100.126.215.66:8299/heartbeat",
+    "stale_after_s": 46800
+  }
 }

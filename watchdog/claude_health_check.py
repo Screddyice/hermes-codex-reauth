@@ -24,7 +24,8 @@ writes the secret. Recovery is a human running `claude setup-token`.
 
 EXIT CODES:
   0  ran correctly (healthy, quiet, or alert fully delivered)
-  1  DISARMED or delivery failed -- something needs a human
+  1  DISARMED or delivery failed -- something needs a human. The unit's
+     OnFailure= fires notify_failure.py, which escalates over Telegram
 """
 from __future__ import annotations
 

@@ -44,6 +44,36 @@ hard failure. There is a test for this — do not relax it.
 and exits 0 is a way for the watchdog to go blind while systemd stays green,
 which is exactly how a six-day outage went unnoticed. Raise `Disarmed` instead.
 
+**`notify_failure.py` must not import the health checks.** It is the last thing
+that speaks when a check cannot report, so it carries its own config read and env
+resolution and stays stdlib-only. A last resort that depends on the component
+which just failed is not a last resort. A test asserts the absence of those
+imports.
+
+**Its transport must stay independent of the alert channels.** Telegram is chosen
+because its token is a different secret from a different vendor: a
+`TMN_COMPOSIO_API_KEY` rotation kills hostinger's only channel and leaves the
+escalator working. Swapping it for a second email would silently undo the whole
+point.
+
+**The heartbeat server binds the tailnet address, never `0.0.0.0`.** hostinger has
+a public IP. `heartbeat_server.py` resolves the bind from `tailscale ip -4` and
+exits 1 when it cannot, because a monitoring tool that quietly opens a public port
+is precisely the class of mistake this repo exists to catch. There is a test.
+
+**A local failure outranks the peer watch.** The peer is only consulted when this
+box's own verdict is `ok`. Reporting a dark peer while this box's credential is
+broken buries the more urgent problem.
+**The observer alerts only when EVERY peer is dark.** While one Hermes box is up
+it already reports its dark partner, so alerting from `neb-ops-gcp` as well would
+page twice for one event. Widening it to "any peer dark" would look like more
+coverage and deliver only noise.
+
+**Observer mode is not a loophole in the `hermes_home` rule.** It is exempt purely
+because it inspects no credential; any config without `mode: observer` must still
+hard-fail with no auth store. There is a test asserting both halves.
+
+
 **Do not put the live probe back on a timer.** It ran every 30 minutes under the
 old design and produced 3 real detections against 209 quota-exhaustion errors,
 consuming the plan quota it existed to protect. The README has the numbers.

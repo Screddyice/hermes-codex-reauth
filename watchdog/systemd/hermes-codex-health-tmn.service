@@ -2,6 +2,9 @@
 Description=Team Nebula Hermes Codex sign-in check (silent unless re-auth is needed)
 After=network-online.target
 Wants=network-online.target
+# Any non-zero exit means the check could not report through its own
+# channels. Escalate over a transport that cannot fail the same way.
+OnFailure=hermes-codex-health-tmn-notify.service
 
 [Service]
 Type=oneshot
