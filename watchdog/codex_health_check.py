@@ -19,11 +19,27 @@ reported ``logged in`` for a credential with zero pooled entries and no refresh
 token at all. It reads auth.json directly and trusts Hermes' own
 ``last_auth_error`` record, which is written when a real refresh fails.
 
+It reports TWO kinds of failure, because they need opposite responses:
+
+``down``   the credential cannot sign in. Fix: a human completes a device-code
+           login.
+``quota``  the credential signs in perfectly and the plan is out of quota. A
+           re-login CANNOT fix this and telling someone to try one wastes their
+           time -- during the 2026-08-15..17 outage two device-code logins were
+           completed against an exhausted plan before anyone read the 429 body.
+
+Quota is read PASSIVELY, from the ``credential_pool`` entries Hermes itself
+writes (``last_status: exhausted``, ``last_error_code: 429``, and the 429 body
+carrying ``resets_at``). It costs no network call and no quota. The live probe is
+NOT used here and must not be put on a timer: under the old design it ran every
+30 minutes and consumed the very quota it existed to protect.
+
 Alerting:
-  ok   -> down : one alert on every configured channel
-  down -> down : quiet for renotify_s, then a single reminder (no new ticket)
-  down -> ok   : silent re-arm, no "recovered" message
-  unknown      : never pages, never changes state (parse/network trouble)
+  ok    -> down/quota : one alert on every configured channel
+  same  -> same       : quiet for renotify_s, then a single reminder (no new ticket)
+  down  -> quota      : alerts again -- a different problem needing a different fix
+  fail  -> ok         : silent re-arm, no "recovered" message
+  unknown             : never pages, never changes state (parse/network trouble)
 
 EXIT CODES -- a watchdog that fails silently is worse than no watchdog, so every
 way this can stop working is loud:
@@ -39,6 +55,7 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import time
@@ -48,6 +65,10 @@ import urllib.request
 HOME = pathlib.Path.home()
 HERE = pathlib.Path(__file__).resolve().parent
 PROVIDER = "openai-codex"
+# A pooled credential whose last error is older than this, with no reset time to
+# judge by, is not evidence of a current block. A live exhaustion re-stamps
+# last_status_at on every attempt, so a fresh outage always clears this bar.
+QUOTA_STALE_S = 6 * 3600
 COMPOSIO_EXEC = "https://backend.composio.dev/api/v3/tools/execute/GMAIL_SEND_EMAIL"
 LINEAR_URL = "https://api.linear.app/graphql"
 SLACK_URL = "https://slack.com/api/chat.postMessage"
@@ -170,6 +191,94 @@ def lineage(refresh_token: str) -> str:
     return hashlib.sha256(refresh_token.encode()).hexdigest()[:8]
 
 
+def plan_of(access_token: str) -> str:
+    """The ChatGPT plan the credential is attached to, per its own JWT claims.
+
+    Context only, never the trigger. The claim is baked at token issuance, so it
+    lags a plan change until the next refresh -- on 2026-08-17 it still read
+    ``free`` for minutes after the account was upgraded and the API was already
+    serving. Alerting on it would have paged through a working bot.
+    """
+    if not access_token or access_token.count(".") != 2:
+        return ""
+    p = access_token.split(".")[1]
+    p += "=" * (-len(p) % 4)
+    try:
+        claims = json.loads(base64.urlsafe_b64decode(p))
+    except Exception:
+        return ""
+    return str((claims.get("https://api.openai.com/auth") or {}).get("chatgpt_plan_type") or "")
+
+
+def _reset_at_of(entry: dict):
+    """When the quota window rolls, from the 429 body Hermes stored verbatim.
+
+    The body is a Python repr of OpenAI's JSON, not JSON, so it is matched rather
+    than parsed. ``resets_at`` is the only authority worth trusting here: it is
+    what distinguishes "blocked right now" from "was blocked last week".
+    """
+    explicit = entry.get("last_error_reset_at")
+    if explicit:
+        try:
+            return float(explicit)
+        except (TypeError, ValueError):
+            pass
+    m = re.search(r"['\"]resets_at['\"]\s*:\s*(\d{9,})", str(entry.get("last_error_message") or ""))
+    return float(m.group(1)) if m else None
+
+
+def _entry_quota_blocked(entry: dict, now: float, stale_s: int) -> tuple[bool, float | None]:
+    """Is this one pooled credential currently refused for quota?"""
+    status = str(entry.get("last_status") or "").lower()
+    code = str(entry.get("last_error_code") or "")
+    msg = str(entry.get("last_error_message") or "").lower()
+    looks_quota = status == "exhausted" or (
+        code == "429" and ("usage_limit" in msg or "usage limit" in msg))
+    if not looks_quota:
+        return False, None
+
+    reset = _reset_at_of(entry)
+    if reset is not None:
+        # Authoritative in both directions: still blocked until it rolls, and
+        # definitively clear afterwards, so a spent window stops paging by itself.
+        return reset > now, reset
+
+    try:
+        at = float(entry.get("last_status_at") or 0)
+    except (TypeError, ValueError):
+        at = 0.0
+    return (now - at) <= stale_s, None
+
+
+def quota_blocked(auth: dict, now: float | None = None,
+                  stale_s: int = QUOTA_STALE_S) -> tuple[bool, str]:
+    """True when EVERY pooled Codex credential is refused for quota.
+
+    The pool is a failover set, so one usable entry means the gateway can still
+    answer and there is nothing to page about. Only a fully blocked pool stops
+    the bot.
+    """
+    pool = (auth.get("credential_pool") or {}).get(PROVIDER) or []
+    if not pool:
+        return False, ""
+
+    now = time.time() if now is None else now
+    blocked = []
+    for entry in pool:
+        is_blocked, reset = _entry_quota_blocked(entry, now, stale_s)
+        if not is_blocked:
+            return False, ""
+        blocked.append((entry, reset))
+
+    labels = ", ".join(str(e.get("label") or e.get("id") or "?") for e, _ in blocked)
+    resets = [r for _, r in blocked if r]
+    when = (time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(max(resets)))
+            if resets else "unknown")
+    plural = "s" if len(blocked) > 1 else ""
+    return True, (f"{len(blocked)} pooled credential{plural} out of quota ({labels}); "
+                  f"window resets {when}")
+
+
 def gateway_active(unit: str) -> tuple[bool, str]:
     """Is the gateway actually running? Codex auth can be perfect while the bot is dead."""
     try:
@@ -226,8 +335,19 @@ def detect(auth_path: pathlib.Path, gateway_unit: str) -> tuple[str, str]:
         return "down", (f"codex credential is healthy but {gateway_unit} is {raw} — "
                         f"the bot is down for a different reason (lineage={fp})")
 
+    plan = plan_of(access)
+    plan_note = f", plan={plan}" if plan else ""
+
+    # Last, deliberately: sign-in and a dead gateway are the more actionable
+    # failures, and quota only matters once the credential is otherwise fine.
+    out_of_quota, quota_detail = quota_blocked(d)
+    if out_of_quota:
+        return "quota", (f"{quota_detail}. The credential itself is valid "
+                         f"(lineage={fp}{plan_note}) — signing in again will not help.")
+
     when = time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(exp)) if exp else "unknown"
-    return "ok", f"refresh token present (lineage={fp}), access token valid to {when}, gateway {raw}"
+    return "ok", (f"refresh token present (lineage={fp}{plan_note}), "
+                  f"access token valid to {when}, gateway {raw}")
 
 
 # --------------------------------------------------------------------------
@@ -300,6 +420,26 @@ def _joined(cfg: dict, key: str) -> str:
     return "\n".join(cfg.get(key) or [])
 
 
+def subject(cfg: dict, status: str) -> str:
+    """Email subject. A quota outage must not arrive titled "lost its sign-in".
+
+    Falls back to the sign-in subject when a host config predates
+    ``quota_subject``, so an un-migrated host still pages.
+    """
+    if status == "quota":
+        return cfg.get("quota_subject") or (
+            f"Action needed: {cfg['bot_label']} is out of Codex quota "
+            f"({cfg['host_label']})")
+    return cfg["subject"]
+
+
+def ticket_title(cfg: dict, status: str) -> str:
+    if status == "quota":
+        return cfg.get("quota_ticket_title") or (
+            f"Codex quota exhausted — {cfg['bot_label']} ({cfg['host_label']})")
+    return cfg["ticket_title"]
+
+
 def reauth_line(cfg: dict) -> str:
     """The sign-in URL, surfaced up top where it is actually readable.
 
@@ -316,7 +456,44 @@ def reauth_line(cfg: dict) -> str:
             f"that the CLI prints)\n\n")
 
 
-def alert_text(cfg: dict, detail: str, ticket: str | None) -> str:
+QUOTA_REMEDY = [
+    "This is NOT a sign-in problem. Do not run the device-code login — it will",
+    "complete successfully and change nothing.",
+    "",
+    "The options are:",
+    "  1. Wait for the window to roll (the reset time is above).",
+    "  2. Raise the plan on the ChatGPT account the credential is attached to.",
+    "  3. Point the profile at another provider for now (`model.provider` in the",
+    "     profile config.yaml), then restart the gateway unit.",
+    "",
+    "Confirm which account is attached before buying anything — an upgrade on the",
+    "wrong account looks identical from here and fixes nothing.",
+]
+
+
+def quota_alert_text(cfg: dict, detail: str, ticket: str | None) -> str:
+    """Alert body for a quota outage.
+
+    Shares nothing with the auth body on purpose. The reauth URL is omitted
+    entirely: it is the wrong action, and offering it is how 2026-08-17 spent two
+    completed logins on a plan that was simply out of quota.
+    """
+    return (
+        f"{cfg['bot_label']} on {cfg['host_label']} is out of Codex quota, so it has "
+        f"stopped answering. Its sign-in is fine.\n\n"
+        f"What the check saw: {detail}\n\n"
+        + (f"Linear ticket: {ticket}\n\n" if ticket else "")
+        + "\n".join(QUOTA_REMEDY) + "\n\n"
+        + (_joined(cfg, "quota_note") + "\n\n" if cfg.get("quota_note") else "")
+        + "You will not get another message about this for 24 hours, and none at all "
+        "once it is working again.\n\n"
+        f"-- Automated check on {cfg['host_label']} (codex-health)."
+    )
+
+
+def alert_text(cfg: dict, detail: str, ticket: str | None, status: str = "down") -> str:
+    if status == "quota":
+        return quota_alert_text(cfg, detail, ticket)
     return (
         f"{cfg['bot_label']} on {cfg['host_label']} can no longer sign in to Codex, "
         f"so it has stopped answering.\n\n"
@@ -331,7 +508,17 @@ def alert_text(cfg: dict, detail: str, ticket: str | None) -> str:
     )
 
 
-def ticket_body(cfg: dict, detail: str) -> str:
+def ticket_body(cfg: dict, detail: str, status: str = "down") -> str:
+    if status == "quota":
+        return (
+            f"`{cfg['bot_label']}` on `{cfg['host_label']}` is out of Codex quota, so it "
+            f"has stopped answering. **The sign-in is fine — a re-login will not help.**\n\n"
+            f"**What the check saw:** {detail}\n\n"
+            f"### Fix\n\n```\n" + "\n".join(QUOTA_REMEDY) + "\n```\n\n"
+            + (f"### Context\n\n{_joined(cfg, 'quota_note')}\n\n"
+               if cfg.get("quota_note") else "")
+            + f"_Auto-filed by the {cfg['host_label']} codex-health check._"
+        )
     url = cfg.get("reauth_url")
     link = (f"**Reauth here:** {url}\n"
             f"(start at step 1 — this page needs the device code the CLI prints)\n\n"
@@ -402,13 +589,18 @@ def run(args) -> int:
     now = int(time.time())
 
     alert = False
-    if status == "down":
-        if prev != "down":
-            alert, why = True, "ok->down (first failure)"
+    if status != "ok":
+        # A change of failure KIND re-alerts even inside the quiet window. An
+        # auth outage and a quota outage need opposite actions, so inheriting the
+        # other one's silence would leave the wrong instruction standing.
+        if prev == "ok":
+            alert, why = True, f"ok->{status} (first failure)"
+        elif prev != status:
+            alert, why = True, f"{prev}->{status} (failure kind changed)"
         elif now - int(st.get("last_alert", 0)) >= renotify_s:
-            alert, why = True, "still down, reminder"
+            alert, why = True, f"still {status}, reminder"
         else:
-            why = "still down, inside quiet window"
+            why = f"still {status}, inside quiet window"
     else:
         why = "healthy (silent by design)" if prev == "ok" else "recovered (silent re-arm)"
 
@@ -422,28 +614,32 @@ def run(args) -> int:
                 if not ch or getattr(args, f"no_{name}"):
                     continue
                 if name == "linear":
-                    print(f"\n--- LINEAR -> team {ch['team']} ---\n{cfg['ticket_title']}")
+                    print(f"\n--- LINEAR -> team {ch['team']} ---\n{ticket_title(cfg, status)}")
                 elif name == "slack":
-                    print(f"\n--- SLACK -> {ch['channel']} ---\n{alert_text(cfg, detail, None)}")
+                    print(f"\n--- SLACK -> {ch['channel']} ---\n"
+                          f"{alert_text(cfg, detail, None, status)}")
                 else:
-                    print(f"\n--- EMAIL -> {ch['to']} ---\nSubject: {cfg['subject']}\n\n"
-                          f"{alert_text(cfg, detail, None)}")
+                    print(f"\n--- EMAIL -> {ch['to']} ---\n"
+                          f"Subject: {subject(cfg, status)}\n\n"
+                          f"{alert_text(cfg, detail, None, status)}")
         return 0
 
     delivered, failures = 0, []
 
     if alert:
         ticket = st.get("ticket_url")
-        # One ticket per outage: file on the first failure, not on reminders.
+        # One ticket per outage: file on the first failure, not on reminders. A
+        # changed failure kind is a new problem with a different fix, so it earns
+        # its own ticket rather than a comment on one that says to re-login.
         ch = channels.get("linear")
-        if ch and not args.no_linear and prev != "down":
+        if ch and not args.no_linear and prev != status:
             key = env_val(ch["key_env"], hermes_home)
             if not key:
                 failures.append(f"linear: {ch['key_env']} unresolvable")
             else:
                 try:
-                    ticket = linear_create(ch, cfg["ticket_title"],
-                                           ticket_body(cfg, detail), key)
+                    ticket = linear_create(ch, ticket_title(cfg, status),
+                                           ticket_body(cfg, detail, status), key)
                     st["ticket_url"] = ticket
                     delivered += 1
                     print(f"linear ticket: {ticket}")
@@ -457,7 +653,7 @@ def run(args) -> int:
                 failures.append(f"slack: {ch['token_env']} unresolvable")
             else:
                 try:
-                    slack_post(ch, alert_text(cfg, detail, ticket), tok)
+                    slack_post(ch, alert_text(cfg, detail, ticket, status), tok)
                     delivered += 1
                     print(f"slack -> {ch['channel']}")
                 except Exception as e:
@@ -470,14 +666,15 @@ def run(args) -> int:
                 failures.append(f"email: {ch['key_env']} unresolvable")
             else:
                 try:
-                    send_email(ch, cfg["subject"], alert_text(cfg, detail, ticket), key)
+                    send_email(ch, subject(cfg, status),
+                               alert_text(cfg, detail, ticket, status), key)
                     delivered += 1
                     print(f"emailed {ch['to']}")
                 except Exception as e:
                     failures.append(f"email: {type(e).__name__}: {e}")
 
         st["last_alert"] = now
-        print(f"status=down ({why}) | {detail}")
+        print(f"status={status} ({why}) | {detail}")
     else:
         if status == "ok":
             st["ticket_url"] = None      # re-arm so the next outage files a fresh ticket
