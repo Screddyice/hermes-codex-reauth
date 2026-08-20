@@ -1,28 +1,28 @@
 {
+  "host_label": "hermes-tmn (NEBOS v2 Claude)",
+  "bot_label": "NEBOS v2",
   "label": "NEBOS v2 (nebos-dev, Cloud Run)",
-
   "secret_name": "CLAUDE_CODE_OAUTH_TOKEN",
   "gcp_project": "nebos-dev",
   "probe_model": "claude-haiku-4-5-20251001",
-
   "renotify_s": 86400,
-
   "reauth_url": "https://claude.ai/settings/profile",
-
   "subject": "Action needed: NEBOS lost its Claude sign-in (nebos-dev)",
-
   "channels": {
     "slack": {
       "channel": "C09FLJDCAJD",
       "token_env": "SLACK_BOT_TOKEN"
     },
     "email": {
-      "to": ["shawn@teamnebula.ai"],
+      "to": [
+        "shawn@teamnebula.ai",
+        "ian@teamnebula.ai",
+        "abraham@teamnebula.ai"
+      ],
       "key_env": "TMN_COMPOSIO_API_KEY",
       "composio_user_id": "user_uwgmr"
     }
   },
-
   "runbook": [
     "A HUMAN MUST DO THIS. Nothing will self-heal: the token is a Claude Code",
     "OAuth credential and minting a new one requires signing in as a person.",
@@ -41,7 +41,6 @@
     "4. Confirm NEBOS is serving and the credential took:",
     "   make health"
   ],
-
   "context_note": [
     "Why this matters: nebos-v2's deploy wires CLAUDE_CODE_OAUTH_TOKEN as the only",
     "Anthropic credential (ANTHROPIC_API_KEY appears in .env.example but is not in",

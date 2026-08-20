@@ -307,3 +307,16 @@ def test_env_beside_the_script_is_used_when_there_is_no_hermes_home(tmp_path, se
 
     assert nf.run(Args(cfg)) == 0
     assert sent[0]["token"] == "obs-token" and sent[0]["chat"] == "42"
+
+
+def test_every_shipped_config_names_itself_for_escalation():
+    """An escalation DM must say what broke.
+
+    nebos-claude.json used `label` where notify_failure.py reads `host_label`, so
+    its Telegram alert would have read "unknown host … a Hermes bot" — anonymous
+    at the one moment the name matters. Caught when install.sh printed host=None.
+    """
+    for name in ("hostinger", "tmn", "neb-ops", "nebos-claude"):
+        cfg = json.loads((WATCHDOG / "hosts" / f"{name}.json").read_text())
+        assert cfg.get("host_label"), f"{name}.json has no host_label"
+        assert cfg.get("bot_label"), f"{name}.json has no bot_label"

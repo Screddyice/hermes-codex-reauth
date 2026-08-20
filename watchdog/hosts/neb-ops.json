@@ -23,6 +23,10 @@
     "telegram": {
       "chat_id": "6056863584",
       "token_env": "TELEGRAM_BOT_TOKEN"
+    },
+    "slack": {
+      "channel": "C09FLJDCAJD",
+      "token_env": "SLACK_BOT_TOKEN"
     }
   },
   "runbook": [
