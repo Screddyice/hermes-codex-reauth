@@ -166,6 +166,27 @@ Three rules keep it honest:
 A broken sign-in outranks quota: with both wrong you get `down`, because quota is
 moot until the credential can call at all.
 
+## A watchdog watching the watchdog next door
+
+A box can run more than one check. hermes-tmn runs the codex check and the NEBOS
+v2 Claude check. If the **codex** timer stops, its heartbeat goes stale and the
+peer reports it — but the **Claude** timer has no such shadow, so switching it off
+was invisible while the box stayed healthy. That is the 2026-08-04 failure mode (a
+timer disabled, six days unnoticed) surviving in a corner.
+
+So each host config may name `sibling_timers`, and the codex check asserts them
+locally through systemd: enabled, scheduled, and triggered within
+`sibling_stale_s` (26h — 4x/day plus slack). No network, no heartbeat, nothing new
+to rot. A never-triggered timer reads as a fresh install rather than a fault, and
+a systemctl error reads as uncheckable rather than broken.
+
+Only hermes-tmn carries one (`nebos-claude-health.timer`). hostinger runs a single
+watchdog, so it has no sibling to pair with.
+
+The `sibling` verdict is its own kind, with prose that says plainly that the box's
+own credential is fine and points at the timer. It outranks the peer watch, being
+local and certain where the peer watch is remote and inferential.
+
 ## Alerting
 
 Routing differs per box, set on 2026-08-17. `@Screddy_bot` on hostinger is Shawn's
@@ -299,9 +320,13 @@ Observer mode is not a loophole in the `hermes_home` rule. A config with no
 `mode: observer` still hard-fails without an auth store; the observer is exempt
 only because it inspects no credential. Both halves have tests.
 
-**What remains uncovered:** all three hosts dark at once. Nothing watches the
-observer, so if it dies, coverage silently degrades to the mutual watch, which
-still catches any single box going dark. It is a backstop, not a root of trust.
+**The observer is watched too.** It serves a heartbeat like the others, and
+hermes-tmn reads it. Only that one box does: if both Hermes boxes watched the
+observer, a single dead observer would page twice for one event. So the ring has
+no unwatched node — hostinger ↔ hermes-tmn → neb-ops-gcp → back.
+
+**What remains uncovered:** all three hosts dark at once, which now requires three
+independent failures across two providers and two regions.
 
 The heartbeat server binds the tailnet address from `tailscale ip -4` and refuses
 to start without one. It never falls back to `0.0.0.0`: hostinger has a public IP,

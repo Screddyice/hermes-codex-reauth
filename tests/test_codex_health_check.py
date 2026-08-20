@@ -517,12 +517,31 @@ def test_shipped_configs_point_at_each_other_over_the_tailnet():
     tmn = chk.load_config(WATCHDOG / "hosts" / "tmn.json")
 
     assert host["peer"]["label"] == "hermes-tmn"
-    assert tmn["peer"]["label"] == "hostinger"
+    # hermes-tmn watches hostinger AND the backstop, so nothing in the ring is
+    # unwatched. Only this box watches the observer — if both Hermes boxes did,
+    # one dead observer would page twice for a single event.
+    assert [p["label"] for p in tmn["peers"]] == ["hostinger", "neb-ops-gcp"]
+    assert "peer" not in tmn
+
     # tailnet addresses only — a public IP here would route monitoring over the
     # internet and would keep working if Tailscale died, hiding a real fault.
-    for cfg in (host, tmn):
-        assert "://100." in cfg["peer"]["url"], cfg["peer"]["url"]
-        assert cfg["peer"]["stale_after_s"] >= 2 * 6 * 3600
+    everything = [host["peer"]] + list(tmn["peers"])
+    for peer in everything:
+        assert "://100." in peer["url"], peer["url"]
+        assert peer["stale_after_s"] >= 2 * 6 * 3600
+
+
+def test_only_the_box_with_two_watchdogs_asserts_a_sibling_timer():
+    """hermes-tmn runs a second check (NEBOS Claude) whose timer nothing shadows.
+
+    The codex timer needs no assertion: if it stops, its heartbeat goes stale and
+    the peer reports it. The Claude timer has no such shadow, which is the gap.
+    """
+    tmn = chk.load_config(WATCHDOG / "hosts" / "tmn.json")
+    assert tmn["sibling_timers"] == ["nebos-claude-health.timer"]
+
+    host = chk.load_config(WATCHDOG / "hosts" / "hostinger.json")
+    assert not host.get("sibling_timers")   # one watchdog on that box, nothing to pair
 
 
 # --------------------------------------------------------------------------
@@ -829,3 +848,103 @@ def test_observer_alert_reaches_telegram(tmp_path, monkeypatch):
     assert chk.run(Args(cfg_path, tmp_path / "state.json")) == 0
     assert len(sent) == 1
     assert "every watched box is dark" in sent[0]
+
+
+# --------------------------------------------------------------------------
+# sibling timers — the watchdog next door
+# --------------------------------------------------------------------------
+
+def fake_systemctl(monkeypatch, *, enabled="enabled", next_elapse="Tue 2026-08-18 03:00:00 UTC",
+                   last="Mon 2026-08-17 21:00:00 UTC"):
+    class R:
+        def __init__(self, out): self.stdout = out
+    def run(cmd, **kw):
+        if "is-enabled" in cmd: return R(enabled + "\n")
+        if "NextElapseUSecRealtime" in cmd: return R(next_elapse + "\n")
+        if "LastTriggerUSec" in cmd: return R(last + "\n")
+        return R("")
+    monkeypatch.setattr(chk.subprocess, "run", run)
+
+
+def test_armed_sibling_timer_is_quiet(monkeypatch):
+    fake_systemctl(monkeypatch)
+    status, detail = chk.sibling_timers_ok({"sibling_timers": ["nebos-claude-health.timer"]})
+    assert status == "ok" and "armed" in detail
+
+
+def test_disabled_sibling_timer_alerts(monkeypatch):
+    """The 2026-08-04 failure mode: a timer switched off, nothing noticing."""
+    fake_systemctl(monkeypatch, enabled="disabled")
+    status, detail = chk.sibling_timers_ok({"sibling_timers": ["nebos-claude-health.timer"]})
+    assert status == "sibling"
+    assert "nebos-claude-health.timer is disabled" in detail
+    assert "unmonitored" in detail
+
+
+def test_enabled_but_unscheduled_sibling_alerts(monkeypatch):
+    """Enabled with no next elapse is the silent-never-fires case."""
+    fake_systemctl(monkeypatch, next_elapse="")
+    status, detail = chk.sibling_timers_ok({"sibling_timers": ["t.timer"]})
+    assert status == "sibling" and "no next run scheduled" in detail
+
+
+def test_never_triggered_sibling_is_a_fresh_install_not_a_fault(monkeypatch):
+    fake_systemctl(monkeypatch, last="n/a")
+    status, _ = chk.sibling_timers_ok({"sibling_timers": ["t.timer"]})
+    assert status == "ok"
+
+
+def test_uncheckable_sibling_never_pages(monkeypatch):
+    """A systemctl hiccup is not evidence a timer stopped."""
+    def boom(*a, **k): raise OSError("systemctl gone")
+    monkeypatch.setattr(chk.subprocess, "run", boom)
+    status, detail = chk.sibling_timers_ok({"sibling_timers": ["t.timer"]})
+    assert status == "ok" and "uncheckable" in detail
+
+
+def test_no_sibling_timers_configured_is_silent():
+    assert chk.sibling_timers_ok({}) == ("ok", "")
+
+
+def test_sibling_alert_points_at_the_timer_not_the_credential():
+    cfg = chk.load_config(WATCHDOG / "hosts" / "tmn.json")
+    body = chk.alert_text(cfg, "nebos-claude-health.timer is disabled", None, "sibling")
+    assert "auth.openai.com/codex/device" not in body
+    assert "Nothing is wrong with this box's own credential" in body
+    assert "systemctl --user enable --now" in body
+    assert "stopped running" in chk.subject(cfg, "sibling")
+
+
+# --------------------------------------------------------------------------
+# multi-peer ring
+# --------------------------------------------------------------------------
+
+def test_any_dark_peer_is_reported_not_just_all(monkeypatch):
+    """Opposite rule to the observer: each peer here is watched by nobody else."""
+    import contextlib, io, json as _json
+    def opener(url, timeout=0):
+        if "100.74" in url:                      # the observer is dark
+            raise OSError("unreachable")
+        body = _json.dumps({"at": int(time.time()) - 60}).encode()
+        return contextlib.closing(io.BytesIO(body))
+    monkeypatch.setattr(chk.urllib.request, "urlopen", opener)
+
+    cfg = chk.load_config(WATCHDOG / "hosts" / "tmn.json")
+    status, _, fails = chk.read_peers(cfg, {})
+    assert status == "ok" and fails["neb-ops-gcp"] == 1      # one miss, no page
+
+    status, detail, fails = chk.read_peers(cfg, fails)
+    assert status == "peer"
+    assert "neb-ops-gcp" in detail
+    assert fails["hostinger"] == 0                          # healthy peer stays reset
+
+
+def test_single_peer_config_still_works(monkeypatch):
+    """hostinger predates the list and must keep working unchanged."""
+    import contextlib, io, json as _json
+    monkeypatch.setattr(chk.urllib.request, "urlopen",
+                        lambda url, timeout=0: contextlib.closing(
+                            io.BytesIO(_json.dumps({"at": int(time.time()) - 60}).encode())))
+    cfg = chk.load_config(WATCHDOG / "hosts" / "hostinger.json")
+    status, _, _ = chk.read_peers(cfg, {})
+    assert status == "ok"
