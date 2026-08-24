@@ -187,16 +187,20 @@ def test_alert_omits_the_reauth_line_when_no_url_configured(tmp_path):
 
 
 def test_shipped_codex_hosts_route_alerts_per_host():
-    """Routing set by instruction on 2026-08-17, and different per box.
+    """Routing set by instruction on 2026-08-17, amended 2026-08-24.
 
-    hostinger (@Screddy_bot) is Shawn's own assistant, so it emails him and does
-    not post to the team channel. hermes-tmn (@Teamnebula_bot) is company
-    infrastructure with no fallback provider, so it does both. Linear ticketing
-    was dropped from hostinger in the same pass.
+    hostinger (@Screddy_bot) is Shawn's own assistant, so it stays out of the
+    team channel: it DMs him over Telegram and emails him. Telegram was added on
+    2026-08-24 so the primary path shares no failure mode with Composio, after a
+    key rotation left email 401ing with only the OnFailure backstop delivering.
+    hermes-tmn (@Teamnebula_bot) is company infrastructure with no fallback
+    provider, so it posts to the team channel and emails. Linear ticketing was
+    dropped from hostinger on 2026-08-17.
     """
     host = chk.load_config(WATCHDOG / "hosts" / "hostinger.json")
-    assert list(host["channels"]) == ["email"]
+    assert sorted(host["channels"]) == ["email", "telegram"]
     assert host["channels"]["email"]["to"] == ["shawn@teamnebula.ai"]
+    assert host["channels"]["telegram"]["token_env"] == "TELEGRAM_BOT_TOKEN"
 
     tmn = chk.load_config(WATCHDOG / "hosts" / "tmn.json")
     assert sorted(tmn["channels"]) == ["email", "slack"]
@@ -206,6 +210,21 @@ def test_shipped_codex_hosts_route_alerts_per_host():
 
     # The personal box must not page the team channel.
     assert "slack" not in host["channels"]
+
+
+def test_shipped_email_channels_pin_entity_and_account():
+    """The 2026-08-21 Composio migration retired the shared entity user_uwgmr.
+
+    Every shipped email channel must pin a per-mailbox user_id AND an explicit
+    connected_account_id: the retired entity fails even with a live key, which
+    is how the 2026-08-24 outage looked like a credential problem from the
+    outside. Default-resolution is also how mail has been sent from the wrong
+    mailbox before, so the account id is not optional politeness.
+    """
+    for name in ("hostinger", "tmn"):
+        ch = chk.load_config(WATCHDOG / "hosts" / f"{name}.json")["channels"]["email"]
+        assert ch["composio_user_id"] != "user_uwgmr"
+        assert ch.get("connected_account_id", "").startswith("ca_")
 
 
 def test_shipped_configs_carry_their_own_runbook_only():

@@ -195,12 +195,25 @@ on hermes-tmn is company infrastructure with no fallback provider, so it posts t
 Slack `#tmn-ops` **and** emails. hostinger's Linear ticketing was dropped in the
 same pass.
 
-hostinger now has a single channel, so read the failure mode: if the Composio key
-rotates away, `env_val` returns empty, and the run exits 1 with nothing delivered.
-That is loud in the journal and silent to you, and nothing watches the watcher.
-tmn survives losing either channel, which is the reason it keeps two: on 2026-08-17
-a Slack app reinstall dropped the bot from `#tmn-ops` and `chat.postMessage` would
-have returned `not_in_channel`.
+The personal box carries two channels since 2026-08-24: Telegram, then email.
+Telegram reuses `TELEGRAM_BOT_TOKEN`, the same secret `notify_failure.py`
+escalates with, so the primary path no longer shares a failure mode with
+Composio. That closed the single-channel risk this paragraph used to document,
+and the risk was not hypothetical: on 2026-08-24 a `TMN_COMPOSIO_API_KEY`
+rotation reached the box's fleet store but not `~/.hermes/.env`, every email
+returned HTTP 401, and for a day the only delivery was the OnFailure backstop.
+tmn survives losing either channel, which is the reason it keeps two: on
+2026-08-17 a Slack app reinstall dropped the bot from `#tmn-ops` and
+`chat.postMessage` would have returned `not_in_channel`.
+
+Composio email is entity-scoped since the 2026-08-21 single-account migration.
+An email channel must pin BOTH `composio_user_id` (per-mailbox: `src` for the
+personal box, `tmn-shawn` for TMN hosts) and `connected_account_id` (the `ca_*`
+id from `~/projects/docs/reference/composio-tmn-connected-accounts.md`). The
+retired shared entity `user_uwgmr` fails even with a live key. And after any key
+rotation, update `~/.hermes/.env` on each box, not only the fleet store:
+`env_val` resolves `TMN_COMPOSIO_API_KEY` from there, and a stale copy is
+exactly the 401 above.
 
 ```
 ok    -> down/quota   alert once on every configured channel

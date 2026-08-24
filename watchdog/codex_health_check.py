@@ -552,9 +552,14 @@ def send_email(cfg_ch: dict, subject: str, body: str, api_key: str) -> None:
     args = {"recipient_email": to[0], "subject": subject, "body": body, "is_html": False}
     if len(to) > 1:
         args["extra_recipients"] = to[1:]
+    payload = {"user_id": cfg_ch["composio_user_id"], "arguments": args}
+    # Composio resolves the sending mailbox from connected_account_id; user_id
+    # alone lets it default-resolve, which has picked the wrong mailbox before.
+    if cfg_ch.get("connected_account_id"):
+        payload["connected_account_id"] = cfg_ch["connected_account_id"]
     req = urllib.request.Request(
         COMPOSIO_EXEC,
-        data=json.dumps({"user_id": cfg_ch["composio_user_id"], "arguments": args}).encode(),
+        data=json.dumps(payload).encode(),
         headers={"x-api-key": api_key, "Content-Type": "application/json"},
     )
     with urllib.request.urlopen(req, timeout=45) as r:
