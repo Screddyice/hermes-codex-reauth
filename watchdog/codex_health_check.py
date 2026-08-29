@@ -293,6 +293,24 @@ def quota_blocked(auth: dict, now: float | None = None,
                   f"window resets {when}")
 
 
+def renewable_pool_entries(auth: dict) -> list[dict]:
+    """Pooled credentials Hermes can still refresh and route through.
+
+    A populated credential pool is Hermes' runtime source of truth. The legacy
+    providers block can retain a terminal refresh error after a manual pooled
+    credential has taken over, so mixing the two sources produces false pages.
+    """
+    pool = (auth.get("credential_pool") or {}).get(PROVIDER) or []
+    renewable = []
+    for entry in pool:
+        tokens = entry.get("tokens") or entry
+        if str(entry.get("last_status") or "").lower() == "dead":
+            continue
+        if tokens.get("refresh_token"):
+            renewable.append(entry)
+    return sorted(renewable, key=lambda entry: int(entry.get("priority") or 0))
+
+
 def write_heartbeat(path: pathlib.Path, cfg: dict, status: str) -> None:
     """Record that this check ran, for the peer box to read.
 
@@ -495,33 +513,47 @@ def detect(auth_path: pathlib.Path, gateway_unit: str) -> tuple[str, str]:
     if not prov and not pool:
         return "down", "no Codex credential at all (providers block empty, pool empty)"
 
-    toks = prov.get("tokens") or {}
+    pooled = bool(pool)
+    if pooled:
+        renewable = renewable_pool_entries(d)
+        if not renewable:
+            return "down", (f"credential pool has {len(pool)} entr"
+                            f"{'y' if len(pool) == 1 else 'ies'} but no renewable "
+                            "pooled credential")
+        now = time.time()
+        active = next((entry for entry in renewable
+                       if not _entry_quota_blocked(entry, now, QUOTA_STALE_S)[0]),
+                      renewable[0])
+        prov = active
+
+    toks = prov.get("tokens") or prov
     refresh = toks.get("refresh_token") or ""
     access = toks.get("access_token") or ""
     exp = _exp_of(access)
     now = time.time()
     fp = lineage(refresh)
 
-    err = prov.get("last_auth_error") or {}
-    if err:
-        code = str(err.get("code") or "")
-        relogin = bool(err.get("relogin_required"))
-        at = str(err.get("at") or "")
-        last_refresh = str(prov.get("last_refresh") or "")
-        # Only trust an error newer than the last successful refresh; a stale
-        # record from a since-repaired outage must not page forever.
-        if at and last_refresh and at > last_refresh:
-            if relogin or code == "refresh_token_reused":
-                return "down", (f"{code or 'auth error'} at {at} "
-                                f"(relogin_required={relogin}, lineage={fp})")
+    if not pooled:
+        err = prov.get("last_auth_error") or {}
+        if err:
+            code = str(err.get("code") or "")
+            relogin = bool(err.get("relogin_required"))
+            at = str(err.get("at") or "")
+            last_refresh = str(prov.get("last_refresh") or "")
+            # Only trust an error newer than the last successful refresh; a stale
+            # record from a since-repaired outage must not page forever.
+            if at and last_refresh and at > last_refresh:
+                if relogin or code == "refresh_token_reused":
+                    return "down", (f"{code or 'auth error'} at {at} "
+                                    f"(relogin_required={relogin}, lineage={fp})")
 
-    if not refresh:
-        return "down", "credential has NO refresh token — it cannot renew and will not recover on its own"
+        if not refresh:
+            return "down", "credential has NO refresh token — it cannot renew and will not recover on its own"
 
-    if exp and exp <= now:
-        return "down", (f"access token expired "
-                        f"{time.strftime('%Y-%m-%dT%H:%MZ', time.gmtime(exp))} "
-                        f"and nothing refreshed it (lineage={fp})")
+        if exp and exp <= now:
+            return "down", (f"access token expired "
+                            f"{time.strftime('%Y-%m-%dT%H:%MZ', time.gmtime(exp))} "
+                            f"and nothing refreshed it (lineage={fp})")
 
     up, raw = gateway_active(gateway_unit)
     if not up:
@@ -539,6 +571,11 @@ def detect(auth_path: pathlib.Path, gateway_unit: str) -> tuple[str, str]:
                          f"(lineage={fp}{plan_note}) — signing in again will not help.")
 
     when = time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(exp)) if exp else "unknown"
+    if pooled:
+        label = str(prov.get("label") or prov.get("id") or "unnamed")
+        return "ok", (f"pooled credential {label} renewable "
+                      f"(lineage={fp}{plan_note}), access token valid to {when}, "
+                      f"gateway {raw}")
     return "ok", (f"refresh token present (lineage={fp}{plan_note}), "
                   f"access token valid to {when}, gateway {raw}")
 

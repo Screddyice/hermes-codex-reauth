@@ -54,14 +54,17 @@ def jwt_with_exp(exp: int | None, plan: str | None = None) -> str:
 
 
 def pool_entry(*, label="cred-1", exhausted=True, reset_offset=+3600,
-               status_age_s=60, code=429, in_message=True) -> dict:
+               status_age_s=60, code=429, in_message=True, refresh="rt-pool",
+               exp_offset=+86400) -> dict:
     """A credential_pool entry shaped like the ones Hermes actually writes.
 
     Mirrors the real record from the 2026-08-17 incident: last_status
     "exhausted", last_error_code 429, and the 429 body stored as a Python repr
     (not JSON) with resets_at inside it.
     """
+    exp = int(time.time()) + exp_offset if exp_offset is not None else None
     e = {"id": label, "label": label, "auth_type": "oauth",
+         "access_token": jwt_with_exp(exp), "refresh_token": refresh,
          "last_status_at": time.time() - status_age_s}
     if not exhausted:
         e["last_status"] = "ok"
@@ -288,6 +291,39 @@ def test_stale_auth_error_older_than_last_refresh_is_ignored(tmp_path):
     assert status == "ok"
 
 
+def test_healthy_pool_outranks_broken_legacy_singleton(tmp_path):
+    """Hermes routes through the pool, so a stale singleton must not page.
+
+    This mirrors Screddy's live auth store: the singleton recorded
+    refresh_token_reused while a manual pooled credential served real Codex
+    requests. The watchdog reported the working gateway as signed out.
+    """
+    err = {"code": "refresh_token_reused", "relogin_required": True,
+           "at": "2026-08-27T10:19:44Z"}
+    doc = auth_doc(refresh=None, last_error=err,
+                   last_refresh="2026-08-21T09:06:21Z",
+                   pool=[pool_entry(label="chatgpt-teamnebula", exhausted=False)])
+    (tmp_path / "auth.json").write_text(json.dumps(doc))
+
+    status, detail = chk.detect(tmp_path / "auth.json", "u.service")
+
+    assert status == "ok"
+    assert "chatgpt-teamnebula" in detail
+    assert "pooled credential" in detail
+
+
+def test_unusable_pool_is_down_even_when_legacy_singleton_is_healthy(tmp_path):
+    """A populated pool is Hermes' runtime source of truth, not the singleton."""
+    doc = auth_doc(pool=[pool_entry(label="broken-pool", exhausted=False,
+                                    refresh=None)])
+    (tmp_path / "auth.json").write_text(json.dumps(doc))
+
+    status, detail = chk.detect(tmp_path / "auth.json", "u.service")
+
+    assert status == "down"
+    assert "no renewable pooled credential" in detail
+
+
 def test_unreadable_auth_is_disarmed_not_silently_ok(tmp_path):
     with pytest.raises(chk.Disarmed):
         chk.detect(tmp_path / "missing.json", "u.service")
@@ -368,12 +404,13 @@ def test_exhausted_with_no_reset_time_falls_back_to_recency(tmp_path):
     assert chk.detect(tmp_path / "auth.json", "u.service")[0] == "ok"
 
 
-def test_broken_signin_outranks_quota(tmp_path):
-    """With both broken, report the sign-in: quota is moot until it can call at all."""
+def test_pooled_quota_outranks_broken_legacy_singleton(tmp_path):
+    """The singleton cannot turn a live pool's quota problem into a reauth alert."""
     (tmp_path / "auth.json").write_text(json.dumps(
         auth_doc(refresh=None, pool=[pool_entry()])))
     status, detail = chk.detect(tmp_path / "auth.json", "u.service")
-    assert status == "down" and "NO refresh token" in detail
+    assert status == "quota"
+    assert "out of quota" in detail
 
 
 def test_plan_is_context_only_and_never_the_trigger(tmp_path):

@@ -155,16 +155,25 @@ no quota. The live probe stays off every timer for the reason recorded below (it
 ran every 30 minutes and burned the quota it existed to watch), and satisfying this
 gap with a scheduled probe would repeat that mistake.
 
+Hermes routes through `credential_pool` whenever that list is populated, so the
+watchdog uses the same source of truth. It ignores the legacy `providers` block in
+that case. That block can retain `refresh_token_reused` after a manual pool entry
+has taken over, which made the watchdog report a working gateway as signed out on
+2026-08-27. The singleton still governs hosts without a pool.
+
 Three rules keep it honest:
 
 | Situation | Verdict | Why |
 |---|---|---|
+| Healthy pooled credential, broken legacy singleton | `ok` | Hermes serves through the pool; the singleton no longer controls runtime auth. |
+| Pool populated, no renewable entry | `down` | Hermes has no pooled credential it can refresh. |
 | Every pooled credential blocked | `quota` | The pool is a failover set. One usable entry and the bot still answers. |
 | `resets_at` in the past | `ok` | The window rolled. A spent record stops paging by itself. |
 | Blocked, no `resets_at`, last error older than `QUOTA_STALE_S` (6h) | `ok` | A live exhaustion re-stamps `last_status_at` on every attempt, so this cannot swallow a real outage. |
 
-A broken sign-in outranks quota: with both wrong you get `down`, because quota is
-moot until the credential can call at all.
+The active auth source determines precedence. A singleton sign-in failure outranks
+quota only when no pool exists. With a populated pool, the watchdog evaluates that
+pool for renewable credentials and quota state.
 
 ## A watchdog watching the watchdog next door
 
