@@ -487,3 +487,22 @@ session. Wipe those deliberately rather than leaving them to rot.
 still-running `codex-keepalive` loads its probe from. Deleting it makes `python3`
 exit 2, which that script maps to UNKNOWN → "no action" → **systemd green
 forever**. Archive it; never `rm` it, and only after the keepalive is retired.
+
+## Automated PR review
+
+[Shawns QA Assist](https://github.com/Screddyice/shawns-qa-assist) reviews pull
+requests here and merges once its gate passes. `.shawns-qa.toml` runs
+`scripts/verify.sh`, which parses every tracked shell and Python file.
+
+Without a gate the agent reports `merge_eligible=false` and hands every PR to a
+human, because nothing can vouch for the change.
+
+Syntax only, on purpose: this repo has no test suite wired into the gate, and a
+gate that failed on pre-existing style would block every PR on faults it did not
+introduce. Add a real test command here once there is a suite to run.
+
+```bash
+bash scripts/verify.sh   # non-zero and names the file on a syntax error
+```
+
+To pause the agent on this repo: `[behavior] enabled = false` in `.shawns-qa.toml`.
