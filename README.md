@@ -155,16 +155,46 @@ no quota. The live probe stays off every timer for the reason recorded below (it
 ran every 30 minutes and burned the quota it existed to watch), and satisfying this
 gap with a scheduled probe would repeat that mistake.
 
+Hermes routes through `credential_pool` whenever that list is populated, so the
+watchdog uses the same source of truth. It ignores the legacy `providers` block in
+that case. That block can retain `refresh_token_reused` after a manual pool entry
+has taken over, which made the watchdog report a working gateway as signed out on
+2026-08-27. The singleton still governs hosts without a pool.
+
 Three rules keep it honest:
 
 | Situation | Verdict | Why |
 |---|---|---|
+| Healthy pooled credential, broken legacy singleton | `ok` | Hermes serves through the pool; the singleton no longer controls runtime auth. |
+| Pool populated, no renewable entry | `down` | Hermes has no pooled credential it can refresh. |
 | Every pooled credential blocked | `quota` | The pool is a failover set. One usable entry and the bot still answers. |
 | `resets_at` in the past | `ok` | The window rolled. A spent record stops paging by itself. |
 | Blocked, no `resets_at`, last error older than `QUOTA_STALE_S` (6h) | `ok` | A live exhaustion re-stamps `last_status_at` on every attempt, so this cannot swallow a real outage. |
 
-A broken sign-in outranks quota: with both wrong you get `down`, because quota is
-moot until the credential can call at all.
+The active auth source determines precedence. A singleton sign-in failure outranks
+quota only when no pool exists. With a populated pool, the watchdog evaluates that
+pool for renewable credentials and quota state.
+
+## A watchdog watching the watchdog next door
+
+A box can run more than one check. hermes-tmn runs the codex check and the NEBOS
+v2 Claude check. If the **codex** timer stops, its heartbeat goes stale and the
+peer reports it — but the **Claude** timer has no such shadow, so switching it off
+was invisible while the box stayed healthy. That is the 2026-08-04 failure mode (a
+timer disabled, six days unnoticed) surviving in a corner.
+
+So each host config may name `sibling_timers`, and the codex check asserts them
+locally through systemd: enabled, scheduled, and triggered within
+`sibling_stale_s` (26h — 4x/day plus slack). No network, no heartbeat, nothing new
+to rot. A never-triggered timer reads as a fresh install rather than a fault, and
+a systemctl error reads as uncheckable rather than broken.
+
+Only hermes-tmn carries one (`nebos-claude-health.timer`). hostinger runs a single
+watchdog, so it has no sibling to pair with.
+
+The `sibling` verdict is its own kind, with prose that says plainly that the box's
+own credential is fine and points at the timer. It outranks the peer watch, being
+local and certain where the peer watch is remote and inferential.
 
 ## Alerting
 
@@ -174,12 +204,25 @@ on hermes-tmn is company infrastructure with no fallback provider, so it posts t
 Slack `#tmn-ops` **and** emails. hostinger's Linear ticketing was dropped in the
 same pass.
 
-hostinger now has a single channel, so read the failure mode: if the Composio key
-rotates away, `env_val` returns empty, and the run exits 1 with nothing delivered.
-That is loud in the journal and silent to you, and nothing watches the watcher.
-tmn survives losing either channel, which is the reason it keeps two: on 2026-08-17
-a Slack app reinstall dropped the bot from `#tmn-ops` and `chat.postMessage` would
-have returned `not_in_channel`.
+The personal box carries two channels since 2026-08-24: Telegram, then email.
+Telegram reuses `TELEGRAM_BOT_TOKEN`, the same secret `notify_failure.py`
+escalates with, so the primary path no longer shares a failure mode with
+Composio. That closed the single-channel risk this paragraph used to document,
+and the risk was not hypothetical: on 2026-08-24 a `TMN_COMPOSIO_API_KEY`
+rotation reached the box's fleet store but not `~/.hermes/.env`, every email
+returned HTTP 401, and for a day the only delivery was the OnFailure backstop.
+tmn survives losing either channel, which is the reason it keeps two: on
+2026-08-17 a Slack app reinstall dropped the bot from `#tmn-ops` and
+`chat.postMessage` would have returned `not_in_channel`.
+
+Composio email is entity-scoped since the 2026-08-21 single-account migration.
+An email channel must pin BOTH `composio_user_id` (per-mailbox: `src` for the
+personal box, `tmn-shawn` for TMN hosts) and `connected_account_id` (the `ca_*`
+id from `~/projects/docs/reference/composio-tmn-connected-accounts.md`). The
+retired shared entity `user_uwgmr` fails even with a live key. And after any key
+rotation, update `~/.hermes/.env` on each box, not only the fleet store:
+`env_val` resolves `TMN_COMPOSIO_API_KEY` from there, and a stale copy is
+exactly the 401 above.
 
 ```
 ok    -> down/quota   alert once on every configured channel
@@ -299,9 +342,13 @@ Observer mode is not a loophole in the `hermes_home` rule. A config with no
 `mode: observer` still hard-fails without an auth store; the observer is exempt
 only because it inspects no credential. Both halves have tests.
 
-**What remains uncovered:** all three hosts dark at once. Nothing watches the
-observer, so if it dies, coverage silently degrades to the mutual watch, which
-still catches any single box going dark. It is a backstop, not a root of trust.
+**The observer is watched too.** It serves a heartbeat like the others, and
+hermes-tmn reads it. Only that one box does: if both Hermes boxes watched the
+observer, a single dead observer would page twice for one event. So the ring has
+no unwatched node — hostinger ↔ hermes-tmn → neb-ops-gcp → back.
+
+**What remains uncovered:** all three hosts dark at once, which now requires three
+independent failures across two providers and two regions.
 
 The heartbeat server binds the tailnet address from `tailscale ip -4` and refuses
 to start without one. It never falls back to `0.0.0.0`: hostinger has a public IP,

@@ -156,9 +156,12 @@ def send_email(ch: dict, subject: str, body: str, api_key: str) -> None:
     args = {"recipient_email": to[0], "subject": subject, "body": body, "is_html": False}
     if len(to) > 1:
         args["extra_recipients"] = to[1:]
+    payload = {"user_id": ch["composio_user_id"], "arguments": args}
+    if ch.get("connected_account_id"):
+        payload["connected_account_id"] = ch["connected_account_id"]
     req = urllib.request.Request(
         COMPOSIO_EXEC,
-        data=json.dumps({"user_id": ch["composio_user_id"], "arguments": args}).encode(),
+        data=json.dumps(payload).encode(),
         headers={"x-api-key": api_key, "Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=45) as r:
         resp = json.loads(r.read())
