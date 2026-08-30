@@ -958,6 +958,21 @@ def test_uncheckable_sibling_never_pages(monkeypatch):
     assert status == "ok" and "uncheckable" in detail
 
 
+def test_nonzero_systemctl_result_never_pages_for_sibling(monkeypatch):
+    """A lost user-systemd session returns nonzero rather than raising."""
+    class R:
+        returncode = 1
+        stdout = ""
+        stderr = "Failed to connect to bus: No medium found\n"
+
+    monkeypatch.setattr(chk.subprocess, "run", lambda *a, **k: R())
+
+    status, detail = chk.sibling_timers_ok({"sibling_timers": ["t.timer"]})
+
+    assert status == "ok"
+    assert "uncheckable" in detail
+
+
 def test_no_sibling_timers_configured_is_silent():
     assert chk.sibling_timers_ok({}) == ("ok", "")
 

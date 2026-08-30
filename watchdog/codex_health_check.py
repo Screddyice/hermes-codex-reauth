@@ -396,14 +396,19 @@ def sibling_timers_ok(cfg: dict) -> tuple[str, str]:
 
     for timer in timers:
         try:
-            enabled = subprocess.run(["systemctl", "--user", "is-enabled", timer],
-                                     capture_output=True, text=True, timeout=20).stdout.strip()
-            nxt = subprocess.run(["systemctl", "--user", "show", timer,
-                                  "-p", "NextElapseUSecRealtime", "--value"],
-                                 capture_output=True, text=True, timeout=20).stdout.strip()
-            last = subprocess.run(["systemctl", "--user", "show", timer,
-                                   "-p", "LastTriggerUSec", "--value"],
-                                  capture_output=True, text=True, timeout=20).stdout.strip()
+            enabled_r = subprocess.run(["systemctl", "--user", "is-enabled", timer],
+                                       capture_output=True, text=True, timeout=20)
+            next_r = subprocess.run(["systemctl", "--user", "show", timer,
+                                     "-p", "NextElapseUSecRealtime", "--value"],
+                                    capture_output=True, text=True, timeout=20)
+            last_r = subprocess.run(["systemctl", "--user", "show", timer,
+                                     "-p", "LastTriggerUSec", "--value"],
+                                    capture_output=True, text=True, timeout=20)
+            if any(getattr(r, "returncode", 0) != 0 for r in (enabled_r, next_r, last_r)):
+                raise OSError("systemctl returned nonzero")
+            enabled = enabled_r.stdout.strip()
+            nxt = next_r.stdout.strip()
+            last = last_r.stdout.strip()
         except Exception as e:
             # Cannot tell is not the same as broken; stay quiet rather than page
             # on a systemctl hiccup.
