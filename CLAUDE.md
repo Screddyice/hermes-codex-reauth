@@ -91,7 +91,9 @@ credential recovery on each cycle. An active fault blocks another mutation until
 `retry_s` elapses. Passive recovery clears the fault and re-arms notification.
 After OAuth persistence, pending gateway and probe work stays owned by
 `local.credential`. The ordinary gateway path must defer, and a cooldown retry
-must resume the pending phase without another OAuth refresh.
+must resume the pending phase without another OAuth refresh. A pending phase
+must never coexist with quota retry action or reset state. A probe-origin 429
+must clear pending work and write the quota action and reset in one state save.
 
 **Keep peer SSH fixed and narrow.** Accept Tailscale IPs and committed users,
 paths, and unit names only. Require a private identity and pinned host-key file.

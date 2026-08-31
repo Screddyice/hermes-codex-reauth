@@ -204,6 +204,11 @@ ordinary gateway handler will defer while either phase exists. At the cooldown
 boundary, the healer resumes the recorded phase without another OAuth refresh.
 Success clears the phase and credential fault.
 
+The state loader will reject a pending phase when quota retry action or reset
+state also exists. A pending probe that receives `QUOTA` will clear the phase
+and write only the probe-origin quota action and reset in one state save. The
+next cycle will wait until that reset before making a request.
+
 The healer will not run a refresh when the selected entry has a terminal error
 and no viable alternate pool entry exists. It will also stop when the pool has
 no renewable entry or refresh token. A stale terminal singleton does not block a
@@ -355,6 +360,9 @@ They will cover:
 - full helper readiness before every normal credential-host mutation;
 - quota silence before reset and one attempt after reset;
 - probe-origin 429 silence before reset and one direct probe at the boundary;
+- rejection of simultaneous credential-pending and quota-retry state before
+  readiness, repair, peer, or state-write boundaries;
+- one atomic pending-probe-to-quota transition with no request before reset;
 - local mutation cooldown before and at the exact retry boundary;
 - no use of `hermes auth reset`;
 - strict peer target validation and argv construction;

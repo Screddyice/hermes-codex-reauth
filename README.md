@@ -389,6 +389,9 @@ After OAuth persistence, the state file records `gateway_restart` and then
 exists. A failed restart waits for the credential cooldown, then resumes one
 restart and one probe. A failed probe resumes one probe. Neither path repeats the
 OAuth refresh. Success clears the pending phase and credential fault.
+The state loader rejects a pending phase when quota retry action or reset state
+also exists. A probe-origin 429 clears the pending phase and writes the quota
+action and reset in one state save, so later cycles wait for that reset.
 
 Credential roles pin the Hermes Python runtime, version, `auth.py`, and
 `credential_pool.py`, including a SHA-256 for each source module. `src` uses

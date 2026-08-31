@@ -1288,6 +1288,10 @@ def _validate_state(state: object) -> None:
         or refresh_attempt.get("status") != "persisted"
     ):
         raise Disarmed("state file is malformed")
+    if credential_pending_phase is not None and (
+        quota_retry_action is not None or quota_reset is not None
+    ):
+        raise Disarmed("state file is malformed")
     _validate_peer_state_map(state.get("peer_misses"), "misses")
     _validate_peer_state_map(state.get("peer_attempts"), "attempts")
 

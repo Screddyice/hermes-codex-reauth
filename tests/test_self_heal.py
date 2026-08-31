@@ -748,6 +748,55 @@ def test_live_probe_429_retries_once_at_reset_without_an_oauth_refresh(tmp_path)
     assert repeated.calls == []
 
 
+def test_pending_probe_quota_transition_is_atomic_and_waits_for_reset(tmp_path):
+    auth_path = write_auth(tmp_path, healthy_singleton())
+    cfg_path = write_cfg(tmp_path)
+    refresh_attempt = {
+        "lineage": "singleton",
+        "refresh_fingerprint": hashlib.sha256(b"refresh").hexdigest(),
+        "started_at": 1000,
+        "status": "persisted",
+        "reset_at": None,
+    }
+    state = {
+        "faults": {},
+        "credential_refresh_attempt": refresh_attempt,
+        "credential_pending_phase": "probe",
+    }
+    saved = []
+    runner = ScriptedRunner([
+        result(3, '{"error":{"resets_at":2000000000}}'),
+    ])
+
+    ok, detail = healer.repair_credential(
+        local_cfg(), cfg_path, auth_path, state, runner, 1000, False,
+        persist_state=lambda: saved.append(json.loads(json.dumps(state))),
+    )
+
+    quota_state = {
+        "faults": {},
+        "credential_refresh_attempt": refresh_attempt,
+        "quota_reset_at": 2000000000,
+        "quota_retry_action": "probe",
+    }
+    assert ok is True
+    assert "2000000000" in detail
+    assert saved == [quota_state]
+    assert state == quota_state
+    assert len(runner.calls) == 1
+    assert any("codex_auth_probe.py" in part for part in runner.calls[0])
+
+    before_reset = ScriptedRunner([])
+    before_ok, before_detail = healer.repair_credential(
+        local_cfg(), cfg_path, auth_path, state, before_reset,
+        1999999999, False,
+    )
+
+    assert before_ok is True
+    assert "2000000000" in before_detail
+    assert before_reset.calls == []
+
+
 def test_unknown_probe_marks_verification_failure_and_preserves_backup(tmp_path):
     auth_path = write_auth(tmp_path, expired_refreshable_singleton())
     runner = ScriptedRunner([
@@ -1243,6 +1292,81 @@ def test_state_rejects_a_pending_phase_without_a_persisted_refresh(tmp_path):
 
     with pytest.raises(healer.Disarmed):
         healer.load_state(path)
+
+
+@pytest.mark.parametrize("phase", ["gateway_restart", "probe"])
+@pytest.mark.parametrize("quota_state", [
+    {"quota_retry_action": "probe"},
+    {"quota_retry_action": "refresh"},
+    {"quota_reset_at": 2000000000},
+    {"quota_retry_action": "probe", "quota_reset_at": 2000000000},
+    {"quota_retry_action": "refresh", "quota_reset_at": 2000000000},
+])
+def test_state_rejects_every_pending_phase_with_quota_retry_state(
+    tmp_path, phase, quota_state
+):
+    path = tmp_path / "self-heal-state.json"
+    path.write_text(json.dumps({
+        "faults": {},
+        "credential_refresh_attempt": {
+            "lineage": "singleton",
+            "refresh_fingerprint": hashlib.sha256(b"refresh").hexdigest(),
+            "started_at": 1000,
+            "status": "persisted",
+            "reset_at": None,
+        },
+        "credential_pending_phase": phase,
+        **quota_state,
+    }))
+
+    with pytest.raises(healer.Disarmed):
+        healer.load_state(path)
+
+
+@pytest.mark.parametrize("phase", ["gateway_restart", "probe"])
+def test_conflicting_pending_and_quota_state_disarms_before_any_boundary(
+    tmp_path, monkeypatch, phase
+):
+    peer = valid_peer(tmp_path / "peer", label="neb-ops-gcp")
+    cfg_path = write_cli_config(tmp_path, peers=[peer])
+    state_path = tmp_path / "self-heal-state.json"
+    state_path.write_text(json.dumps({
+        "faults": {},
+        "credential_refresh_attempt": {
+            "lineage": "singleton",
+            "refresh_fingerprint": hashlib.sha256(b"refresh").hexdigest(),
+            "started_at": 1000,
+            "status": "persisted",
+            "reset_at": None,
+        },
+        "credential_pending_phase": phase,
+        "quota_retry_action": "probe",
+        "quota_reset_at": 2000000000,
+    }))
+    original_state = state_path.read_bytes()
+    crossed = []
+
+    def forbidden(label):
+        def fail(*_args, **_kwargs):
+            crossed.append(label)
+            raise AssertionError(f"crossed {label} before state validation")
+        return fail
+
+    monkeypatch.setattr(
+        healer, "run_refresh_readiness", forbidden("readiness")
+    )
+    monkeypatch.setattr(healer, "repair_health_timer", forbidden("timer"))
+    monkeypatch.setattr(healer, "repair_gateway", forbidden("gateway"))
+    monkeypatch.setattr(healer, "repair_credential", forbidden("credential"))
+    monkeypatch.setattr(healer, "run_live_probe", forbidden("probe"))
+    monkeypatch.setattr(healer, "handle_peer", forbidden("peer"))
+    monkeypatch.setattr(healer, "save_state", forbidden("state-write"))
+
+    with pytest.raises(healer.Disarmed, match="state file is malformed"):
+        healer.run(CliArgs(cfg_path, state_path))
+
+    assert crossed == []
+    assert state_path.read_bytes() == original_state
 
 
 def test_state_detail_is_bounded_to_prevent_unbounded_state_growth():
