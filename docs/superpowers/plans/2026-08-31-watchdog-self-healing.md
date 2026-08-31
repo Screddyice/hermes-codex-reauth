@@ -703,7 +703,8 @@ def test_warmup_is_pinned_safe_and_bounded():
     outcome = healer.run_hermes_warmup(local_cfg(), runner)
     assert outcome.returncode == 0
     assert runner.calls == [[
-        "hermes", "--safe-mode", "--provider", "openai-codex",
+        "/opt/hermes-agent/venv/bin/hermes",
+        "--safe-mode", "--provider", "openai-codex",
         "-m", "openai-codex/gpt-5.5", "-z", "Reply with exactly: OK"
     ]]
     assert runner.timeouts == [120]
@@ -1030,6 +1031,7 @@ Description=Run personal Hermes watchdog self-healing every 15 minutes
 
 [Timer]
 OnBootSec=2m
+OnActiveSec=2m
 OnUnitActiveSec=15m
 Persistent=true
 
@@ -1041,7 +1043,7 @@ WantedBy=timers.target
 
 Add role variables `HEAL_SERVICE` and `HEAL_TIMER` for the three Codex roles. Leave both empty for `nebos-claude`. Install `auth_state.py` for Codex hosts, `self_heal.py` for all three healer roles, and the probe for `src` and `tmn`.
 
-Enable and start the healer timer. Assert enabled, active, next elapse, `OnFailure`, and a healer dry-run with a temporary state path. Do not remove `self-heal-state.json` or the backup directory.
+Validate the absolute configured Hermes executable before enabling the timer. Enable and start the healer timer. Assert enabled, active, next elapse, `OnFailure`, and a healer dry-run with a temporary state path. Do not remove `self-heal-state.json` or the backup directory.
 
 - [x] **Step 7: Add full shipped config**
 

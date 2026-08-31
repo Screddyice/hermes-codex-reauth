@@ -203,8 +203,11 @@ def run_hermes_warmup(cfg: dict, run_cmd) -> CommandResult:
     model = cfg["self_heal"].get("codex_model")
     if not isinstance(model, str) or not model:
         raise Disarmed("Codex warmup model is invalid")
+    hermes_executable = cfg["self_heal"].get("hermes_executable")
+    if not isinstance(hermes_executable, str) or not hermes_executable:
+        raise Disarmed("Hermes executable is invalid")
     return run_cmd([
-        "hermes", "--safe-mode", "--provider", "openai-codex",
+        hermes_executable, "--safe-mode", "--provider", "openai-codex",
         "-m", model, "-z", "Reply with exactly: OK",
     ], 120)
 
@@ -942,6 +945,23 @@ def _validate_regular_file(value: object, label: str) -> None:
         raise Disarmed(f"{label} file permissions are unsafe")
 
 
+def _validate_executable_file(value: object, label: str) -> pathlib.Path:
+    if not isinstance(value, str) or not value:
+        raise Disarmed(f"{label} is invalid")
+    path = pathlib.Path(value)
+    if not path.is_absolute() or ".." in pathlib.PurePath(value).parts:
+        raise Disarmed(f"{label} must be an absolute path")
+    try:
+        file_stat = path.lstat()
+    except OSError as exc:
+        raise Disarmed(f"{label} is unavailable") from exc
+    if not stat.S_ISREG(file_stat.st_mode):
+        raise Disarmed(f"{label} is not a regular file")
+    if not os.access(path, os.R_OK | os.X_OK):
+        raise Disarmed(f"{label} is not readable and executable")
+    return path
+
+
 def _path_from_value(value: object, label: str) -> pathlib.Path:
     if not isinstance(value, str) or not value:
         raise Disarmed(f"{label} file is invalid")
@@ -1022,6 +1042,9 @@ def load_config(path: pathlib.Path) -> dict:
         model = self_heal.get("codex_model")
         if not isinstance(model, str) or model != "openai-codex/gpt-5.5":
             raise Disarmed("Codex warmup model is invalid")
+        _validate_executable_file(
+            self_heal.get("hermes_executable"), "Hermes executable"
+        )
         if not self_heal["gateway_restart"]:
             raise Disarmed("local gateway repair must be enabled")
     return cfg
@@ -1096,6 +1119,9 @@ def run(args) -> int:
         else HERE / "config.json"
     )
     cfg = load_config(cfg_path)
+    if getattr(args, "check_readiness", False):
+        print("healer configuration and executable are ready")
+        return 0
     state_path = (
         pathlib.Path(args.state_file).expanduser()
         if args.state_file
@@ -1181,6 +1207,11 @@ def main(argv: list[str] | None = None) -> int:
         help="healer state (default: self-heal-state.json beside this script)",
     )
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--check-readiness",
+        action="store_true",
+        help="validate the role configuration and local executable, then exit",
+    )
     args = parser.parse_args(argv)
     try:
         return run(args)

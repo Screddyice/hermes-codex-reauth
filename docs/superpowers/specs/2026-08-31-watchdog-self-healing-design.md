@@ -116,10 +116,13 @@ Each Codex role will gain one healer service and timer:
 
 Each service will use `Type=oneshot`, a 180-second timeout, and the role's
 existing Telegram notifier through `OnFailure=`. Each timer will use
-`OnBootSec=2m`, `OnUnitActiveSec=15m`, and `Persistent=true`.
+`OnBootSec=2m`, `OnActiveSec=2m`, `OnUnitActiveSec=15m`, and `Persistent=true`.
 
 `watchdog/install.sh` will install, enable, start, and assert the healer units.
-The installer will preserve both watchdog state files across deployment.
+The installer will preserve both watchdog state files across deployment. Before
+it enables a credential-host healer timer, it will validate the role's absolute
+`self_heal.hermes_executable` as a readable, executable regular file. The
+observer has no credential mutation path and omits that field.
 
 ## Local Repair Flows
 
@@ -309,6 +312,7 @@ They will cover:
 - terminal credential blocking gateway and warmup mutation;
 - atomic mode-600 backup and five-file retention;
 - one Hermes warmup followed by one pool-aware probe;
+- absolute executable validation before every credential-host mutation;
 - quota silence before reset and one attempt after reset;
 - no use of `hermes auth reset`;
 - strict peer target validation and argv construction;
@@ -331,7 +335,7 @@ Deployment will follow the repository copy-and-install workflow:
 
 1. share `src` into the Team Nebula tailnet and pin SSH host keys;
 2. deploy `src`, `tmn`, and `observer` roles;
-3. verify health, heartbeat, and healer timers;
+3. verify configured executables, health, heartbeat, and healer timers;
 4. run healer dry-runs on each host;
 5. test local and peer repair against disposable user units;
 6. verify a fresh heartbeat and quiet alert state.

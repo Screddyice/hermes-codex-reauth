@@ -83,6 +83,18 @@ if [[ -n "${BEAT:-}" ]]; then
 fi
 log "installed check.py + config.json + notify_failure.py -> $DEST"
 
+# Validate credential-host dependencies before the healer timer can start. The
+# systemd manager does not inherit an interactive shell's PATH, so every
+# credential role pins and validates its Hermes executable in config.json.
+if [[ -n "$HEAL_SERVICE" ]]; then
+  if OUT="$(/usr/bin/python3 "$DEST/self_heal.py" --check-readiness 2>&1)"; then
+    log "OK    healer readiness: $OUT"
+  else
+    log "FAIL  healer readiness: $OUT"
+    exit 1
+  fi
+fi
+
 # --- 2. systemd units ---
 install -m 0644 "$HERE/systemd/$SERVICE" "$UNIT_DIR/$SERVICE"
 install -m 0644 "$HERE/systemd/$TIMER"   "$UNIT_DIR/$TIMER"

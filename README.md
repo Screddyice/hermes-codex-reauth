@@ -374,6 +374,14 @@ runs one warmup and one live probe. The state file records that reset attempt,
 so later 15-minute cycles do not repeat it. A fresh 429 stores the next reset
 and returns to passive waiting.
 
+Credential roles pin the Hermes CLI in `self_heal.hermes_executable`. `src` uses
+`/opt/hermes-agent/venv/bin/hermes`; Team Nebula uses
+`/home/shawn_teamnebula_ai/.hermes/hermes-agent/venv/bin/hermes`. The healer
+rejects a bare command name, relative path, missing file, directory, or file
+without read and execute access. `install.sh` runs this readiness check before
+it enables or starts the healer timer, so user-systemd does not depend on an
+interactive shell's `PATH`.
+
 Each failed repair raises one `OnFailure=` notification. Later cycles retry at
 the configured six-hour cooldown but exit without another notification while
 the fault remains active. A successful repair removes the fault record and
@@ -423,6 +431,8 @@ healer state at `~/.hermes/codex-health/self-heal-state.json`. The observer uses
 `~/.watchdog-observer/self-heal-state.json`. The healer writes private state by
 atomic replace with mode `0600`. Credential backups live in the adjacent
 `backups/` directory. `install.sh` preserves both state files and all backups.
+It also requires the backup directory to remain private and writable by the
+service user.
 
 ## Install
 

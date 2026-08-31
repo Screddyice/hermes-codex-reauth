@@ -8,6 +8,7 @@
     "check_service": "hermes-codex-health.service",
     "gateway_restart": true,
     "codex_model": "openai-codex/gpt-5.5",
+    "hermes_executable": "/opt/hermes-agent/venv/bin/hermes",
     "maintenance_lock": "~/.hermes/codex-health/SELF_HEAL_PAUSED",
     "retry_s": 21600,
     "peers": []

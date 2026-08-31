@@ -276,6 +276,13 @@ def test_every_healer_unit_wires_a_healer_specific_notifier():
         assert "notify_failure.py" in notify_body
         assert f"--unit {unit}" in notify_body
 
+        trigger_sources = [
+            candidate.name
+            for candidate in (WATCHDOG / "systemd").glob("*.service")
+            if f"OnFailure={notify}" in candidate.read_text()
+        ]
+        assert trigger_sources == [unit]
+
 
 def test_notifier_units_read_the_env_that_holds_the_bot_token():
     """The live TMN host stores its notifier token in the root Hermes env."""
