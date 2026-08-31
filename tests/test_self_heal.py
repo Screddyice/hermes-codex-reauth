@@ -8,6 +8,7 @@ import pathlib
 import stat
 import sys
 import time
+import traceback
 
 import pytest
 
@@ -69,6 +70,81 @@ def test_state_is_atomic_private_and_rearms_after_recovery(tmp_path):
     assert healer.fault_transition(state, "local.timer", "failed", 1100) is False
     healer.clear_fault(state, "local.timer")
     assert healer.fault_transition(state, "local.timer", "failed again", 1200) is True
+
+
+def test_state_save_uses_same_directory_fsync_and_atomic_replace(tmp_path, monkeypatch):
+    path = tmp_path / "self-heal-state.json"
+    events = []
+    real_mkstemp = healer.tempfile.mkstemp
+    real_fdopen = healer.os.fdopen
+    real_fsync = healer.os.fsync
+    real_replace = healer.os.replace
+
+    def spy_mkstemp(*args, **kwargs):
+        events.append(("mkstemp", pathlib.Path(kwargs["dir"])))
+        return real_mkstemp(*args, **kwargs)
+
+    class TrackingFile:
+        def __init__(self, file):
+            self.file = file
+
+        def __enter__(self):
+            self.file.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.file.__exit__(*args)
+
+        def write(self, value):
+            return self.file.write(value)
+
+        def flush(self):
+            events.append(("flush",))
+            return self.file.flush()
+
+        def fileno(self):
+            return self.file.fileno()
+
+    def spy_fdopen(*args, **kwargs):
+        return TrackingFile(real_fdopen(*args, **kwargs))
+
+    def spy_fsync(fd):
+        events.append(("fsync", fd))
+        return real_fsync(fd)
+
+    def spy_replace(source, destination):
+        events.append(("replace", pathlib.Path(source), pathlib.Path(destination)))
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(healer.tempfile, "mkstemp", spy_mkstemp)
+    monkeypatch.setattr(healer.os, "fdopen", spy_fdopen)
+    monkeypatch.setattr(healer.os, "fsync", spy_fsync)
+    monkeypatch.setattr(healer.os, "replace", spy_replace)
+
+    healer.save_state(path, {"faults": {}})
+
+    assert [event[0] for event in events] == ["mkstemp", "flush", "fsync", "replace"]
+    assert events[0][1] == path.parent
+    assert events[-1][1].parent == path.parent
+    assert events[-1][2] == path
+
+
+def test_state_rejects_a_dangling_symlink_instead_of_rearming(tmp_path):
+    path = tmp_path / "self-heal-state.json"
+    path.symlink_to(tmp_path / "missing-state.json")
+
+    with pytest.raises(healer.Disarmed):
+        healer.load_state(path)
+
+
+def test_state_rejects_a_symlink_even_when_its_target_is_valid(tmp_path):
+    path = tmp_path / "self-heal-state.json"
+    target = tmp_path / "other-state.json"
+    target.write_text(json.dumps({"faults": {}}))
+    path.symlink_to(target)
+
+    with pytest.raises(healer.Disarmed):
+        healer.load_state(path)
 
 
 def test_state_rejects_malformed_json_instead_of_disarming_repair_silently(tmp_path):
@@ -201,6 +277,18 @@ def test_peer_validation_errors_do_not_echo_file_contents(tmp_path):
         healer.validate_peer(peer)
 
     assert secret_like_content not in str(excinfo.value)
+
+
+def test_peer_validation_formatted_failure_does_not_echo_ip_value(tmp_path):
+    peer = valid_peer(tmp_path)
+    sentinel = "sentinel-ip-value-must-not-appear"
+    peer["ip"] = sentinel
+
+    with pytest.raises(healer.Disarmed) as excinfo:
+        healer.validate_peer(peer)
+
+    rendered = "".join(traceback.format_exception(excinfo.type, excinfo.value, excinfo.tb))
+    assert sentinel not in rendered
 
 
 def test_command_result_is_immutable_value_object():

@@ -29,12 +29,18 @@ class CommandResult:
 def load_state(path: pathlib.Path) -> dict:
     """Load valid persisted healer state, or stop before a repair action."""
     path = pathlib.Path(path)
-    if not path.exists():
+    try:
+        file_stat = path.lstat()
+    except FileNotFoundError:
         return {"faults": {}}
+    except OSError:
+        raise Disarmed("state file is corrupt or unreadable") from None
+    if not stat.S_ISREG(file_stat.st_mode):
+        raise Disarmed("state file is not a regular file")
     try:
         state = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise Disarmed(f"state file is corrupt or unreadable: {type(exc).__name__}") from exc
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise Disarmed("state file is corrupt or unreadable") from None
     _validate_state(state)
     return state
 
@@ -101,8 +107,8 @@ def validate_peer(peer: dict) -> dict:
 
     try:
         address = ipaddress.ip_address(peer.get("ip"))
-    except ValueError as exc:
-        raise Disarmed("peer address is invalid") from exc
+    except (TypeError, ValueError):
+        raise Disarmed("peer address is invalid") from None
     if address not in TAILNET:
         raise Disarmed("peer address is outside the tailnet")
 
