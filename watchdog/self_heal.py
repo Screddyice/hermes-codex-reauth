@@ -20,13 +20,17 @@ from auth_state import full_pool_reset_at, quota_blocked, selected_codex_credent
 
 TAILNET = ipaddress.ip_network("100.64.0.0/10")
 HERE = pathlib.Path(__file__).resolve().parent
+COMMAND_CAPTURE_LIMIT = 64 * 1024
 UNIT_TOKEN = re.compile(r"^[A-Za-z0-9_.@-]+$")
 SSH_USER = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 JWT_TOKEN = re.compile(r"\b[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*\b")
 LONG_TOKEN = re.compile(r"\b[A-Za-z0-9_-]{40,}\b")
 BEARER_TOKEN = re.compile(r"(?i)\bBearer\s+\S+")
 NAMED_TOKEN = re.compile(
-    r"(?i)(access_token|refresh_token|id_token|api_key)(\s*[:=]\s*)([^\s,}\]]+)"
+    r"(?ix)"
+    r"(?P<prefix>[\"']?(?:access_token|refresh_token|id_token|api_key|authorization)"
+    r"[\"']?\s*[:=]\s*)"
+    r"(?:(?P<quote>[\"'])(?P<quoted>.*?)(?P=quote)|(?P<bare>[^\s,}\]]+))"
 )
 TERMINAL_CREDENTIAL_CODES = frozenset({
     "refresh_token_reused",
@@ -51,23 +55,37 @@ class CommandResult:
 
 def run_command(argv: list[str], timeout: int = 20) -> CommandResult:
     """Run one fixed local command without a shell."""
-    process = subprocess.Popen(
-        argv,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-    )
-    try:
-        stdout, stderr = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
+    with tempfile.TemporaryFile(mode="w+b") as stdout_file, tempfile.TemporaryFile(
+        mode="w+b"
+    ) as stderr_file:
+        process = subprocess.Popen(
+            argv,
+            stdout=stdout_file,
+            stderr=stderr_file,
+            start_new_session=True,
+        )
+        timed_out = False
         try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        stdout, stderr = process.communicate()
-        return CommandResult(124, stdout or "", stderr or "command timed out")
-    return CommandResult(process.returncode, stdout or "", stderr or "")
+            process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.communicate()
+        stdout = _read_command_capture(stdout_file)
+        stderr = _read_command_capture(stderr_file)
+        if timed_out:
+            return CommandResult(124, stdout, stderr or "command timed out")
+        return CommandResult(process.returncode, stdout, stderr)
+
+
+def _read_command_capture(capture_file) -> str:
+    capture_file.flush()
+    capture_file.seek(0)
+    captured = capture_file.read(COMMAND_CAPTURE_LIMIT)
+    return captured.decode("utf-8", errors="replace")
 
 
 def systemctl(run_cmd, *args: str) -> CommandResult:
@@ -126,8 +144,20 @@ def backup_auth(
     backup_dir.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now))
     backup_path = backup_dir / f"{stamp}-auth.json"
-    shutil.copyfile(auth_path, backup_path)
-    os.chmod(backup_path, 0o600)
+    backup_fd = os.open(
+        backup_path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        0o600,
+    )
+    try:
+        os.fchmod(backup_fd, 0o600)
+    finally:
+        os.close(backup_fd)
+    try:
+        shutil.copyfile(auth_path, backup_path)
+    except BaseException:
+        backup_path.unlink(missing_ok=True)
+        raise
     with backup_path.open("rb") as backup_file:
         os.fsync(backup_file.fileno())
     for old_path in sorted(backup_dir.glob("*-auth.json"))[:-5]:
@@ -271,10 +301,15 @@ def _command_failure(
 
 def _bounded_detail(detail: str) -> str:
     redacted = BEARER_TOKEN.sub("Bearer [REDACTED]", detail)
-    redacted = NAMED_TOKEN.sub(r"\1\2[REDACTED]", redacted)
+    redacted = NAMED_TOKEN.sub(_redact_named_token, redacted)
     redacted = JWT_TOKEN.sub("[REDACTED]", redacted)
     redacted = LONG_TOKEN.sub("[REDACTED]", redacted)
     return redacted[:500]
+
+
+def _redact_named_token(match: re.Match) -> str:
+    quote = match.group("quote") or ""
+    return f"{match.group('prefix')}{quote}[REDACTED]{quote}"
 
 
 def _credential_tokens(entry: dict) -> dict:

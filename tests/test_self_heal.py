@@ -172,6 +172,25 @@ def test_backup_is_private_and_retains_five_newest(tmp_path):
     assert len(list(backups.glob("*-auth.json"))) == 5
 
 
+def test_backup_destination_is_private_before_auth_bytes_are_copied(tmp_path, monkeypatch):
+    auth = tmp_path / "auth.json"
+    auth.write_text('{"refresh_token":"short-test-value"}')
+    backups = tmp_path / "backups"
+    real_copyfile = healer.shutil.copyfile
+    observed = []
+
+    def inspect_destination_before_copy(source, destination):
+        destination = pathlib.Path(destination)
+        observed.append((stat.S_IMODE(destination.stat().st_mode), destination.stat().st_size))
+        return real_copyfile(source, destination)
+
+    monkeypatch.setattr(healer.shutil, "copyfile", inspect_destination_before_copy)
+
+    healer.backup_auth(auth, backups, 1000)
+
+    assert observed == [(0o600, 0)]
+
+
 def test_warmup_is_pinned_safe_and_bounded():
     runner = ScriptedRunner([result(0, "OK")])
     outcome = healer.run_hermes_warmup(local_cfg(), runner)
@@ -185,21 +204,31 @@ def test_warmup_is_pinned_safe_and_bounded():
 
 def test_warmup_runtime_kills_process_group_on_timeout(monkeypatch):
     events = []
+    oversized = b"x" * (64 * 1024 + 1024)
 
     class TimedOutProcess:
         pid = 4321
         returncode = None
 
+        def __init__(self, stdout, stderr):
+            self.stdout = stdout
+            self.stderr = stderr
+
         def communicate(self, timeout=None):
             events.append(("communicate", timeout))
             if timeout is not None:
+                if hasattr(self.stdout, "write"):
+                    self.stdout.write(oversized)
+                    self.stderr.write(b"timed out")
                 raise subprocess.TimeoutExpired("hermes", timeout)
             self.returncode = -9
-            return "", "timed out"
+            if hasattr(self.stdout, "write"):
+                return None, None
+            return oversized.decode(), "timed out"
 
     def fake_popen(argv, **kwargs):
         events.append(("popen", list(argv), kwargs))
-        return TimedOutProcess()
+        return TimedOutProcess(kwargs["stdout"], kwargs["stderr"])
 
     monkeypatch.setattr(healer.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(healer.os, "killpg", lambda pid, sig: events.append(("killpg", pid, sig)))
@@ -209,6 +238,51 @@ def test_warmup_runtime_kills_process_group_on_timeout(monkeypatch):
     assert outcome.returncode != 0
     assert events[0][2]["start_new_session"] is True
     assert [event[0] for event in events] == ["popen", "communicate", "killpg", "communicate"]
+    assert len(outcome.stdout.encode()) <= 64 * 1024
+    assert outcome.stderr == "timed out"
+
+
+def test_run_command_capture_is_file_backed_and_memory_bounded(monkeypatch):
+    observed = {}
+    oversized = b"x" * (64 * 1024 + 1024)
+
+    class NoisyProcess:
+        pid = 5432
+        returncode = 0
+
+        def communicate(self, timeout=None):
+            observed["timeout"] = timeout
+            stdout = observed["stdout"]
+            stderr = observed["stderr"]
+            if hasattr(stdout, "write"):
+                stdout.write(oversized)
+                stderr.write(oversized)
+                return None, None
+            return oversized.decode(), oversized.decode()
+
+    def fake_popen(_argv, **kwargs):
+        observed.update(kwargs)
+        return NoisyProcess()
+
+    monkeypatch.setattr(healer.subprocess, "Popen", fake_popen)
+
+    outcome = healer.run_command(["noisy"], timeout=20)
+
+    assert observed["stdout"] is not subprocess.PIPE
+    assert observed["stderr"] is not subprocess.PIPE
+    assert observed["timeout"] == 20
+    assert len(outcome.stdout.encode()) <= 64 * 1024
+    assert len(outcome.stderr.encode()) <= 64 * 1024
+
+
+def test_run_command_preserves_small_stdout_and_stderr():
+    outcome = healer.run_command([
+        sys.executable,
+        "-c",
+        "import sys; print('small stdout'); print('small stderr', file=sys.stderr)",
+    ], timeout=20)
+
+    assert outcome == result(0, "small stdout\n", "small stderr\n")
 
 
 def write_auth(tmp_path, auth):
@@ -401,6 +475,19 @@ def test_warmup_failure_redacts_and_caps_output_while_preserving_backup(tmp_path
     assert len(detail) <= 500
     assert len(list((tmp_path / "backups").glob("*-auth.json"))) == 1
     assert len(runner.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "field", ["access_token", "refresh_token", "id_token", "authorization"]
+)
+@pytest.mark.parametrize("value", ["short-test-value", "long-" + "x" * 80])
+def test_quoted_json_token_fields_are_redacted_in_rendered_detail(tmp_path, field, value):
+    outcome = result(1, json.dumps({field: value}, separators=(",", ":")))
+
+    detail = healer._command_failure("command failed", outcome, tmp_path / "backup")
+
+    assert value not in detail
+    assert f'"{field}":"[REDACTED]"' in detail
 
 
 def test_credential_repair_rereads_auth_before_gateway_restart(tmp_path):
