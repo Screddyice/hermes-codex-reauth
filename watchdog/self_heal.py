@@ -1,8 +1,11 @@
 """Fail-closed state and target-validation primitives for the watchdog healer."""
 from __future__ import annotations
 
+import argparse
 import base64
+import contextlib
 import dataclasses
+import fcntl
 import ipaddress
 import json
 import os
@@ -970,3 +973,226 @@ def _validate_maintenance_lock(value: object, ssh_user: str) -> str:
     ):
         raise Disarmed("peer maintenance lock is invalid")
     return value
+
+
+def load_config(path: pathlib.Path) -> dict:
+    """Load and validate one role config before any repair boundary."""
+    path = pathlib.Path(path)
+    try:
+        cfg = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise Disarmed(f"cannot read healer config: {type(exc).__name__}") from exc
+    if not isinstance(cfg, dict):
+        raise Disarmed("healer config is malformed")
+    if not isinstance(cfg.get("host_label"), str) or not cfg["host_label"]:
+        raise Disarmed("healer config has no host label")
+
+    self_heal = cfg.get("self_heal")
+    if not isinstance(self_heal, dict):
+        raise Disarmed("self-heal configuration is malformed")
+    validate_unit(self_heal.get("health_timer"), ".timer")
+    validate_unit(self_heal.get("check_service"), ".service")
+    if not isinstance(self_heal.get("gateway_restart"), bool):
+        raise Disarmed("gateway repair switch is invalid")
+    maintenance = _path_from_value(
+        self_heal.get("maintenance_lock"), "maintenance lock"
+    )
+    if maintenance.name != "SELF_HEAL_PAUSED":
+        raise Disarmed("maintenance lock path is invalid")
+    retry_s = self_heal.get("retry_s")
+    if isinstance(retry_s, bool) or not isinstance(retry_s, int) or retry_s <= 0:
+        raise Disarmed("repair retry interval is invalid")
+    peers = self_heal.get("peers")
+    if not isinstance(peers, list):
+        raise Disarmed("peer repair allowlist is invalid")
+    for peer in peers:
+        validate_peer(peer)
+
+    observer = cfg.get("mode") == "observer"
+    if observer:
+        if self_heal["gateway_restart"]:
+            raise Disarmed("observer gateway repair must be disabled")
+    else:
+        home = cfg.get("hermes_home")
+        if not isinstance(home, str) or not home:
+            raise Disarmed("healer config has no Hermes home")
+        _path_from_value(home, "Hermes home")
+        validate_unit(cfg.get("gateway_unit"), ".service")
+        model = self_heal.get("codex_model")
+        if not isinstance(model, str) or model != "openai-codex/gpt-5.5":
+            raise Disarmed("Codex warmup model is invalid")
+        if not self_heal["gateway_restart"]:
+            raise Disarmed("local gateway repair must be enabled")
+    return cfg
+
+
+@contextlib.contextmanager
+def _healer_lock(state_path: pathlib.Path):
+    """Take a non-mutating, nonblocking lock on the state directory."""
+    try:
+        directory_fd = os.open(state_path.parent, os.O_RDONLY)
+    except OSError as exc:
+        raise Disarmed(f"cannot open healer state directory: {type(exc).__name__}") from exc
+    acquired = False
+    try:
+        try:
+            fcntl.flock(directory_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+        except BlockingIOError:
+            pass
+        yield acquired
+    finally:
+        if acquired:
+            fcntl.flock(directory_fd, fcntl.LOCK_UN)
+        os.close(directory_fd)
+
+
+def _maintenance_path(cfg: dict) -> pathlib.Path:
+    value = cfg["self_heal"]["maintenance_lock"]
+    return pathlib.Path(value).expanduser()
+
+
+def _record_local_result(
+    state: dict, key: str, outcome: tuple[bool, str], now: int
+) -> bool:
+    ok, detail = outcome
+    safe_detail = _bounded_detail(str(detail))
+    print(f"{key}: {safe_detail}")
+    if ok:
+        clear_fault(state, key)
+        return False
+    return fault_transition(state, key, safe_detail, now)
+
+
+def _dry_run_cycle(
+    cfg: dict,
+    cfg_path: pathlib.Path,
+    state: dict,
+) -> None:
+    """Describe the bounded cycle without crossing a mutation or network boundary."""
+    _, detail = repair_health_timer(cfg, run_command, dry_run=True)
+    print(_bounded_detail(detail))
+    if cfg.get("mode") != "observer":
+        auth_path = pathlib.Path(cfg["hermes_home"]).expanduser() / "auth.json"
+        auth = _read_auth(auth_path)
+        _, detail = repair_gateway(cfg, auth, run_command, dry_run=True)
+        print(_bounded_detail(detail))
+        _, detail = repair_credential(
+            cfg, cfg_path, auth_path, state, run_command,
+            int(time.time()), dry_run=True,
+        )
+        print(_bounded_detail(detail))
+    for peer in cfg["self_heal"]["peers"]:
+        _, detail = repair_peer(peer, run_command, peer_heartbeat, dry_run=True)
+        print(_bounded_detail(detail))
+
+
+def run(args) -> int:
+    """Run one role-specific healer cycle and return the alert edge."""
+    cfg_path = (
+        pathlib.Path(args.config).expanduser()
+        if args.config
+        else HERE / "config.json"
+    )
+    cfg = load_config(cfg_path)
+    state_path = (
+        pathlib.Path(args.state_file).expanduser()
+        if args.state_file
+        else HERE / "self-heal-state.json"
+    )
+    if not state_path.parent.is_dir():
+        raise Disarmed("healer state directory is unavailable")
+
+    with _healer_lock(state_path) as acquired:
+        if not acquired:
+            print("healer cycle already running; leaving state unchanged")
+            return 0
+
+        state = load_state(state_path)
+        maintenance_path = _maintenance_path(cfg)
+        try:
+            paused = maintenance_path.exists()
+        except OSError as exc:
+            raise Disarmed(
+                f"cannot inspect maintenance lock: {type(exc).__name__}"
+            ) from exc
+        if paused:
+            print("maintenance lock present; healer paused")
+            return 0
+
+        if args.dry_run:
+            _dry_run_cycle(cfg, cfg_path, state)
+            return 0
+
+        now = int(time.time())
+        new_failure = False
+        try:
+            new_failure |= _record_local_result(
+                state,
+                "local.timer",
+                repair_health_timer(cfg, run_command, dry_run=False),
+                now,
+            )
+
+            if cfg.get("mode") != "observer":
+                auth_path = pathlib.Path(cfg["hermes_home"]).expanduser() / "auth.json"
+                auth = _read_auth(auth_path)
+                new_failure |= _record_local_result(
+                    state,
+                    "local.gateway",
+                    repair_gateway(cfg, auth, run_command, dry_run=False),
+                    now,
+                )
+                new_failure |= _record_local_result(
+                    state,
+                    "local.credential",
+                    repair_credential(
+                        cfg, cfg_path, auth_path, state, run_command, now,
+                        dry_run=False,
+                    ),
+                    now,
+                )
+
+            retry_s = cfg["self_heal"]["retry_s"]
+            for peer in cfg["self_heal"]["peers"]:
+                outcome = handle_peer(
+                    peer, state, peer_heartbeat, run_command, now, retry_s
+                )
+                print(f"peer.{peer['label']}: {_bounded_detail(outcome.detail)}")
+                new_failure |= outcome.notify
+        finally:
+            save_state(state_path, state)
+        return 1 if new_failure else 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Repair bounded watchdog faults from passive local evidence."
+    )
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="role config (default: config.json beside this script)",
+    )
+    parser.add_argument(
+        "--state-file",
+        default=None,
+        help="healer state (default: self-heal-state.json beside this script)",
+    )
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args(argv)
+    try:
+        return run(args)
+    except Disarmed as exc:
+        print(f"DISARMED: {_bounded_detail(str(exc))}", file=sys.stderr)
+        return 1
+    except Exception as exc:
+        print(
+            f"DISARMED: unexpected healer error ({type(exc).__name__})",
+            file=sys.stderr,
+        )
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

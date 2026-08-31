@@ -218,6 +218,28 @@ def test_message_stays_inside_telegram_limit(tmp_path):
     assert text.rstrip().endswith("x")          # trimmed from the front, newest kept
 
 
+def test_healer_failure_message_names_repair_not_reporting(tmp_path):
+    cfg = json.loads(write_cfg(tmp_path).read_text())
+    text = nf.build_message(
+        cfg, "hermes-codex-self-heal.service", "timer repair failed"
+    )
+
+    assert "SELF-HEAL REPAIR FAILED" in text
+    assert "FAILED TO REPORT" not in text
+
+
+def test_onfailure_monitor_unit_selects_healer_message(
+    tmp_path, sent, monkeypatch
+):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
+    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "123")
+    monkeypatch.setenv("MONITOR_UNIT", "hermes-codex-self-heal.service")
+
+    assert nf.run(Args(write_cfg(tmp_path), unit="hermes-codex-health.service")) == 0
+    assert "SELF-HEAL REPAIR FAILED" in sent[0]["text"]
+    assert "hermes-codex-self-heal.service" in sent[0]["text"]
+
+
 # --------------------------------------------------------------------------
 # wiring — the directive that was claimed for months and never existed
 # --------------------------------------------------------------------------

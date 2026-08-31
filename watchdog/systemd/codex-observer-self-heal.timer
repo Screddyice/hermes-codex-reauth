@@ -1,0 +1,10 @@
+[Unit]
+Description=Run backstop Codex observer self-healing every 15 minutes
+
+[Timer]
+OnBootSec=2m
+OnUnitActiveSec=15m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

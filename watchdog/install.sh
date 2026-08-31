@@ -12,8 +12,8 @@
 # exists to remove, so this script refuses to print success unless it has
 # verified the timer is enabled, scheduled, and that the script actually runs.
 #
-# It never touches state.json. A fresh install must not reset an in-progress
-# outage to "ok" and re-arm the edge detector.
+# It never touches state.json, self-heal-state.json, or healer backups. A fresh
+# install must not re-arm an outage edge or discard credential evidence.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -30,12 +30,17 @@ done
 # not another config: codex is judged from local auth.json state, Claude only from
 # a live call, since its token is an opaque string with no local metadata.
 CHECK_SRC="$HERE/codex_health_check.py"
+HEAL_SERVICE=""
+HEAL_TIMER=""
 case "$HOST" in
-  src)          DEST="$HOME/.hermes/codex-health";               TIMER="hermes-codex-health.timer";     SERVICE="hermes-codex-health.service";     NOTIFY="hermes-codex-health-notify.service";     BEAT="hermes-codex-heartbeat.service" ;;
-  tmn)          DEST="$HOME/.hermes/codex-health";               TIMER="hermes-codex-health-tmn.timer"; SERVICE="hermes-codex-health-tmn.service"; NOTIFY="hermes-codex-health-tmn-notify.service"; BEAT="hermes-codex-heartbeat-tmn.service" ;;
+  src)          DEST="$HOME/.hermes/codex-health";               TIMER="hermes-codex-health.timer";     SERVICE="hermes-codex-health.service";     NOTIFY="hermes-codex-health-notify.service";     BEAT="hermes-codex-heartbeat.service"
+                HEAL_SERVICE="hermes-codex-self-heal.service";     HEAL_TIMER="hermes-codex-self-heal.timer" ;;
+  tmn)          DEST="$HOME/.hermes/codex-health";               TIMER="hermes-codex-health-tmn.timer"; SERVICE="hermes-codex-health-tmn.service"; NOTIFY="hermes-codex-health-tmn-notify.service"; BEAT="hermes-codex-heartbeat-tmn.service"
+                HEAL_SERVICE="hermes-codex-self-heal-tmn.service"; HEAL_TIMER="hermes-codex-self-heal-tmn.timer" ;;
   nebos-claude) DEST="$HOME/.hermes/profiles/tmn/claude-health"; TIMER="nebos-claude-health.timer";     SERVICE="nebos-claude-health.service";     NOTIFY="nebos-claude-health-notify.service"
-                CHECK_SRC="$HERE/claude_health_check.py" ;;
-  observer)     DEST="$HOME/.watchdog-observer";                 TIMER="codex-observer.timer";          SERVICE="codex-observer.service";          NOTIFY="codex-observer-notify.service";     BEAT="codex-observer-heartbeat.service"; CFG_NAME="hermes-tmn-observer" ;;
+                CHECK_SRC="$HERE/claude_health_check.py"; HEAL_SERVICE=""; HEAL_TIMER="" ;;
+  observer)     DEST="$HOME/.watchdog-observer";                 TIMER="codex-observer.timer";          SERVICE="codex-observer.service";          NOTIFY="codex-observer-notify.service";     BEAT="codex-observer-heartbeat.service"; CFG_NAME="hermes-tmn-observer"
+                HEAL_SERVICE="codex-observer-self-heal.service"; HEAL_TIMER="codex-observer-self-heal.timer" ;;
   *) echo "usage: $0 --host {src|tmn|nebos-claude|observer}" >&2; exit 2 ;;
 esac
 
@@ -49,10 +54,19 @@ log() { echo "[install] $*"; }
 mkdir -p "$DEST" "$UNIT_DIR"
 install -m 0755 "$CHECK_SRC" "$DEST/check.py"
 install -m 0644 "$CFG_SRC"   "$DEST/config.json"
+# The Codex check and healer share one passive auth classifier. The observer
+# imports it even though observer mode never reads a local credential.
+if [[ "$HOST" != "nebos-claude" ]]; then
+  install -m 0755 "$HERE/auth_state.py" "$DEST/auth_state.py"
+fi
 # The live probe is a codex triage tool; the Claude watchdog already probes live,
 # so shipping it there would just be a second thing that can rot.
 if [[ "$HOST" != "nebos-claude" && "$HOST" != "observer" ]]; then
   install -m 0755 "$HERE/codex_auth_probe.py" "$DEST/codex_auth_probe.py"
+fi
+# The three Codex roles run the bounded healer. NEBOS Claude has no healer.
+if [[ -n "$HEAL_SERVICE" ]]; then
+  install -m 0755 "$HERE/self_heal.py" "$DEST/self_heal.py"
 fi
 # The last-resort escalator lives beside the check it backs up, and reads that
 # check's config.json for host labels and hermes_home.
@@ -68,12 +82,20 @@ install -m 0644 "$HERE/systemd/$SERVICE" "$UNIT_DIR/$SERVICE"
 install -m 0644 "$HERE/systemd/$TIMER"   "$UNIT_DIR/$TIMER"
 install -m 0644 "$HERE/systemd/$NOTIFY"  "$UNIT_DIR/$NOTIFY"
 [[ -n "${BEAT:-}" ]] && install -m 0644 "$HERE/systemd/$BEAT" "$UNIT_DIR/$BEAT"
+if [[ -n "$HEAL_SERVICE" ]]; then
+  install -m 0644 "$HERE/systemd/$HEAL_SERVICE" "$UNIT_DIR/$HEAL_SERVICE"
+  install -m 0644 "$HERE/systemd/$HEAL_TIMER" "$UNIT_DIR/$HEAL_TIMER"
+fi
 systemctl --user daemon-reload
-log "installed units $SERVICE + $TIMER + $NOTIFY${BEAT:+ + $BEAT}"
+log "installed units $SERVICE + $TIMER + $NOTIFY${BEAT:+ + $BEAT}${HEAL_SERVICE:+ + $HEAL_SERVICE + $HEAL_TIMER}"
 
 # --- 3. enable ---
 systemctl --user enable "$TIMER" >/dev/null
 systemctl --user start  "$TIMER"
+if [[ -n "$HEAL_SERVICE" ]]; then
+  systemctl --user enable "$HEAL_TIMER" >/dev/null
+  systemctl --user start  "$HEAL_TIMER"
+fi
 if [[ -n "${BEAT:-}" ]]; then
   systemctl --user enable "$BEAT" >/dev/null
   systemctl --user restart "$BEAT"
@@ -109,6 +131,22 @@ else
   log "FAIL  $SERVICE has no OnFailure=$NOTIFY"; fail=1
 fi
 
+if [[ -n "$HEAL_SERVICE" ]]; then
+  check "healer timer enabled" "$(systemctl --user is-enabled "$HEAL_TIMER" 2>&1)" "enabled"
+  check "healer timer active"  "$(systemctl --user is-active  "$HEAL_TIMER" 2>&1)" "active"
+  HEAL_NEXT="$(systemctl --user show "$HEAL_TIMER" -p NextElapseUSecRealtime --value)"
+  if [[ -n "$HEAL_NEXT" ]]; then
+    log "OK    healer next elapse = $HEAL_NEXT"
+  else
+    log "FAIL  healer timer has no scheduled next run"; fail=1
+  fi
+  if systemctl --user show "$HEAL_SERVICE" -p OnFailure --value | grep -q "$NOTIFY"; then
+    log "OK    healer OnFailure = $NOTIFY"
+  else
+    log "FAIL  $HEAL_SERVICE has no OnFailure=$NOTIFY"; fail=1
+  fi
+fi
+
 # Prove the escalator can resolve its own credentials. It is the last thing that
 # will ever speak, so "it was never going to work" must surface at install time.
 if OUT="$(/usr/bin/python3 "$DEST/notify_failure.py" --unit "$SERVICE" --dry-run 2>&1 | head -1)"; then
@@ -137,14 +175,32 @@ if [[ -n "${BEAT:-}" ]]; then
   fi
 fi
 
-# Prove the installed script actually runs and resolves the intended credential.
-if OUT="$(/usr/bin/python3 "$DEST/check.py" --dry-run --state-file /tmp/install-probe-$$.json 2>&1)"; then
+# Prove the installed scripts run without touching either live state file.
+PROBE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/watchdog-install.XXXXXX")"
+CHECK_PROBE_STATE="$PROBE_DIR/check-state.json"
+HEAL_PROBE_STATE="$PROBE_DIR/healer-state.json"
+cleanup_probe_dir() {
+  rm -f "$CHECK_PROBE_STATE" "$HEAL_PROBE_STATE"
+  rmdir "$PROBE_DIR" 2>/dev/null || true
+}
+trap cleanup_probe_dir EXIT
+
+if OUT="$(/usr/bin/python3 "$DEST/check.py" --dry-run --state-file "$CHECK_PROBE_STATE" 2>&1)"; then
   log "OK    dry-run exited 0"
   echo "$OUT" | sed 's/^/          /'
 else
   log "FAIL  dry-run exited non-zero:"; echo "$OUT" | sed 's/^/          /'; fail=1
 fi
-rm -f "/tmp/install-probe-$$.json"
+
+if [[ -n "$HEAL_SERVICE" ]]; then
+  if OUT="$(/usr/bin/python3 "$DEST/self_heal.py" --dry-run --state-file "$HEAL_PROBE_STATE" 2>&1)"; then
+    log "OK    healer dry-run exited 0"
+    echo "$OUT" | sed 's/^/          /'
+  else
+    log "FAIL  healer dry-run exited non-zero:"
+    echo "$OUT" | sed 's/^/          /'; fail=1
+  fi
+fi
 
 if [[ "$fail" -ne 0 ]]; then
   echo "[install] INSTALL INCOMPLETE — see FAIL lines above" >&2

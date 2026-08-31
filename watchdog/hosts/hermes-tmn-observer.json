@@ -4,6 +4,11 @@
   "mode": "observer",
   "renotify_s": 86400,
   "self_heal": {
+    "health_timer": "codex-observer.timer",
+    "check_service": "codex-observer.service",
+    "gateway_restart": false,
+    "maintenance_lock": "~/.watchdog-observer/SELF_HEAL_PAUSED",
+    "retry_s": 21600,
     "peers": [
       {
         "label": "src",

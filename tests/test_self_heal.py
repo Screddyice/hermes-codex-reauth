@@ -5,6 +5,7 @@ import dataclasses
 import http.server
 import importlib.util
 import json
+import os
 import pathlib
 import stat
 import subprocess
@@ -63,6 +64,50 @@ def local_cfg():
             "peers": [],
         },
     }
+
+
+class CliArgs:
+    def __init__(self, config, state_file, dry_run=False):
+        self.config = str(config) if config is not None else None
+        self.state_file = str(state_file) if state_file is not None else None
+        self.dry_run = dry_run
+
+
+def write_cli_config(tmp_path, *, peers=None, observer=False):
+    if observer:
+        cfg = {
+            "host_label": "observer",
+            "mode": "observer",
+            "self_heal": {
+                "health_timer": "codex-observer.timer",
+                "check_service": "codex-observer.service",
+                "gateway_restart": False,
+                "maintenance_lock": str(tmp_path / "SELF_HEAL_PAUSED"),
+                "retry_s": 21600,
+                "peers": peers or [],
+            },
+        }
+    else:
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir(exist_ok=True)
+        (hermes_home / "auth.json").write_text(json.dumps(healthy_singleton()))
+        cfg = {
+            "host_label": "test-host",
+            "hermes_home": str(hermes_home),
+            "gateway_unit": "hermes-gateway.service",
+            "self_heal": {
+                "health_timer": "hermes-codex-health.timer",
+                "check_service": "hermes-codex-health.service",
+                "gateway_restart": True,
+                "codex_model": "openai-codex/gpt-5.5",
+                "maintenance_lock": str(tmp_path / "SELF_HEAL_PAUSED"),
+                "retry_s": 21600,
+                "peers": peers or [],
+            },
+        }
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(cfg))
+    return path
 
 
 def token_with_exp(exp: int) -> str:
@@ -1352,6 +1397,366 @@ def test_committed_peer_repair_allowlists_match_one_way_tailnet_topology():
         },
     ]
     assert not (src.get("self_heal") or {}).get("peers")
+
+
+def test_cli_new_failed_repair_alerts_once_then_rearms_after_recovery(
+    tmp_path, monkeypatch
+):
+    cfg_path = write_cli_config(tmp_path)
+    state_path = tmp_path / "self-heal-state.json"
+    timer_results = iter([
+        (False, "timer repair failed"),
+        (False, "timer repair failed"),
+        (True, "timer recovered"),
+        (False, "timer repair failed again"),
+    ])
+    monkeypatch.setattr(
+        healer,
+        "repair_health_timer",
+        lambda _cfg, _runner, dry_run: next(timer_results),
+    )
+    monkeypatch.setattr(
+        healer,
+        "repair_gateway",
+        lambda _cfg, _auth, _runner, dry_run: (True, "gateway healthy"),
+    )
+    monkeypatch.setattr(
+        healer,
+        "repair_credential",
+        lambda *_args, **_kwargs: (True, "credential healthy"),
+    )
+    args = CliArgs(cfg_path, state_path)
+
+    assert healer.run(args) == 1
+    first = json.loads(state_path.read_text())
+    assert first["faults"]["local.timer"]["alerted"] is True
+    assert healer.run(args) == 0
+    assert healer.run(args) == 0
+    assert json.loads(state_path.read_text())["faults"] == {}
+    assert healer.run(args) == 1
+
+
+def test_cli_persists_quota_markers_from_credential_handler(tmp_path, monkeypatch):
+    cfg_path = write_cli_config(tmp_path)
+    state_path = tmp_path / "self-heal-state.json"
+    monkeypatch.setattr(
+        healer,
+        "repair_health_timer",
+        lambda *_args, **_kwargs: (True, "timer healthy"),
+    )
+    monkeypatch.setattr(
+        healer,
+        "repair_gateway",
+        lambda *_args, **_kwargs: (True, "gateway healthy"),
+    )
+
+    def record_quota(_cfg, _cfg_path, _auth_path, state, *_args, **_kwargs):
+        state["quota_attempt_reset_at"] = 2000
+        state["quota_reset_at"] = 3000
+        return True, "quota reset recorded"
+
+    monkeypatch.setattr(healer, "repair_credential", record_quota)
+
+    assert healer.run(CliArgs(cfg_path, state_path)) == 0
+    saved = json.loads(state_path.read_text())
+    assert saved["quota_attempt_reset_at"] == 2000
+    assert saved["quota_reset_at"] == 3000
+
+
+def test_cli_invokes_peer_handler_and_persists_peer_state(tmp_path, monkeypatch):
+    peer = valid_peer(tmp_path / "peer", label="neb-ops-gcp")
+    cfg_path = write_cli_config(tmp_path, peers=[peer], observer=True)
+    state_path = tmp_path / "self-heal-state.json"
+    monkeypatch.setattr(
+        healer,
+        "repair_health_timer",
+        lambda *_args, **_kwargs: (True, "timer healthy"),
+    )
+    calls = []
+
+    def handle(peer_cfg, state, fetch, runner, now, retry_s):
+        calls.append((peer_cfg["label"], fetch, runner, retry_s))
+        state["peer_misses"] = {peer_cfg["label"]: 2}
+        state["peer_attempts"] = {peer_cfg["label"]: now}
+        healer.fault_transition(
+            state, f"peer.{peer_cfg['label']}", "repair failed", now
+        )
+        return healer.PeerResult("repair", False, "repair failed", notify=True)
+
+    monkeypatch.setattr(healer, "handle_peer", handle)
+
+    assert healer.run(CliArgs(cfg_path, state_path)) == 1
+    saved = json.loads(state_path.read_text())
+    assert calls[0][0] == "neb-ops-gcp"
+    assert calls[0][3] == 21600
+    assert saved["peer_misses"] == {"neb-ops-gcp": 2}
+    assert saved["peer_attempts"]["neb-ops-gcp"] > 0
+    assert saved["faults"]["peer.neb-ops-gcp"]["alerted"] is True
+
+
+def test_cli_dry_run_has_no_state_command_network_backup_or_credential_mutation(
+    tmp_path, monkeypatch
+):
+    peer = valid_peer(tmp_path / "peer", label="neb-ops-gcp")
+    cfg_path = write_cli_config(tmp_path, peers=[peer])
+    cfg = json.loads(cfg_path.read_text())
+    auth_path = pathlib.Path(cfg["hermes_home"]) / "auth.json"
+    auth_path.write_text(json.dumps(expired_refreshable_singleton()))
+    state_path = tmp_path / "self-heal-state.json"
+    original = b'{"faults":{}}\n'
+    state_path.write_bytes(original)
+    calls = []
+
+    def forbidden(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("dry-run crossed a mutation or network boundary")
+
+    monkeypatch.setattr(healer, "run_command", forbidden)
+    monkeypatch.setattr(healer, "peer_heartbeat", forbidden)
+    monkeypatch.setattr(healer, "backup_auth", forbidden)
+    monkeypatch.setattr(healer, "save_state", forbidden)
+
+    assert healer.run(CliArgs(cfg_path, state_path, dry_run=True)) == 0
+    assert state_path.read_bytes() == original
+    assert not (tmp_path / "backups").exists()
+    assert calls == []
+
+
+def test_cli_maintenance_lock_pauses_without_state_write_or_handlers(
+    tmp_path, monkeypatch
+):
+    cfg_path = write_cli_config(tmp_path)
+    cfg = json.loads(cfg_path.read_text())
+    pathlib.Path(cfg["self_heal"]["maintenance_lock"]).touch()
+    state_path = tmp_path / "self-heal-state.json"
+    original = b'{"faults":{}}\n'
+    state_path.write_bytes(original)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("maintenance lock did not pause the healer")
+
+    monkeypatch.setattr(healer, "repair_health_timer", forbidden)
+    monkeypatch.setattr(healer, "save_state", forbidden)
+
+    assert healer.run(CliArgs(cfg_path, state_path)) == 0
+    assert state_path.read_bytes() == original
+
+
+def test_cli_main_redacts_disarmed_errors(monkeypatch, capsys):
+    secret = "x" * 48
+    monkeypatch.setattr(
+        healer,
+        "run",
+        lambda _args: (_ for _ in ()).throw(
+            healer.Disarmed(f'access_token="{secret}"')
+        ),
+    )
+
+    assert healer.main([]) == 1
+    stderr = capsys.readouterr().err
+    assert "DISARMED" in stderr
+    assert secret not in stderr
+    assert "[REDACTED]" in stderr
+
+
+def test_cli_config_defaults_beside_script_and_explicit_flag_still_works(
+    tmp_path, monkeypatch
+):
+    default_dir = tmp_path / "installed"
+    default_dir.mkdir()
+    default_cfg = write_cli_config(default_dir)
+    default_state = default_dir / "dry-state.json"
+    explicit_dir = tmp_path / "explicit"
+    explicit_dir.mkdir()
+    explicit_cfg = write_cli_config(explicit_dir)
+    explicit_state = explicit_dir / "dry-state.json"
+    monkeypatch.setattr(healer, "HERE", default_dir)
+
+    assert healer.main(["--dry-run", "--state-file", str(default_state)]) == 0
+    assert healer.main([
+        "--config", str(explicit_cfg), "--dry-run",
+        "--state-file", str(explicit_state),
+    ]) == 0
+    assert default_cfg.exists()
+    assert not default_state.exists()
+    assert not explicit_state.exists()
+
+
+def test_every_codex_role_wires_a_healer_timer_and_notifier():
+    pairs = {
+        "hermes-codex-self-heal.service": (
+            "hermes-codex-health-notify.service",
+            "%h/.hermes/codex-health/self_heal.py",
+            "%h/.hermes/.env",
+        ),
+        "hermes-codex-self-heal-tmn.service": (
+            "hermes-codex-health-tmn-notify.service",
+            "%h/.hermes/codex-health/self_heal.py",
+            "%h/.hermes/.env",
+        ),
+        "codex-observer-self-heal.service": (
+            "codex-observer-notify.service",
+            "%h/.watchdog-observer/self_heal.py",
+            "%h/.watchdog-observer/.env",
+        ),
+    }
+    for service, (notifier, script, env_file) in pairs.items():
+        body = (WATCHDOG / "systemd" / service).read_text()
+        assert "Type=oneshot" in body
+        assert f"ExecStart=/usr/bin/python3 {script}" in body
+        assert f"EnvironmentFile=-{env_file}" in body
+        assert f"OnFailure={notifier}" in body
+        assert "TimeoutStartSec=180" in body
+        timer = (
+            WATCHDOG / "systemd" / service.replace(".service", ".timer")
+        ).read_text()
+        assert "OnBootSec=2m" in timer
+        assert "OnUnitActiveSec=15m" in timer
+        assert "Persistent=true" in timer
+        assert "WantedBy=timers.target" in timer
+
+    assert not list((WATCHDOG / "systemd").glob("*nebos*self-heal*"))
+
+
+def test_shipped_role_configs_have_exact_local_healer_settings():
+    src = json.loads((WATCHDOG / "hosts" / "src.json").read_text())
+    tmn = json.loads((WATCHDOG / "hosts" / "tmn.json").read_text())
+    observer = json.loads(
+        (WATCHDOG / "hosts" / "hermes-tmn-observer.json").read_text()
+    )
+
+    assert {k: v for k, v in src["self_heal"].items() if k != "peers"} == {
+        "health_timer": "hermes-codex-health.timer",
+        "check_service": "hermes-codex-health.service",
+        "gateway_restart": True,
+        "codex_model": "openai-codex/gpt-5.5",
+        "maintenance_lock": "~/.hermes/codex-health/SELF_HEAL_PAUSED",
+        "retry_s": 21600,
+    }
+    assert {k: v for k, v in tmn["self_heal"].items() if k != "peers"} == {
+        "health_timer": "hermes-codex-health-tmn.timer",
+        "check_service": "hermes-codex-health-tmn.service",
+        "gateway_restart": True,
+        "codex_model": "openai-codex/gpt-5.5",
+        "maintenance_lock": "~/.hermes/codex-health/SELF_HEAL_PAUSED",
+        "retry_s": 21600,
+    }
+    assert {k: v for k, v in observer["self_heal"].items() if k != "peers"} == {
+        "health_timer": "codex-observer.timer",
+        "check_service": "codex-observer.service",
+        "gateway_restart": False,
+        "maintenance_lock": "~/.watchdog-observer/SELF_HEAL_PAUSED",
+        "retry_s": 21600,
+    }
+
+
+def test_installer_wires_healer_roles_without_adding_one_to_nebos():
+    source = (WATCHDOG / "install.sh").read_text()
+    assert 'HEAL_SERVICE="hermes-codex-self-heal.service"' in source
+    assert 'HEAL_SERVICE="hermes-codex-self-heal-tmn.service"' in source
+    assert 'HEAL_SERVICE="codex-observer-self-heal.service"' in source
+    assert 'HEAL_SERVICE=""' in source
+    assert 'install -m 0755 "$HERE/auth_state.py" "$DEST/auth_state.py"' in source
+    assert 'install -m 0755 "$HERE/self_heal.py" "$DEST/self_heal.py"' in source
+    assert 'systemctl --user enable "$HEAL_TIMER"' in source
+    assert 'systemctl --user start  "$HEAL_TIMER"' in source
+    assert '"$DEST/self_heal.py" --dry-run --state-file' in source
+    assert "healer timer enabled" in source
+    assert "healer timer active" in source
+    assert "healer next elapse" in source
+    assert "healer OnFailure" in source
+
+
+def test_installer_preserves_healer_state_and_backups_and_checks_runtime(
+    tmp_path
+):
+    home = tmp_path / "home"
+    dest = home / ".hermes" / "codex-health"
+    backups = dest / "backups"
+    backups.mkdir(parents=True)
+    state_path = dest / "self-heal-state.json"
+    state_path.write_text('{"faults":{"keep":{"active":true}}}')
+    backup_path = backups / "keep-auth.json"
+    backup_path.write_text("keep")
+    hermes_home = home / ".hermes"
+    auth = healthy_singleton()
+    auth["providers"]["openai-codex"]["tokens"]["access_token"] = token_with_exp(
+        int(time.time()) + 3600
+    )
+    (hermes_home / "auth.json").write_text(json.dumps(auth))
+    (hermes_home / "config.yaml").write_text(
+        "model:\n  provider: openai-codex\n"
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    trace = tmp_path / "systemctl.trace"
+    systemctl = fake_bin / "systemctl"
+    systemctl.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$*\" >> \"$TRACE\"\n"
+        "[ \"$1\" = --user ] && shift\n"
+        "case \"$1\" in\n"
+        "  is-enabled) echo enabled ;;\n"
+        "  is-active) echo active ;;\n"
+        "  show)\n"
+        "    case \"$*\" in\n"
+        "      *OnFailure*)\n"
+        "        case \"$2\" in\n"
+        "          hermes-codex-self-heal.service) echo hermes-codex-health-notify.service ;;\n"
+        "          *) echo hermes-codex-health-notify.service ;;\n"
+        "        esac ;;\n"
+        "      *) echo 'Mon 2026-08-31 12:00:00 UTC' ;;\n"
+        "    esac ;;\n"
+        "esac\n"
+    )
+    systemctl.chmod(0o755)
+    for name, body in {
+        "loginctl": "#!/bin/sh\necho yes\n",
+        "tailscale": "#!/bin/sh\necho 100.79.251.126\n",
+        "curl": "#!/bin/sh\nexit 0\n",
+    }.items():
+        command = fake_bin / name
+        command.write_text(body)
+        command.chmod(0o755)
+    env = os.environ.copy()
+    env.update({
+        "HOME": str(home),
+        "USER": "hermes",
+        "PATH": f"{fake_bin}:/usr/bin:/bin",
+        "TRACE": str(trace),
+        "TELEGRAM_BOT_TOKEN": "test-token",
+        "TELEGRAM_HOME_CHANNEL": "123",
+    })
+
+    completed = subprocess.run(
+        ["/bin/bash", str(WATCHDOG / "install.sh"), "--host", "src"],
+        text=True,
+        capture_output=True,
+        env=env,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert state_path.read_text() == '{"faults":{"keep":{"active":true}}}'
+    assert backup_path.read_text() == "keep"
+    assert (dest / "auth_state.py").exists()
+    assert (dest / "self_heal.py").exists()
+    assert (dest / "codex_auth_probe.py").exists()
+    trace_text = trace.read_text()
+    assert "enable hermes-codex-self-heal.timer" in trace_text
+    assert "start hermes-codex-self-heal.timer" in trace_text
+    assert "show hermes-codex-self-heal.timer" in trace_text
+    assert "show hermes-codex-self-heal.service -p OnFailure --value" in trace_text
+    assert "healer dry-run exited 0" in completed.stdout
+
+
+def test_installer_is_bash_32_syntax_compatible():
+    completed = subprocess.run(
+        ["/bin/bash", "-n", str(WATCHDOG / "install.sh")],
+        text=True,
+        capture_output=True,
+    )
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_command_result_is_immutable_value_object():

@@ -4,6 +4,12 @@
   "hermes_home": "~/.hermes",
   "gateway_unit": "hermes-gateway.service",
   "self_heal": {
+    "health_timer": "hermes-codex-health-tmn.timer",
+    "check_service": "hermes-codex-health-tmn.service",
+    "gateway_restart": true,
+    "codex_model": "openai-codex/gpt-5.5",
+    "maintenance_lock": "~/.hermes/codex-health/SELF_HEAL_PAUSED",
+    "retry_s": 21600,
     "peers": [
       {
         "label": "src",
