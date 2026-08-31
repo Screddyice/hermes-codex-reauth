@@ -2,7 +2,7 @@
 Description=Repair backstop Codex observer watchdog faults
 After=network-online.target tailscaled.service
 Wants=network-online.target
-OnFailure=codex-observer-notify.service
+OnFailure=codex-observer-self-heal-notify.service
 
 [Service]
 Type=oneshot

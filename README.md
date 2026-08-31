@@ -44,7 +44,8 @@ run a healer every 15 minutes.
 
 The two hosts use an interleaved half-cycle: TMN runs at 00/06/12/18:35, and src
 runs at 03/09/15/21:35. Each box gets a passive check every six hours. The
-15-minute healer uses `OnBootSec=2m`, `OnUnitActiveSec=15m`, and `Persistent=true`.
+15-minute healer uses `OnBootSec=2m`, `OnActiveSec=2m`,
+`OnUnitActiveSec=15m`, and `Persistent=true`.
 
 ```
 watchdog/
@@ -370,8 +371,8 @@ active, and next-elapse state after either action. It skips masked units.
 A pool whose renewable entries all report quota blocks causes no Codex request
 before the latest stored reset. The first healer cycle at or after that reset
 runs one warmup and one live probe. The state file records that reset attempt,
-so later 15-minute cycles do
-not repeat it. A fresh 429 stores the next reset and returns to passive waiting.
+so later 15-minute cycles do not repeat it. A fresh 429 stores the next reset
+and returns to passive waiting.
 
 Each failed repair raises one `OnFailure=` notification. Later cycles retry at
 the configured six-hour cooldown but exit without another notification while

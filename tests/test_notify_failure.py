@@ -260,6 +260,23 @@ def test_every_check_unit_wires_onfailure_to_its_notifier():
         assert f"--unit {unit}" in notify_body
 
 
+def test_every_healer_unit_wires_a_healer_specific_notifier():
+    pairs = {
+        "hermes-codex-self-heal.service": "hermes-codex-self-heal-notify.service",
+        "hermes-codex-self-heal-tmn.service": (
+            "hermes-codex-self-heal-tmn-notify.service"
+        ),
+        "codex-observer-self-heal.service": "codex-observer-self-heal-notify.service",
+    }
+    for unit, notify in pairs.items():
+        body = (WATCHDOG / "systemd" / unit).read_text()
+        assert f"OnFailure={notify}" in body
+
+        notify_body = (WATCHDOG / "systemd" / notify).read_text()
+        assert "notify_failure.py" in notify_body
+        assert f"--unit {unit}" in notify_body
+
+
 def test_notifier_units_read_the_env_that_holds_the_bot_token():
     """The live TMN host stores its notifier token in the root Hermes env."""
     tmn = (WATCHDOG / "systemd" / "hermes-codex-health-tmn-notify.service").read_text()

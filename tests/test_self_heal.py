@@ -1614,17 +1614,17 @@ def test_cli_config_defaults_beside_script_and_explicit_flag_still_works(
 def test_every_codex_role_wires_a_healer_timer_and_notifier():
     pairs = {
         "hermes-codex-self-heal.service": (
-            "hermes-codex-health-notify.service",
+            "hermes-codex-self-heal-notify.service",
             "%h/.hermes/codex-health/self_heal.py",
             "%h/.hermes/.env",
         ),
         "hermes-codex-self-heal-tmn.service": (
-            "hermes-codex-health-tmn-notify.service",
+            "hermes-codex-self-heal-tmn-notify.service",
             "%h/.hermes/codex-health/self_heal.py",
             "%h/.hermes/.env",
         ),
         "codex-observer-self-heal.service": (
-            "codex-observer-notify.service",
+            "codex-observer-self-heal-notify.service",
             "%h/.watchdog-observer/self_heal.py",
             "%h/.watchdog-observer/.env",
         ),
@@ -1640,6 +1640,7 @@ def test_every_codex_role_wires_a_healer_timer_and_notifier():
             WATCHDOG / "systemd" / service.replace(".service", ".timer")
         ).read_text()
         assert "OnBootSec=2m" in timer
+        assert "OnActiveSec=2m" in timer
         assert "OnUnitActiveSec=15m" in timer
         assert "Persistent=true" in timer
         assert "WantedBy=timers.target" in timer
@@ -1684,6 +1685,9 @@ def test_installer_wires_healer_roles_without_adding_one_to_nebos():
     assert 'HEAL_SERVICE="hermes-codex-self-heal.service"' in source
     assert 'HEAL_SERVICE="hermes-codex-self-heal-tmn.service"' in source
     assert 'HEAL_SERVICE="codex-observer-self-heal.service"' in source
+    assert 'HEAL_NOTIFY="hermes-codex-self-heal-notify.service"' in source
+    assert 'HEAL_NOTIFY="hermes-codex-self-heal-tmn-notify.service"' in source
+    assert 'HEAL_NOTIFY="codex-observer-self-heal-notify.service"' in source
     assert 'HEAL_SERVICE=""' in source
     assert 'install -m 0755 "$HERE/auth_state.py" "$DEST/auth_state.py"' in source
     assert 'install -m 0755 "$HERE/self_heal.py" "$DEST/self_heal.py"' in source
@@ -1696,8 +1700,14 @@ def test_installer_wires_healer_roles_without_adding_one_to_nebos():
     assert "healer OnFailure" in source
 
 
+@pytest.mark.parametrize(("heal_next", "expect_success"), [
+    ("2min 30s", True),
+    ("infinity", False),
+    ("n/a", False),
+    ("", False),
+])
 def test_installer_preserves_healer_state_and_backups_and_checks_runtime(
-    tmp_path
+    tmp_path, heal_next, expect_success
 ):
     home = tmp_path / "home"
     dest = home / ".hermes" / "codex-health"
@@ -1731,7 +1741,7 @@ def test_installer_preserves_healer_state_and_backups_and_checks_runtime(
         "    case \"$*\" in\n"
         "      *OnFailure*)\n"
         "        case \"$2\" in\n"
-        "          hermes-codex-self-heal.service) echo hermes-codex-health-notify.service ;;\n"
+        "          hermes-codex-self-heal.service) echo hermes-codex-self-heal-notify.service ;;\n"
         "          *) echo hermes-codex-health-notify.service ;;\n"
         "        esac ;;\n"
         "      *NextElapseUSecRealtime*)\n"
@@ -1739,7 +1749,7 @@ def test_installer_preserves_healer_state_and_backups_and_checks_runtime(
         "          *self-heal*.timer) : ;;\n"
         "          *) echo 'Mon 2026-08-31 12:00:00 UTC' ;;\n"
         "        esac ;;\n"
-        "      *NextElapseUSecMonotonic*) echo '2min 30s' ;;\n"
+        "      *NextElapseUSecMonotonic*) echo \"$FAKE_HEAL_NEXT\" ;;\n"
         "    esac ;;\n"
         "esac\n"
     )
@@ -1760,6 +1770,7 @@ def test_installer_preserves_healer_state_and_backups_and_checks_runtime(
         "TRACE": str(trace),
         "TELEGRAM_BOT_TOKEN": "test-token",
         "TELEGRAM_HOME_CHANNEL": "123",
+        "FAKE_HEAL_NEXT": heal_next,
     })
 
     completed = subprocess.run(
@@ -1770,9 +1781,15 @@ def test_installer_preserves_healer_state_and_backups_and_checks_runtime(
         timeout=30,
     )
 
+    if not expect_success:
+        assert completed.returncode == 1, completed.stdout + completed.stderr
+        assert "healer timer has no scheduled next run" in completed.stdout
+        return
+
     assert completed.returncode == 0, completed.stdout + completed.stderr
     assert state_path.read_text() == '{"faults":{"keep":{"active":true}}}'
     assert backup_path.read_text() == "keep"
+    assert stat.S_IMODE(backups.stat().st_mode) == 0o700
     assert (dest / "auth_state.py").exists()
     assert (dest / "self_heal.py").exists()
     assert (dest / "codex_auth_probe.py").exists()

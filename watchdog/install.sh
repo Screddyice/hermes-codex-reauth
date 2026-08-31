@@ -32,15 +32,16 @@ done
 CHECK_SRC="$HERE/codex_health_check.py"
 HEAL_SERVICE=""
 HEAL_TIMER=""
+HEAL_NOTIFY=""
 case "$HOST" in
   src)          DEST="$HOME/.hermes/codex-health";               TIMER="hermes-codex-health.timer";     SERVICE="hermes-codex-health.service";     NOTIFY="hermes-codex-health-notify.service";     BEAT="hermes-codex-heartbeat.service"
-                HEAL_SERVICE="hermes-codex-self-heal.service";     HEAL_TIMER="hermes-codex-self-heal.timer" ;;
+                HEAL_SERVICE="hermes-codex-self-heal.service";     HEAL_TIMER="hermes-codex-self-heal.timer"; HEAL_NOTIFY="hermes-codex-self-heal-notify.service" ;;
   tmn)          DEST="$HOME/.hermes/codex-health";               TIMER="hermes-codex-health-tmn.timer"; SERVICE="hermes-codex-health-tmn.service"; NOTIFY="hermes-codex-health-tmn-notify.service"; BEAT="hermes-codex-heartbeat-tmn.service"
-                HEAL_SERVICE="hermes-codex-self-heal-tmn.service"; HEAL_TIMER="hermes-codex-self-heal-tmn.timer" ;;
+                HEAL_SERVICE="hermes-codex-self-heal-tmn.service"; HEAL_TIMER="hermes-codex-self-heal-tmn.timer"; HEAL_NOTIFY="hermes-codex-self-heal-tmn-notify.service" ;;
   nebos-claude) DEST="$HOME/.hermes/profiles/tmn/claude-health"; TIMER="nebos-claude-health.timer";     SERVICE="nebos-claude-health.service";     NOTIFY="nebos-claude-health-notify.service"
-                CHECK_SRC="$HERE/claude_health_check.py"; HEAL_SERVICE=""; HEAL_TIMER="" ;;
+                CHECK_SRC="$HERE/claude_health_check.py"; HEAL_SERVICE=""; HEAL_TIMER=""; HEAL_NOTIFY="" ;;
   observer)     DEST="$HOME/.watchdog-observer";                 TIMER="codex-observer.timer";          SERVICE="codex-observer.service";          NOTIFY="codex-observer-notify.service";     BEAT="codex-observer-heartbeat.service"; CFG_NAME="hermes-tmn-observer"
-                HEAL_SERVICE="codex-observer-self-heal.service"; HEAL_TIMER="codex-observer-self-heal.timer" ;;
+                HEAL_SERVICE="codex-observer-self-heal.service"; HEAL_TIMER="codex-observer-self-heal.timer"; HEAL_NOTIFY="codex-observer-self-heal-notify.service" ;;
   *) echo "usage: $0 --host {src|tmn|nebos-claude|observer}" >&2; exit 2 ;;
 esac
 
@@ -52,6 +53,11 @@ log() { echo "[install] $*"; }
 
 # --- 1. script + config (never state.json) ---
 mkdir -p "$DEST" "$UNIT_DIR"
+if [[ -n "$HEAL_SERVICE" ]]; then
+  # A healer that cannot create private credential backups must fail at install,
+  # before its first scheduled mutation reaches that boundary.
+  install -d -m 0700 "$DEST/backups"
+fi
 install -m 0755 "$CHECK_SRC" "$DEST/check.py"
 install -m 0644 "$CFG_SRC"   "$DEST/config.json"
 # The Codex check and healer share one passive auth classifier. The observer
@@ -85,9 +91,10 @@ install -m 0644 "$HERE/systemd/$NOTIFY"  "$UNIT_DIR/$NOTIFY"
 if [[ -n "$HEAL_SERVICE" ]]; then
   install -m 0644 "$HERE/systemd/$HEAL_SERVICE" "$UNIT_DIR/$HEAL_SERVICE"
   install -m 0644 "$HERE/systemd/$HEAL_TIMER" "$UNIT_DIR/$HEAL_TIMER"
+  install -m 0644 "$HERE/systemd/$HEAL_NOTIFY" "$UNIT_DIR/$HEAL_NOTIFY"
 fi
 systemctl --user daemon-reload
-log "installed units $SERVICE + $TIMER + $NOTIFY${BEAT:+ + $BEAT}${HEAL_SERVICE:+ + $HEAL_SERVICE + $HEAL_TIMER}"
+log "installed units $SERVICE + $TIMER + $NOTIFY${BEAT:+ + $BEAT}${HEAL_SERVICE:+ + $HEAL_SERVICE + $HEAL_TIMER + $HEAL_NOTIFY}"
 
 # --- 3. enable ---
 systemctl --user enable "$TIMER" >/dev/null
@@ -135,15 +142,16 @@ if [[ -n "$HEAL_SERVICE" ]]; then
   check "healer timer enabled" "$(systemctl --user is-enabled "$HEAL_TIMER" 2>&1)" "enabled"
   check "healer timer active"  "$(systemctl --user is-active  "$HEAL_TIMER" 2>&1)" "active"
   HEAL_NEXT="$(systemctl --user show "$HEAL_TIMER" -p NextElapseUSecMonotonic --value)"
-  if [[ -n "$HEAL_NEXT" ]]; then
-    log "OK    healer next elapse = $HEAL_NEXT"
+  HEAL_NEXT_NORMALIZED="$(printf '%s' "$HEAL_NEXT" | tr '[:upper:]' '[:lower:]')"
+  case "$HEAL_NEXT_NORMALIZED" in
+    ""|n/a|infinity|infinite|never|-)
+      log "FAIL  healer timer has no scheduled next run"; fail=1 ;;
+    *) log "OK    healer next elapse = $HEAL_NEXT" ;;
+  esac
+  if systemctl --user show "$HEAL_SERVICE" -p OnFailure --value | grep -q "$HEAL_NOTIFY"; then
+    log "OK    healer OnFailure = $HEAL_NOTIFY"
   else
-    log "FAIL  healer timer has no scheduled next run"; fail=1
-  fi
-  if systemctl --user show "$HEAL_SERVICE" -p OnFailure --value | grep -q "$NOTIFY"; then
-    log "OK    healer OnFailure = $NOTIFY"
-  else
-    log "FAIL  $HEAL_SERVICE has no OnFailure=$NOTIFY"; fail=1
+    log "FAIL  $HEAL_SERVICE has no OnFailure=$HEAL_NOTIFY"; fail=1
   fi
 fi
 
@@ -154,6 +162,15 @@ if OUT="$(/usr/bin/python3 "$DEST/notify_failure.py" --unit "$SERVICE" --dry-run
 else
   log "FAIL  escalator cannot resolve TELEGRAM_BOT_TOKEN / TELEGRAM_HOME_CHANNEL:"
   echo "$OUT" | sed 's/^/          /'; fail=1
+fi
+
+if [[ -n "$HEAL_SERVICE" ]]; then
+  if OUT="$(/usr/bin/python3 "$DEST/notify_failure.py" --unit "$HEAL_SERVICE" --dry-run 2>&1 | head -1)"; then
+    log "OK    healer escalator ready: $OUT"
+  else
+    log "FAIL  healer escalator cannot resolve TELEGRAM_BOT_TOKEN / TELEGRAM_HOME_CHANNEL:"
+    echo "$OUT" | sed 's/^/          /'; fail=1
+  fi
 fi
 
 # The heartbeat is what the OTHER box reads to know this one is alive, so a

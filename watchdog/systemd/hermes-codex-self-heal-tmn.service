@@ -2,7 +2,7 @@
 Description=Repair Team Nebula Hermes Codex watchdog faults
 After=network-online.target tailscaled.service
 Wants=network-online.target
-OnFailure=hermes-codex-health-tmn-notify.service
+OnFailure=hermes-codex-self-heal-tmn-notify.service
 
 [Service]
 Type=oneshot
