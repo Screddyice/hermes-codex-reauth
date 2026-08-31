@@ -144,7 +144,7 @@ def credential_action(auth: dict, now: float) -> str:
         return "human_2fa"
 
     if recorded_reset is not None and now >= recorded_reset:
-        return "warmup" if _renewable_pool_entries(pool) else "human_2fa"
+        return "refresh" if _renewable_pool_entries(pool) else "human_2fa"
     if selected is None:
         return "human_2fa"
     if _credential_is_terminal(selected):
@@ -152,14 +152,14 @@ def credential_action(auth: dict, now: float) -> str:
             entry for entry in _renewable_pool_entries(pool)
             if entry is not selected and not _credential_is_terminal(entry)
         ]
-        return "warmup" if alternates else "human_2fa"
+        return "refresh" if alternates else "human_2fa"
 
     tokens = _credential_tokens(selected)
     if not tokens.get("refresh_token"):
         return "human_2fa"
     expires_at = _jwt_exp(tokens.get("access_token"))
     if expires_at is None or expires_at <= now:
-        return "warmup"
+        return "refresh"
     return "none"
 
 
@@ -275,6 +275,7 @@ def repair_credential(
     now: int,
     dry_run: bool,
     persist_state=None,
+    allow_mutation: bool = True,
 ) -> tuple[bool, str]:
     """Perform at most one backed-up direct refresh and one live probe."""
     _validate_state(state)
@@ -284,6 +285,49 @@ def repair_credential(
     auth = _read_auth(auth_path)
     action = credential_action(auth, now)
     reset_at = full_pool_reset_at(auth, 0.0)
+
+    probe_reset = state.get("quota_reset_at")
+    if state.get("quota_retry_action") == "probe" and isinstance(
+        probe_reset, (int, float)
+    ) and not isinstance(probe_reset, bool):
+        if now < probe_reset:
+            return True, (
+                "quota probe waits until recorded reset "
+                f"{_format_reset(float(probe_reset))}"
+            )
+        if state.get("quota_attempt_reset_at") == probe_reset:
+            return False, (
+                f"quota probe reset {_format_reset(float(probe_reset))} "
+                "was already attempted; refusing a second request"
+            )
+        if dry_run:
+            return True, "dry-run: run one direct no-tool quota probe"
+        if not allow_mutation:
+            return False, "quota probe retry waits for the local repair cooldown"
+        state["quota_attempt_reset_at"] = probe_reset
+        persist_state()
+        probe = run_live_probe(cfg_path, run_cmd)
+        if probe.returncode == 0:
+            state.pop("quota_reset_at", None)
+            state.pop("quota_retry_action", None)
+            persist_state()
+            return True, "quota probe retry verified credential recovery"
+        if probe.returncode == 3:
+            next_reset = _reset_at_from_text(probe.stdout + "\n" + probe.stderr)
+            if next_reset is None or next_reset <= now:
+                return False, "quota probe returned no safe future reset"
+            state["quota_reset_at"] = next_reset
+            state["quota_retry_action"] = "probe"
+            persist_state()
+            return True, (
+                "quota remains blocked until recorded reset "
+                f"{_format_reset(next_reset)}"
+            )
+        if probe.returncode == 1:
+            return False, "credential requires human 2FA after quota probe"
+        if probe.returncode == 2:
+            return False, "quota probe result is uncertain; retry blocked"
+        return False, f"quota probe returned unsupported code {probe.returncode}"
 
     if action == "none":
         return True, "credential is healthy"
@@ -314,6 +358,8 @@ def repair_credential(
 
     if dry_run:
         return True, "dry-run: plan one direct refresh, back up auth, refresh once, restart gateway, run one probe"
+    if not allow_mutation:
+        return False, "credential repair waits for the local repair cooldown"
 
     plan = plan_hermes_refresh(cfg, auth_path, run_cmd)
     if plan.returncode != 0:
@@ -402,6 +448,7 @@ def repair_credential(
         attempt["status"] = "quota"
         attempt["reset_at"] = next_reset
         state["quota_reset_at"] = next_reset
+        state["quota_retry_action"] = "refresh"
         persist_state()
         return True, _bounded_detail(
             f"quota remains blocked until recorded reset {_format_reset(next_reset)}; "
@@ -455,6 +502,10 @@ def repair_credential(
 
     probe = run_live_probe(cfg_path, run_cmd)
     if probe.returncode == 0:
+        if "quota_reset_at" in state or "quota_retry_action" in state:
+            state.pop("quota_reset_at", None)
+            state.pop("quota_retry_action", None)
+            persist_state()
         return True, _bounded_detail(f"credential repair verified; backup retained at {backup_path}")
     if probe.returncode == 1:
         return False, _command_failure(
@@ -473,6 +524,8 @@ def repair_credential(
                 "quota probe returned no recorded reset", probe, backup_path
             )
         state["quota_reset_at"] = next_reset
+        state["quota_retry_action"] = "probe"
+        persist_state()
         return True, _bounded_detail(
             f"quota remains blocked until recorded reset {_format_reset(next_reset)}; "
             f"backup retained at {backup_path}"
@@ -574,7 +627,12 @@ def _jwt_exp(token: object) -> float | None:
         return None
 
 
-def repair_health_timer(cfg: dict, run_cmd, dry_run: bool) -> tuple[bool, str]:
+def repair_health_timer(
+    cfg: dict,
+    run_cmd,
+    dry_run: bool,
+    allow_mutation: bool = True,
+) -> tuple[bool, str]:
     """Repair the configured health timer once, then prove its schedule."""
     timer, check_service = _local_timer_units(cfg)
     if dry_run:
@@ -589,6 +647,8 @@ def repair_health_timer(cfg: dict, run_cmd, dry_run: bool) -> tuple[bool, str]:
     if enabled.returncode != 0:
         if enabled_state != "disabled":
             return False, "health timer is not enabled"
+        if not allow_mutation:
+            return False, "health timer is disabled; repair waits for cooldown"
         repair = systemctl(run_cmd, "enable", "--now", timer)
         if repair.returncode != 0:
             return False, "health timer enable failed"
@@ -597,6 +657,9 @@ def repair_health_timer(cfg: dict, run_cmd, dry_run: bool) -> tuple[bool, str]:
     active, next_elapse = _timer_status(run_cmd, timer)
     if active and _has_next_elapse(next_elapse):
         return True, "health timer is active and scheduled"
+
+    if not allow_mutation:
+        return False, "health timer is unscheduled; repair waits for cooldown"
 
     restarted = systemctl(run_cmd, "restart", timer)
     if restarted.returncode != 0:
@@ -644,6 +707,8 @@ def repair_gateway(
     dry_run: bool,
     sleeper=time.sleep,
     force_restart: bool = False,
+    allow_mutation: bool = True,
+    defer_for_credential: bool = False,
 ) -> tuple[bool, str]:
     """Restart an inactive local gateway once when passive auth state permits it."""
     if not isinstance(cfg, dict):
@@ -660,6 +725,10 @@ def repair_gateway(
         current = systemctl(run_cmd, "is-active", gateway)
         if current.returncode == 0 and current.stdout.strip() == "active":
             return True, "gateway is active"
+        if defer_for_credential:
+            return False, "gateway restart deferred to due credential refresh"
+        if not allow_mutation:
+            return False, "gateway is inactive; repair waits for cooldown"
 
     if not _gateway_can_recover(auth):
         return False, "gateway is inactive and no recoverable credential is available"
@@ -1090,6 +1159,11 @@ def _validate_state(state: object) -> None:
         isinstance(quota_reset, bool) or not isinstance(quota_reset, (int, float))
     ):
         raise Disarmed("state file is malformed")
+    quota_retry_action = state.get("quota_retry_action")
+    if quota_retry_action is not None and quota_retry_action not in {
+        "probe", "refresh"
+    }:
+        raise Disarmed("state file is malformed")
     refresh_attempt = state.get("credential_refresh_attempt")
     if refresh_attempt is not None:
         if not isinstance(refresh_attempt, dict):
@@ -1300,7 +1374,11 @@ def _maintenance_path(cfg: dict) -> pathlib.Path:
 
 
 def _record_local_result(
-    state: dict, key: str, outcome: tuple[bool, str], now: int
+    state: dict,
+    key: str,
+    outcome: tuple[bool, str],
+    now: int,
+    attempted: bool = True,
 ) -> bool:
     ok, detail = outcome
     safe_detail = _bounded_detail(str(detail))
@@ -1308,7 +1386,34 @@ def _record_local_result(
     if ok:
         clear_fault(state, key)
         return False
+    if not attempted:
+        return False
     return fault_transition(state, key, safe_detail, now)
+
+
+def _local_mutation_allowed(
+    state: dict, key: str, now: int, retry_s: int
+) -> bool:
+    fault = (state.get("faults") or {}).get(key)
+    if not isinstance(fault, dict) or not fault.get("active"):
+        return True
+    last_attempt = fault.get("last_attempt")
+    if isinstance(last_attempt, bool) or not isinstance(last_attempt, int):
+        raise Disarmed("state file is malformed")
+    return now - last_attempt >= retry_s
+
+
+def _credential_refresh_owns_gateway(
+    auth: dict,
+    state: dict,
+    now: int,
+    allow_mutation: bool,
+) -> bool:
+    if not allow_mutation:
+        return False
+    if state.get("quota_retry_action") == "probe":
+        return False
+    return credential_action(auth, now) == "refresh"
 
 
 def _dry_run_cycle(
@@ -1334,6 +1439,19 @@ def _dry_run_cycle(
         print(_bounded_detail(detail))
 
 
+def _require_refresh_readiness(cfg: dict) -> None:
+    readiness = run_refresh_readiness(cfg, run_command)
+    if readiness.returncode == 0:
+        return
+    captured = "\n".join(
+        part for part in (readiness.stdout, readiness.stderr) if part
+    )
+    detail = "Hermes refresh readiness failed"
+    if captured:
+        detail += f"; output: {captured}"
+    raise Disarmed(_bounded_detail(detail))
+
+
 def run(args) -> int:
     """Run one role-specific healer cycle and return the alert edge."""
     cfg_path = (
@@ -1344,15 +1462,7 @@ def run(args) -> int:
     cfg = load_config(cfg_path)
     if getattr(args, "check_readiness", False):
         if cfg.get("mode") != "observer":
-            readiness = run_refresh_readiness(cfg, run_command)
-            if readiness.returncode != 0:
-                captured = "\n".join(
-                    part for part in (readiness.stdout, readiness.stderr) if part
-                )
-                detail = "Hermes refresh readiness failed"
-                if captured:
-                    detail += f"; output: {captured}"
-                raise Disarmed(_bounded_detail(detail))
+            _require_refresh_readiness(cfg)
         print("healer configuration and refresh helper are ready")
         return 0
     state_path = (
@@ -1384,24 +1494,56 @@ def run(args) -> int:
             _dry_run_cycle(cfg, cfg_path, state)
             return 0
 
+        if cfg.get("mode") != "observer":
+            _require_refresh_readiness(cfg)
+
         now = int(time.time())
+        retry_s = cfg["self_heal"]["retry_s"]
         new_failure = False
         try:
+            timer_mutation = _local_mutation_allowed(
+                state, "local.timer", now, retry_s
+            )
             new_failure |= _record_local_result(
                 state,
                 "local.timer",
-                repair_health_timer(cfg, run_command, dry_run=False),
+                repair_health_timer(
+                    cfg, run_command, dry_run=False,
+                    allow_mutation=timer_mutation,
+                ),
                 now,
+                attempted=timer_mutation,
             )
 
             if cfg.get("mode") != "observer":
                 auth_path = pathlib.Path(cfg["hermes_home"]).expanduser() / "auth.json"
                 auth = _read_auth(auth_path)
+                gateway_mutation = _local_mutation_allowed(
+                    state, "local.gateway", now, retry_s
+                )
+                credential_mutation = _local_mutation_allowed(
+                    state, "local.credential", now, retry_s
+                )
+                if (
+                    credential_action(auth, now) == "refresh"
+                    and not gateway_mutation
+                ):
+                    credential_mutation = False
+                credential_owns_gateway = _credential_refresh_owns_gateway(
+                    auth, state, now, credential_mutation
+                )
                 new_failure |= _record_local_result(
                     state,
                     "local.gateway",
-                    repair_gateway(cfg, auth, run_command, dry_run=False),
+                    repair_gateway(
+                        cfg, auth, run_command, dry_run=False,
+                        allow_mutation=gateway_mutation,
+                        defer_for_credential=credential_owns_gateway,
+                    ),
                     now,
+                    attempted=(
+                        gateway_mutation and not credential_owns_gateway
+                    ),
                 )
                 new_failure |= _record_local_result(
                     state,
@@ -1410,11 +1552,12 @@ def run(args) -> int:
                         cfg, cfg_path, auth_path, state, run_command, now,
                         dry_run=False,
                         persist_state=lambda: save_state(state_path, state),
+                        allow_mutation=credential_mutation,
                     ),
                     now,
+                    attempted=credential_mutation,
                 )
 
-            retry_s = cfg["self_heal"]["retry_s"]
             for peer in cfg["self_heal"]["peers"]:
                 outcome = handle_peer(
                     peer, state, peer_heartbeat, run_command, now, retry_s

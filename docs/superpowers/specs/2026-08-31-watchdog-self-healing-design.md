@@ -150,6 +150,11 @@ The healer will inspect the configured `gateway_unit` after auth classification.
   restore service.
 - An active gateway needs no action.
 
+One cycle may restart the gateway once. When a due credential refresh will own
+that restart, the earlier gateway step records a deferral and does not restart an
+inactive gateway. The verified refresh performs the one restart before its live
+probe.
+
 The healer will poll `is-active` for up to 10 seconds after restart. A failed
 restart becomes a repair fault and triggers the first-failure alert path.
 
@@ -175,6 +180,11 @@ the request. It will select one unique eligible lineage, hold Hermes'
 and directory, and verify the persisted lineage. Manual pool entries stay
 independent. A `device_code` entry updates the singleton only when both stores
 held the same token pair before refresh.
+
+Every normal credential-host cycle will execute the helper's full readiness
+action before timer, gateway, credential, or peer mutation. Dry-run will remain
+command-free. A package-version, hash, constant, or signature mismatch disarms
+the cycle before a mutation boundary.
 
 The healer will record the attempt in its durable state before the request. A
 timeout, malformed response, or partial persistence blocks reuse of that refresh
@@ -206,6 +216,12 @@ state that should stay quarantined.
 A new 429 stores the next reset and ends the attempt. The healer will wait for
 that reset before another request. It will not restart the gateway or run the
 probe after a refresh-endpoint 429.
+
+A 429 from the post-refresh live probe records a probe-specific reset. A healthy
+auth file does not bypass that state. The healer makes no request before the
+reset, records the attempt at the boundary, and runs one direct no-tool probe
+without another OAuth refresh. A repeated 429 stores the next reset and makes no
+second request in that cycle.
 
 ## Peer Repair
 
@@ -262,8 +278,10 @@ The healer will write state with a same-directory temporary file, `fsync`, mode
 A failed repair exits nonzero after the healer saves `alerted=true`, so the
 existing Telegram `OnFailure=` notifier sends one message. `notify_failure.py`
 will detect healer unit names and describe the failed repair instead of claiming
-that a health check failed to report. Runs during the same fault retry after the
-configured cooldown but exit zero to prevent repeated notifications. Recovery
+that a health check failed to report. Runs during the same fault inspect passive
+postconditions but block another local timer, gateway, or credential mutation
+until the configured cooldown. The cycle at the exact boundary may retry once
+and exits zero to prevent a repeated notification. Passive or repaired recovery
 removes the active fault and re-arms a later incident.
 
 `dry-run` will print planned commands, skip network calls, skip subprocess
@@ -322,11 +340,14 @@ They will cover:
 - disabled timer repair and post-repair assertions;
 - masked timer and maintenance-lock refusal;
 - healthy credential plus inactive gateway restart;
-- terminal credential blocking gateway and warmup mutation;
+- terminal credential blocking gateway and direct-refresh mutation;
 - atomic mode-600 backup and five-file retention;
-- one Hermes warmup followed by one pool-aware probe;
-- absolute executable validation before every credential-host mutation;
+- one direct refresh followed by one pool-aware probe;
+- one gateway restart across a due credential-repair cycle;
+- full helper readiness before every normal credential-host mutation;
 - quota silence before reset and one attempt after reset;
+- probe-origin 429 silence before reset and one direct probe at the boundary;
+- local mutation cooldown before and at the exact retry boundary;
 - no use of `hermes auth reset`;
 - strict peer target validation and argv construction;
 - peer repair re-arm after heartbeat recovery;

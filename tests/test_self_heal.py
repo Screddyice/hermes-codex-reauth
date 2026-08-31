@@ -224,10 +224,10 @@ def stale_singleton_with_healthy_manual_pool():
 
 @pytest.mark.parametrize(("auth", "now", "expected"), [
     (healthy_singleton(), 1000, "none"),
-    (expired_refreshable_singleton(), 1000, "warmup"),
+    (expired_refreshable_singleton(), 1000, "refresh"),
     (dead_singleton(), 1000, "human_2fa"),
     (fully_blocked_pool(reset_at=2000), 1000, "wait_quota"),
-    (fully_blocked_pool(reset_at=2000), 2000, "warmup"),
+    (fully_blocked_pool(reset_at=2000), 2000, "refresh"),
     (stale_singleton_with_healthy_manual_pool(), 1000, "none"),
 ])
 def test_credential_action(auth, now, expected):
@@ -409,7 +409,40 @@ def test_cli_readiness_rejects_dependency_before_any_mutation(tmp_path, monkeypa
     assert crossed == []
 
 
-def test_warmup_runtime_kills_process_group_on_timeout(monkeypatch):
+def test_normal_cycle_requires_full_helper_readiness_before_any_boundary(
+    tmp_path, monkeypatch
+):
+    peer = valid_peer(tmp_path / "peer", label="neb-ops-gcp")
+    cfg_path = write_cli_config(tmp_path, peers=[peer])
+    state_path = tmp_path / "self-heal-state.json"
+    crossed = []
+
+    monkeypatch.setattr(
+        healer,
+        "run_refresh_readiness",
+        lambda *_args, **_kwargs: result(
+            1, stderr='{"status":"disarmed","detail":"version mismatch"}'
+        ),
+    )
+
+    def forbidden(*args, **kwargs):
+        crossed.append((args, kwargs))
+        raise AssertionError("normal cycle crossed a boundary before readiness")
+
+    monkeypatch.setattr(healer, "repair_health_timer", forbidden)
+    monkeypatch.setattr(healer, "repair_gateway", forbidden)
+    monkeypatch.setattr(healer, "repair_credential", forbidden)
+    monkeypatch.setattr(healer, "handle_peer", forbidden)
+    monkeypatch.setattr(healer, "backup_auth", forbidden)
+
+    with pytest.raises(healer.Disarmed, match="readiness"):
+        healer.run(CliArgs(cfg_path, state_path))
+
+    assert crossed == []
+    assert not state_path.exists()
+
+
+def test_refresh_runtime_kills_process_group_on_timeout(monkeypatch):
     events = []
     oversized = b"x" * (64 * 1024 + 1024)
 
@@ -645,6 +678,67 @@ def test_refresh_429_records_new_reset_without_probe_or_second_request(tmp_path)
     assert len([call for call in next_runner.calls if "codex_auth_probe.py" in call[1]]) == 1
 
 
+def test_live_probe_429_retries_once_at_reset_without_an_oauth_refresh(tmp_path):
+    auth_path = write_auth(tmp_path, expired_refreshable_singleton())
+    cfg_path = write_cfg(tmp_path)
+    state = {"faults": {}}
+
+    first_runner = ScriptedRunner([
+        planned(),
+        persisted(),
+        result(0),
+        result(0, "active"),
+        result(3, '{"error":{"resets_at":2000000000}}'),
+    ])
+    first_ok, first_detail = healer.repair_credential(
+        local_cfg(), cfg_path, auth_path, state, first_runner, 1000, False
+    )
+    healthy = healthy_singleton()
+    healthy["providers"]["openai-codex"]["tokens"]["access_token"] = token_with_exp(
+        3000000000
+    )
+    auth_path.write_text(json.dumps(healthy))
+
+    assert first_ok is True
+    assert "2000000000" in first_detail
+    assert state["quota_reset_at"] == 2000000000
+    assert state["quota_retry_action"] == "probe"
+
+    before_reset = ScriptedRunner([])
+    before_ok, before_detail = healer.repair_credential(
+        local_cfg(), cfg_path, auth_path, state, before_reset, 1999999999, False
+    )
+
+    assert before_ok is True
+    assert "2000000000" in before_detail
+    assert before_reset.calls == []
+
+    at_reset = ScriptedRunner([
+        result(3, '{"error":{"resets_at":3000000000}}'),
+    ])
+    reset_ok, reset_detail = healer.repair_credential(
+        local_cfg(), cfg_path, auth_path, state, at_reset, 2000000000, False
+    )
+
+    assert reset_ok is True
+    assert "3000000000" in reset_detail
+    assert state["quota_attempt_reset_at"] == 2000000000
+    assert state["quota_reset_at"] == 3000000000
+    assert state["quota_retry_action"] == "probe"
+    assert len(at_reset.calls) == 1
+    assert any("codex_auth_probe.py" in part for part in at_reset.calls[0])
+    assert "--refresh" not in at_reset.calls[0]
+
+    repeated = ScriptedRunner([])
+    repeated_ok, repeated_detail = healer.repair_credential(
+        local_cfg(), cfg_path, auth_path, state, repeated, 2000000001, False
+    )
+
+    assert repeated_ok is True
+    assert "3000000000" in repeated_detail
+    assert repeated.calls == []
+
+
 def test_unknown_probe_marks_verification_failure_and_preserves_backup(tmp_path):
     auth_path = write_auth(tmp_path, expired_refreshable_singleton())
     runner = ScriptedRunner([
@@ -744,6 +838,22 @@ def test_credential_dry_run_has_no_commands_backup_or_state_changes(tmp_path):
     assert state == {"faults": {}}
 
 
+def test_credential_cooldown_passively_classifies_without_mutation(tmp_path):
+    auth_path = write_auth(tmp_path, expired_refreshable_singleton())
+    state = {"faults": {}}
+    runner = ScriptedRunner([])
+
+    ok, detail = healer.repair_credential(
+        local_cfg(), write_cfg(tmp_path), auth_path, state, runner, 1000, False,
+        allow_mutation=False,
+    )
+
+    assert ok is False
+    assert "cooldown" in detail
+    assert runner.calls == []
+    assert not (tmp_path / "backups").exists()
+
+
 def test_disabled_timer_is_enabled_started_and_verified():
     runner = ScriptedRunner([
         result(1, "disabled"),
@@ -803,6 +913,20 @@ def test_enabled_unscheduled_timer_restarts_and_starts_the_check_service_once():
     ]
 
 
+def test_disabled_timer_cooldown_checks_state_without_enabling():
+    runner = ScriptedRunner([result(1, "disabled")])
+
+    ok, detail = healer.repair_health_timer(
+        local_cfg(), runner, dry_run=False, allow_mutation=False
+    )
+
+    assert ok is False
+    assert "cooldown" in detail
+    assert runner.calls == [[
+        "systemctl", "--user", "is-enabled", "hermes-codex-health.timer"
+    ]]
+
+
 def test_timer_dry_run_returns_fixed_argv_without_running_commands():
     runner = ScriptedRunner([])
 
@@ -843,6 +967,21 @@ def test_inactive_gateway_restarts_when_a_credential_can_recover():
     assert ["systemctl", "--user", "restart", "hermes-gateway.service"] in runner.calls
     assert "active" in detail
     assert json.dumps(auth, sort_keys=True) == original_auth
+
+
+def test_inactive_gateway_cooldown_checks_state_without_restarting():
+    runner = ScriptedRunner([result(1, "inactive")])
+
+    ok, detail = healer.repair_gateway(
+        local_cfg(), healthy_singleton(), runner, dry_run=False,
+        allow_mutation=False,
+    )
+
+    assert ok is False
+    assert "cooldown" in detail
+    assert runner.calls == [[
+        "systemctl", "--user", "is-active", "hermes-gateway.service"
+    ]]
 
 
 def test_terminal_credential_blocks_gateway_restart():
@@ -1070,6 +1209,17 @@ def test_state_rejects_a_json_value_that_is_not_an_object(tmp_path):
 def test_state_rejects_a_malformed_faults_record(tmp_path):
     path = tmp_path / "self-heal-state.json"
     path.write_text(json.dumps({"faults": []}))
+
+    with pytest.raises(healer.Disarmed):
+        healer.load_state(path)
+
+
+def test_state_rejects_an_unknown_quota_retry_action(tmp_path):
+    path = tmp_path / "self-heal-state.json"
+    path.write_text(json.dumps({
+        "faults": {},
+        "quota_retry_action": "warmup",
+    }))
 
     with pytest.raises(healer.Disarmed):
         healer.load_state(path)
@@ -1570,6 +1720,170 @@ def test_committed_peer_repair_allowlists_match_one_way_tailnet_topology():
     assert not (src.get("self_heal") or {}).get("peers")
 
 
+def test_credential_refresh_cycle_restarts_gateway_at_most_once(
+    tmp_path, monkeypatch
+):
+    cfg_path = write_cli_config(tmp_path)
+    cfg = json.loads(cfg_path.read_text())
+    auth_path = pathlib.Path(cfg["hermes_home"]) / "auth.json"
+    auth_path.write_text(json.dumps(expired_refreshable_singleton()))
+    state_path = tmp_path / "self-heal-state.json"
+    gateway_active = False
+    calls = []
+
+    monkeypatch.setattr(healer.time, "time", lambda: 1000)
+    monkeypatch.setattr(
+        healer, "run_refresh_readiness",
+        lambda *_args, **_kwargs: result(0, '{"status":"ready"}'),
+    )
+    monkeypatch.setattr(
+        healer, "repair_health_timer",
+        lambda *_args, **_kwargs: (True, "timer healthy"),
+    )
+
+    def runner(argv, _timeout):
+        nonlocal gateway_active
+        calls.append(list(argv))
+        if argv == ["systemctl", "--user", "is-active", "hermes-gateway.service"]:
+            return result(0, "active") if gateway_active else result(1, "inactive")
+        if argv == ["systemctl", "--user", "restart", "hermes-gateway.service"]:
+            gateway_active = True
+            return result(0)
+        if "--plan" in argv:
+            return planned()
+        if "--refresh" in argv:
+            auth_path.write_text(json.dumps(healthy_singleton()))
+            return persisted()
+        if any("codex_auth_probe.py" in part for part in argv):
+            return result(0, "OK")
+        raise AssertionError(f"unexpected command: {argv}")
+
+    monkeypatch.setattr(healer, "run_command", runner)
+
+    assert healer.run(CliArgs(cfg_path, state_path)) == 0
+    restart = ["systemctl", "--user", "restart", "hermes-gateway.service"]
+    restart_indexes = [index for index, call in enumerate(calls) if call == restart]
+    refresh_index = next(index for index, call in enumerate(calls) if "--refresh" in call)
+
+    assert len(restart_indexes) == 1
+    assert refresh_index < restart_indexes[0]
+
+
+def test_gateway_cooldown_blocks_credential_owned_restart(
+    tmp_path, monkeypatch
+):
+    cfg_path = write_cli_config(tmp_path)
+    cfg = json.loads(cfg_path.read_text())
+    auth_path = pathlib.Path(cfg["hermes_home"]) / "auth.json"
+    auth_path.write_text(json.dumps(expired_refreshable_singleton()))
+    state_path = tmp_path / "self-heal-state.json"
+    state_path.write_text(json.dumps({"faults": {
+        "local.gateway": {
+            "active": True,
+            "alerted": True,
+            "last_attempt": 1000,
+            "detail": "gateway restart failed",
+        },
+    }}))
+    calls = []
+
+    monkeypatch.setattr(healer.time, "time", lambda: 1001)
+    monkeypatch.setattr(
+        healer, "run_refresh_readiness",
+        lambda *_args, **_kwargs: result(0, '{"status":"ready"}'),
+    )
+    monkeypatch.setattr(
+        healer, "repair_health_timer",
+        lambda *_args, **_kwargs: (True, "timer healthy"),
+    )
+
+    def runner(argv, _timeout):
+        calls.append(list(argv))
+        if argv == ["systemctl", "--user", "is-active", "hermes-gateway.service"]:
+            return result(1, "inactive")
+        raise AssertionError(f"unexpected command: {argv}")
+
+    monkeypatch.setattr(healer, "run_command", runner)
+
+    assert healer.run(CliArgs(cfg_path, state_path)) == 0
+    assert calls == [[
+        "systemctl", "--user", "is-active", "hermes-gateway.service"
+    ]]
+    state = json.loads(state_path.read_text())
+    assert state["faults"]["local.gateway"]["last_attempt"] == 1000
+    assert "local.credential" not in state["faults"]
+
+
+def test_local_fault_cooldown_blocks_mutation_until_exact_boundary(
+    tmp_path, monkeypatch
+):
+    cfg_path = write_cli_config(tmp_path)
+    cfg = json.loads(cfg_path.read_text())
+    auth_path = pathlib.Path(cfg["hermes_home"]) / "auth.json"
+    healthy = healthy_singleton()
+    healthy["providers"]["openai-codex"]["tokens"]["access_token"] = token_with_exp(
+        999999
+    )
+    auth_path.write_text(json.dumps(healthy))
+    state_path = tmp_path / "self-heal-state.json"
+    state_path.write_text(json.dumps({"faults": {
+        key: {
+            "active": True,
+            "alerted": True,
+            "last_attempt": 1000,
+            "detail": "repair failed",
+        }
+        for key in ("local.timer", "local.gateway", "local.credential")
+    }}))
+    now = [1001]
+    observed = []
+
+    monkeypatch.setattr(healer.time, "time", lambda: now[0])
+    monkeypatch.setattr(
+        healer, "run_refresh_readiness",
+        lambda *_args, **_kwargs: result(0, '{"status":"ready"}'),
+    )
+
+    def timer_handler(*_args, allow_mutation=None, **_kwargs):
+        observed.append(("local.timer", allow_mutation))
+        return False, "timer still broken"
+
+    def gateway_handler(*_args, allow_mutation=None, **_kwargs):
+        observed.append(("local.gateway", allow_mutation))
+        return False, "gateway still broken"
+
+    def credential_handler(*_args, allow_mutation=None, **_kwargs):
+        observed.append(("local.credential", allow_mutation))
+        return False, "credential still broken"
+
+    monkeypatch.setattr(healer, "repair_health_timer", timer_handler)
+    monkeypatch.setattr(healer, "repair_gateway", gateway_handler)
+    monkeypatch.setattr(healer, "repair_credential", credential_handler)
+
+    assert healer.run(CliArgs(cfg_path, state_path)) == 0
+    first = json.loads(state_path.read_text())
+    assert observed == [
+        ("local.timer", False),
+        ("local.gateway", False),
+        ("local.credential", False),
+    ]
+    assert {record["last_attempt"] for record in first["faults"].values()} == {1000}
+
+    observed.clear()
+    now[0] = 1000 + 21600
+
+    assert healer.run(CliArgs(cfg_path, state_path)) == 0
+    second = json.loads(state_path.read_text())
+    assert observed == [
+        ("local.timer", True),
+        ("local.gateway", True),
+        ("local.credential", True),
+    ]
+    assert {record["last_attempt"] for record in second["faults"].values()} == {
+        1000 + 21600
+    }
+
+
 def test_cli_new_failed_repair_alerts_once_then_rearms_after_recovery(
     tmp_path, monkeypatch
 ):
@@ -1581,15 +1895,19 @@ def test_cli_new_failed_repair_alerts_once_then_rearms_after_recovery(
         (True, "timer recovered"),
         (False, "timer repair failed again"),
     ])
+    now = iter([1000, 1001, 1002, 1003])
+    monkeypatch.setattr(healer.time, "time", lambda: next(now))
     monkeypatch.setattr(
         healer,
         "repair_health_timer",
-        lambda _cfg, _runner, dry_run: next(timer_results),
+        lambda _cfg, _runner, dry_run, allow_mutation=True: next(timer_results),
     )
     monkeypatch.setattr(
         healer,
         "repair_gateway",
-        lambda _cfg, _auth, _runner, dry_run: (True, "gateway healthy"),
+        lambda _cfg, _auth, _runner, dry_run, **_kwargs: (
+            True, "gateway healthy"
+        ),
     )
     monkeypatch.setattr(
         healer,

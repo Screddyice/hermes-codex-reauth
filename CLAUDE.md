@@ -80,8 +80,15 @@ a mode-`0600` copy of `auth.json`, retain five snapshots, and invoke the
 stdlib-only refresh helper through the pinned Hermes Python runtime. The helper
 must validate the installed Hermes version and source hashes before one request,
 hold `auth.lock` through atomic persistence, and import no agent or plugin code.
-It must not restore an old snapshot, call `hermes auth reset`, redeem usage-reset
-credits, or automate device-code login and 2FA.
+Every normal credential-host cycle must run the full helper readiness check
+before timer, gateway, credential, or peer mutation. The healer must not make ad
+hoc token edits outside the pinned helper, restore an old snapshot, call
+`hermes auth reset`, redeem usage-reset credits, or automate device-code login
+and 2FA.
+
+**Honor local repair cooldowns.** The healer must check timer, gateway, and
+credential recovery on each cycle. An active fault blocks another mutation until
+`retry_s` elapses. Passive recovery clears the fault and re-arms notification.
 
 **Keep peer SSH fixed and narrow.** Accept Tailscale IPs and committed users,
 paths, and unit names only. Require a private identity and pinned host-key file.

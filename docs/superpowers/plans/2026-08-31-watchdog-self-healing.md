@@ -605,10 +605,12 @@ git commit -m "feat(watchdog): repair local timers and gateways"
 **Interfaces:**
 - Consumes: `selected_codex_credential`, `quota_blocked`, `full_pool_reset_at`.
 - Produces: `backup_auth(auth_path: pathlib.Path, backup_dir: pathlib.Path, now: int) -> pathlib.Path`
-- Produces: `credential_action(auth: dict, now: float) -> str`, returning `none`, `warmup`, `wait_quota`, or `human_2fa`.
-- Produces: `run_hermes_warmup(cfg: dict, run_cmd) -> CommandResult`
+- Produces: `credential_action(auth: dict, now: float) -> str`, returning `none`, `refresh`, `wait_quota`, or `human_2fa`.
+- Produces: `run_refresh_readiness(cfg: dict, run_cmd) -> CommandResult`
+- Produces: `plan_hermes_refresh(cfg: dict, auth_path: pathlib.Path, run_cmd) -> CommandResult`
+- Produces: `run_hermes_refresh(cfg: dict, auth_path: pathlib.Path, lineage: str, refresh_fingerprint: str, run_cmd) -> CommandResult`
 - Produces: `run_live_probe(cfg_path: pathlib.Path, run_cmd) -> CommandResult`
-- Produces: `repair_credential(cfg: dict, cfg_path: pathlib.Path, auth_path: pathlib.Path, state: dict, run_cmd, now: int, dry_run: bool) -> tuple[bool, str]`
+- Produces: `repair_credential(cfg: dict, cfg_path: pathlib.Path, auth_path: pathlib.Path, state: dict, run_cmd, now: int, dry_run: bool, persist_state=None, allow_mutation: bool = True) -> tuple[bool, str]`
 
 - [x] **Step 1: Write failing deterministic decision tests**
 
@@ -667,11 +669,11 @@ def stale_singleton_with_healthy_manual_pool():
 ```python
 @pytest.mark.parametrize(("auth", "now", "expected"), [
     (healthy_singleton(), 1000, "none"),
-    (expired_refreshable_singleton(), 1000, "warmup"),
+    (expired_refreshable_singleton(), 1000, "refresh"),
     (dead_singleton(), 1000, "human_2fa"),
     (fully_blocked_pool(reset_at=2000), 1000, "wait_quota"),
-    (fully_blocked_pool(reset_at=2000), 2000, "warmup"),
-    (stale_singleton_with_healthy_manual_pool(), 1000, "warmup"),
+    (fully_blocked_pool(reset_at=2000), 2000, "refresh"),
+    (stale_singleton_with_healthy_manual_pool(), 1000, "none"),
 ])
 def test_credential_action(auth, now, expected):
     assert healer.credential_action(auth, now) == expected
@@ -687,7 +689,7 @@ Expected: FAIL because `credential_action` does not exist.
 
 Use JWT `exp`, terminal status and error codes, renewable entries, and the full-pool reset. Treat `refresh_token_reused`, `invalid_grant`, `token_revoked`, `token_invalidated`, `invalid_token`, and `dead` as terminal for the selected entry. Allow a healthy manual entry to outrank a stale singleton.
 
-- [x] **Step 4: Write failing backup and one-shot tests**
+- [x] **Step 4: Write failing backup and isolated-helper tests**
 
 ```python
 def test_backup_is_private_and_retains_five_newest(tmp_path):
@@ -700,27 +702,27 @@ def test_backup_is_private_and_retains_five_newest(tmp_path):
     assert len(list(backups.glob("*-auth.json"))) == 5
 
 
-def test_warmup_is_pinned_safe_and_bounded():
-    runner = ScriptedRunner([result(0, "OK")])
-    outcome = healer.run_hermes_warmup(local_cfg(), runner)
+def test_refresh_helper_is_pinned_isolated_and_bounded():
+    runner = ScriptedRunner([result(0, '{"status":"ready"}')])
+    outcome = healer.run_refresh_readiness(local_cfg(), runner)
     assert outcome.returncode == 0
-    assert runner.calls == [[
-        "/opt/hermes-agent/venv/bin/hermes",
-        "--safe-mode", "--provider", "openai-codex",
-        "-m", "openai-codex/gpt-5.5", "-z", "Reply with exactly: OK"
-    ]]
-    assert runner.timeouts == [120]
+    assert runner.calls[0][0:3] == [
+        "/opt/hermes-agent/venv/bin/python", "-I",
+        str(WATCHDOG / "hermes_codex_refresh.py"),
+    ]
+    assert runner.calls[0][-1] == "--check-readiness"
+    assert runner.timeouts == [20]
 ```
 
-- [x] **Step 5: Run backup and warmup tests and verify RED**
+- [x] **Step 5: Run backup and direct-refresh tests and verify RED**
 
-Run: `pytest -q tests/test_self_heal.py -k 'backup or warmup'`
+Run: `pytest -q tests/test_self_heal.py tests/test_hermes_codex_refresh.py -k 'backup or refresh'`
 
 Expected: FAIL because the functions do not exist.
 
-- [x] **Step 6: Implement backup, warmup, and probe commands**
+- [x] **Step 6: Implement backup, direct-refresh, and probe commands**
 
-Copy with `shutil.copyfile`, set mode `0600`, `fsync` the backup, and prune oldest names after sorting. Run Hermes with `start_new_session=True`; on timeout, kill the process group before returning failure. Run the probe with:
+Copy with `shutil.copyfile`, set mode `0600`, `fsync` the backup, and prune oldest names after sorting. Run the pinned helper with `start_new_session=True`; on timeout, kill the process group before returning failure. Run the probe with:
 
 ```python
 [sys.executable, str(HERE / "codex_auth_probe.py"), "--config", str(cfg_path)]
@@ -732,22 +734,22 @@ Map probe exit codes without parsing human text.
 
 Test these command sequences with temp auth files and a scripted runner:
 
-1. expired token: backup, warmup, gateway restart, probe zero;
-2. terminal token: no backup, no warmup, return human 2FA detail;
+1. expired token: backup, one direct refresh, gateway restart, probe zero;
+2. terminal token: no backup, no direct refresh, return human 2FA detail;
 3. quota before reset: no command and no state write;
-4. quota at reset: one warmup and one probe;
-5. probe code three: store the new reset and stop without a second request;
+4. quota at reset: one direct refresh and one probe;
+5. probe code three: store a probe-specific reset, then run one probe at that reset without another OAuth refresh;
 6. probe code two: mark verification failure and preserve the backup.
 
 - [x] **Step 8: Implement credential orchestration**
 
-Read `auth.json` again after warmup before restarting the gateway. Never restore the snapshot. Redact captured output with token patterns before logging. Set the quota attempt marker to the observed reset timestamp so the healer cannot retry the same window.
+Read `auth.json` again after direct refresh before restarting the gateway. Never restore the snapshot. Redact captured output with token patterns before logging. Set the quota attempt marker to the observed reset timestamp so the healer cannot retry the same window. A due refresh owns the cycle's one gateway restart; the earlier gateway step must defer when that restart is reserved.
 
 - [x] **Step 9: Run credential tests**
 
-Run: `pytest -q tests/test_self_heal.py -k 'credential or quota or warmup or backup or probe'`
+Run: `pytest -q tests/test_self_heal.py tests/test_hermes_codex_refresh.py -k 'credential or quota or refresh or backup or probe'`
 
-Expected: PASS with one warmup and one probe for each eligible incident.
+Expected: PASS with one direct refresh and one probe for each eligible incident.
 
 - [x] **Step 10: Commit credential recovery**
 
@@ -1098,7 +1100,7 @@ Replace prose that says the watchdog never repairs. Keep the device-code 2FA run
 
 - [x] **Step 2: Update repository rules**
 
-In `CLAUDE.md`, replace `Detect only; never repairs` with the bounded rules from the spec. Keep the bans on scheduled healthy probes, direct token edits, broad SSH, automated 2FA, and `hermes auth reset`.
+In `CLAUDE.md`, replace `Detect only; never repairs` with the bounded rules from the spec. Keep the bans on scheduled healthy probes, ad hoc token edits outside the pinned helper, broad SSH, automated 2FA, and `hermes auth reset`.
 
 - [x] **Step 3: Run focused tests**
 
@@ -1167,10 +1169,14 @@ Record unit enabled/active state, next elapses, disposable repair results, fresh
 
 - [ ] Shared auth selection matches scheduled check, probe, and healer.
 - [ ] Healthy healer cycles make no Codex request.
-- [ ] Credential repair creates one private backup, one warmup, and one probe.
+- [ ] Every normal credential-host cycle passes full helper readiness before mutation.
+- [ ] Credential repair creates one private backup, one direct refresh, and one probe.
+- [ ] A credential-repair cycle restarts the gateway at most once.
 - [ ] Terminal OAuth failures stop at the human 2FA runbook.
 - [ ] Quota retry waits for the recorded reset and runs once per window.
+- [ ] A probe-origin 429 retries with one direct probe and no OAuth refresh.
 - [ ] Local timer and gateway repairs verify postconditions.
+- [ ] Active local faults block mutation until the exact `retry_s` boundary.
 - [ ] Peer repair accepts Tailscale IPs and fixed unit commands only.
 - [ ] Maintenance locks and masks block mutation.
 - [ ] First repair failure alerts once; recovery re-arms it.

@@ -238,6 +238,16 @@ def test_shipped_configs_carry_their_own_runbook_only():
     assert "--profile tmn" not in host_rb and "tunnel-through-iap" not in host_rb
 
 
+def test_src_runbook_describes_bounded_refresh_and_bans_ad_hoc_token_edits():
+    host = chk.load_config(WATCHDOG / "hosts" / "src.json")
+    note = "\n".join(host["context_note"])
+
+    assert "pinned direct-refresh helper" in note
+    assert "Do not edit token fields by hand" in note
+    assert "no longer any scheduled token refresh" not in note
+    assert "Nothing will retry it for you" not in note
+
+
 # --------------------------------------------------------------------------
 # detect()
 # --------------------------------------------------------------------------

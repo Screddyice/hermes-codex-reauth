@@ -361,10 +361,11 @@ last verdict.
 The healer takes a nonblocking lock and processes faults in this order:
 
 1. Stop when the role's `SELF_HEAL_PAUSED` file exists.
-2. Repair the local health timer once, unless systemd reports a mask.
-3. Restart an inactive gateway once when passive auth state permits recovery.
-4. Run one backed-up credential repair or one post-reset quota retry.
-5. Repair fixed peer timer, check, and heartbeat units after two missed heartbeats.
+2. Validate the full pinned Hermes helper contract on credential hosts.
+3. Repair the local health timer once, unless systemd reports a mask.
+4. Restart an inactive gateway once, or reserve that restart for a due refresh.
+5. Run one backed-up credential refresh or one post-reset quota probe.
+6. Repair fixed peer timer, check, and heartbeat units after two missed heartbeats.
 
 An enabled timer with no next elapse gets one timer restart and one health-check
 start. A disabled timer gets one `enable --now`. The healer verifies enabled,
@@ -377,19 +378,27 @@ state file records the attempt before the request, so a timeout or lost response
 cannot reuse the same single-use token. A fresh 429 stores the next reset
 without a probe or second request and returns to passive waiting.
 
+When the live probe returns 429 after a verified refresh, the healer stores that
+probe reset separately. It makes no request before the reset, then runs one
+direct no-tool probe at the boundary without another OAuth refresh. A repeated
+429 stores the next reset and ends the cycle.
+
 Credential roles pin the Hermes Python runtime, version, `auth.py`, and
 `credential_pool.py`, including a SHA-256 for each source module. `src` uses
 `/opt/hermes-agent`; Team Nebula uses the Hermes checkout under
 `~/.hermes/hermes-agent`. The healer checks absolute paths, file type, hashes,
 and the refresh, lock, selection, and persistence signatures before mutation.
 `install.sh` runs the helper's readiness check before it enables or starts the
-timer. A Hermes upgrade stops the healer until an operator reviews and updates
-the source pins.
+timer. Each normal credential-host cycle repeats the same full readiness check
+before any mutation. A Hermes upgrade stops the healer until an operator reviews
+and updates the source pins.
 
 Each failed repair raises one `OnFailure=` notification. Later cycles retry at
 the configured six-hour cooldown but exit without another notification while
-the fault remains active. A successful repair removes the fault record and
-re-arms notification for a new incident.
+the fault remains active. Between attempts, the healer still checks passive
+postconditions and clears a recovered fault. It does not mutate the timer,
+gateway, or credential before the cooldown boundary. A successful repair removes
+the fault record and re-arms notification for a new incident.
 
 ## Peer repair topology
 
