@@ -1,8 +1,8 @@
 # Watchdog Self-Healing Design
 
-**Date:** 2026-08-31  
-**Status:** Approved; implementation plan ready  
-**Branch:** `fix/watchdog-post-migration-topology`  
+**Date:** 2026-08-31
+**Status:** Implemented; final review fixes await deployment
+**Branch:** `fix/watchdog-post-migration-topology`
 **PR:** `Screddyice/hermes-codex-reauth#29`
 
 **Plan:** `docs/superpowers/plans/2026-08-31-watchdog-self-healing.md`
@@ -69,7 +69,7 @@ timer, gateway, credential pool, and quota state. The TMN hosts may repair fixed
 timer and check units on allowlisted peers over Tailscale. Local work continues
 during peer network loss, while remote repair covers a disabled health timer.
 
-The implementation will use approach 3.
+The implementation uses approach 3.
 
 ## Architecture
 
@@ -268,6 +268,13 @@ The one-device Tailscale share exposes `src` to the Team Nebula tailnet. It lets
 access to Team Nebula hosts. The observer and `neb-ops-gcp` can repair each other
 inside the Team Nebula tailnet.
 
+Observer alert ownership follows explicit coverage declarations. `src` names
+`neb-ops-gcp` as its watcher, so the observer suppresses a lone dark `src` only
+while the TMN heartbeat is fresh. `neb-ops-gcp` has no covering observer peer,
+so its lone outage alerts even when `src` is fresh. A combined outage alerts as
+well. Config loading rejects malformed, self-referential, and unknown coverage
+references.
+
 ## State and Alerting
 
 `self-heal-state.json` will contain one record per local or peer fault:
@@ -378,8 +385,9 @@ also send the deterministic repair-decision unit through local-first LLM-Jury.
 
 ## Deployment and Live Verification
 
-PR #29 will remain draft until the three-role topology and healer run on their
-target hosts.
+PR #29 remains draft. SRC has live deployment evidence; the final review fix and
+the paused TMN and observer roles still require separate deployment approval and
+host verification.
 
 Deployment will follow the repository copy-and-install workflow:
 
@@ -397,7 +405,10 @@ the deployment canary.
 
 ## Rollback
 
-`install.sh` will retain pre-deploy files in the existing backup directory. A
-rollback will disable the healer timer, restore the prior scripts and units,
-run `daemon-reload`, and restart the original health and heartbeat units. The
-watchdog state file and Hermes auth store will remain in place.
+Before overwrite, `install.sh` retains deployed scripts, config, and unit files
+under the role's private
+`install-backups/<UTC timestamp>.<suffix>/` directory. `restore-map.tsv` maps
+each file in `files/` or `systemd/` to its deployment target. A rollback disables
+the healer timer, restores the retained files, runs `daemon-reload`, and restarts
+the original health and heartbeat units. The watchdog state file, Hermes auth
+store, and credential backups remain in place.

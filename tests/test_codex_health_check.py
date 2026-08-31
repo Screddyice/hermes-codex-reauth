@@ -835,7 +835,7 @@ def test_non_codex_gateway_is_quiet_but_unreadable_config_is_loud(tmp_path):
 
 
 # --------------------------------------------------------------------------
-# observer host — the backstop for BOTH boxes dark
+# observer host: the backstop for peers without live coverage
 # --------------------------------------------------------------------------
 
 def obs_cfg(**over):
@@ -866,15 +866,27 @@ def peers_aged(monkeypatch, ages):
     monkeypatch.setattr(chk.urllib.request, "urlopen", opener)
 
 
-def test_observer_stays_silent_while_one_box_is_alive(monkeypatch):
-    """A single dark box is already reported by its live peer.
+@pytest.mark.parametrize(
+    ("ages", "expected_status", "expected_dark"),
+    [
+        ({"src": 60, "neb-ops-gcp": 60}, "ok", None),
+        ({"src": 99 * 3600, "neb-ops-gcp": 60}, "ok", None),
+        ({"src": 60, "neb-ops-gcp": 99 * 3600}, "peer", "neb-ops-gcp"),
+        ({"src": 99 * 3600, "neb-ops-gcp": 99 * 3600}, "peer", "src"),
+    ],
+)
+def test_observer_alerts_for_dark_peers_without_live_coverage(
+    monkeypatch, ages, expected_status, expected_dark
+):
+    """TMN covers src, but src cannot cover a dark TMN watchdog."""
+    peers_aged(monkeypatch, ages)
+    cfg = chk.load_config(WATCHDOG / "hosts" / "hermes-tmn-observer.json")
 
-    Alerting here too would page twice for one event, which is the noise this
-    repo keeps refusing to add.
-    """
-    peers_aged(monkeypatch, {"src": 60, "neb-ops-gcp": 99 * 3600})
-    status, _, _ = chk.observe_peers(obs_cfg(), {})
-    assert status == "ok"
+    status, detail, _ = chk.observe_peers(cfg, {})
+
+    assert status == expected_status
+    if expected_dark:
+        assert expected_dark in detail
 
 
 def test_observer_alerts_when_every_box_is_dark(monkeypatch):
@@ -911,6 +923,20 @@ def test_observer_config_needs_no_auth_store_but_others_still_do(tmp_path):
     p.write_text(json.dumps(obs_cfg(peers=[])))
     with pytest.raises(chk.Disarmed, match="watches no peers"):
         chk.load_config(p)
+
+
+@pytest.mark.parametrize(
+    "covered_by",
+    ["neb-ops-gcp", ["missing-peer"], ["src"]],
+)
+def test_observer_rejects_malformed_or_unknown_peer_coverage(tmp_path, covered_by):
+    cfg = obs_cfg()
+    cfg["peers"][0]["covered_by"] = covered_by
+    path = tmp_path / "observer.json"
+    path.write_text(json.dumps(cfg))
+
+    with pytest.raises(chk.Disarmed, match="covered_by"):
+        chk.load_config(path)
 
 
 def test_shipped_observer_config_watches_both_boxes_over_the_tailnet():
@@ -1041,7 +1067,7 @@ def test_sibling_alert_points_at_the_timer_not_the_credential():
 # --------------------------------------------------------------------------
 
 def test_any_dark_peer_is_reported_not_just_all(monkeypatch):
-    """A normal watchdog reports any dark peer; the observer waits for all peers."""
+    """A normal watchdog reports any dark peer without applying observer coverage."""
     import contextlib, io, json as _json
     def opener(url, timeout=0):
         if "100.126" in url:                     # the observer is dark

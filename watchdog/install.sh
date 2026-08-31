@@ -49,10 +49,91 @@ CFG_SRC="$HERE/hosts/${CFG_NAME:-$HOST}.json"
 UNIT_DIR="$HOME/.config/systemd/user"
 log() { echo "[install] $*"; }
 
+PROBE_DIR=""
+ROLLBACK_STOP=()
+ROLLBACK_DISABLE=()
+ACTIVATION_STARTED=0
+cleanup_install() {
+  local rc=$?
+  set +e
+  if [[ -n "$PROBE_DIR" ]]; then
+    rm -f "$PROBE_DIR/check-state.json" "$PROBE_DIR/healer-state.json"
+    rmdir "$PROBE_DIR" 2>/dev/null || true
+  fi
+  if [[ "$rc" -ne 0 && "$ACTIVATION_STARTED" -eq 1 ]]; then
+    log "rolling back units activated by this failed install"
+    local i
+    for ((i=${#ROLLBACK_STOP[@]} - 1; i >= 0; i--)); do
+      systemctl --user stop "${ROLLBACK_STOP[$i]}" >/dev/null 2>&1 || true
+    done
+    for ((i=${#ROLLBACK_DISABLE[@]} - 1; i >= 0; i--)); do
+      systemctl --user disable "${ROLLBACK_DISABLE[$i]}" >/dev/null 2>&1 || true
+    done
+  fi
+  return "$rc"
+}
+trap cleanup_install EXIT
+
+track_activation() {
+  local unit="$1"
+  if ! systemctl --user is-active "$unit" >/dev/null 2>&1; then
+    ROLLBACK_STOP+=("$unit")
+  fi
+  if ! systemctl --user is-enabled "$unit" >/dev/null 2>&1; then
+    ROLLBACK_DISABLE+=("$unit")
+  fi
+}
+
+SNAPSHOT=""
+ensure_snapshot() {
+  if [[ -z "$SNAPSHOT" ]]; then
+    local root="$DEST/install-backups"
+    install -d -m 0700 "$root"
+    SNAPSHOT="$(mktemp -d "$root/$(date -u +%Y%m%dT%H%M%SZ).XXXXXX")"
+    chmod 0700 "$SNAPSHOT"
+    install -d -m 0700 "$SNAPSHOT/files" "$SNAPSHOT/systemd"
+    : > "$SNAPSHOT/restore-map.tsv"
+    chmod 0600 "$SNAPSHOT/restore-map.tsv"
+  fi
+}
+
+backup_artifact() {
+  local target="$1"
+  local relative="$2"
+  [[ -f "$target" ]] || return 0
+  ensure_snapshot
+  install -m 0600 "$target" "$SNAPSHOT/$relative"
+  printf '%s\t%s\n' "$relative" "$target" >> "$SNAPSHOT/restore-map.tsv"
+}
+
 [[ -f "$CFG_SRC" ]] || { echo "missing config $CFG_SRC" >&2; exit 1; }
 
-# --- 1. script + config (never state.json) ---
+# --- 1. retain prior deploy, then install scripts + config (never state.json) ---
 mkdir -p "$DEST" "$UNIT_DIR"
+PAYLOAD_NAMES=(check.py config.json notify_failure.py)
+[[ "$HOST" != "nebos-claude" ]] && PAYLOAD_NAMES+=(auth_state.py)
+if [[ "$HOST" != "nebos-claude" && "$HOST" != "observer" ]]; then
+  PAYLOAD_NAMES+=(codex_auth_probe.py)
+fi
+if [[ -n "$HEAL_SERVICE" ]]; then
+  PAYLOAD_NAMES+=(self_heal.py hermes_codex_refresh.py)
+fi
+[[ -n "${BEAT:-}" ]] && PAYLOAD_NAMES+=(heartbeat_server.py)
+
+UNIT_NAMES=("$SERVICE" "$TIMER" "$NOTIFY")
+[[ -n "${BEAT:-}" ]] && UNIT_NAMES+=("$BEAT")
+if [[ -n "$HEAL_SERVICE" ]]; then
+  UNIT_NAMES+=("$HEAL_SERVICE" "$HEAL_TIMER" "$HEAL_NOTIFY")
+fi
+
+for name in "${PAYLOAD_NAMES[@]}"; do
+  backup_artifact "$DEST/$name" "files/$name"
+done
+for name in "${UNIT_NAMES[@]}"; do
+  backup_artifact "$UNIT_DIR/$name" "systemd/$name"
+done
+[[ -z "$SNAPSHOT" ]] || log "retained pre-overwrite restore snapshot at $SNAPSHOT"
+
 if [[ -n "$HEAL_SERVICE" ]]; then
   # A healer that cannot create private credential backups must fail at install,
   # before its first scheduled mutation reaches that boundary.
@@ -109,39 +190,16 @@ fi
 systemctl --user daemon-reload
 log "installed units $SERVICE + $TIMER + $NOTIFY${BEAT:+ + $BEAT}${HEAL_SERVICE:+ + $HEAL_SERVICE + $HEAL_TIMER + $HEAL_NOTIFY}"
 
-# --- 3. enable ---
-systemctl --user enable "$TIMER" >/dev/null
-systemctl --user start  "$TIMER"
-if [[ -n "$HEAL_SERVICE" ]]; then
-  systemctl --user enable "$HEAL_TIMER" >/dev/null
-  systemctl --user start  "$HEAL_TIMER"
-fi
-if [[ -n "${BEAT:-}" ]]; then
-  systemctl --user enable "$BEAT" >/dev/null
-  systemctl --user restart "$BEAT"
-fi
-
-# A monotonic timer (OnUnitActiveSec) can end up enabled+active with NO next
-# elapse when the service has not run recently — that is how a re-enabled timer
-# silently never fires. These use OnCalendar so it should not happen, but assert
-# it rather than trust it.
-if [[ -z "$(systemctl --user show "$TIMER" -p NextElapseUSecRealtime --value)" ]]; then
-  log "timer has no next elapse — priming by running the service once"
-  systemctl --user start "$SERVICE" || true
-fi
-
-# --- 4. assertions: refuse to claim success without proof ---
+# --- 3. pre-activation gates ---
+# Everything that can be proved without scheduling a mutation-capable unit is
+# checked here. A missing notifier credential or broken dry-run must leave the
+# healer exactly as inactive as it was before this command.
 fail=0
 check() { # check <label> <actual> <expected>
   if [[ "$2" == "$3" ]]; then log "OK    $1 = $2"; else log "FAIL  $1 = $2 (want $3)"; fail=1; fi
 }
 
-check "timer enabled" "$(systemctl --user is-enabled "$TIMER" 2>&1)" "enabled"
-check "timer active"  "$(systemctl --user is-active  "$TIMER" 2>&1)" "active"
 check "linger"        "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)" "yes"
-
-NEXT="$(systemctl --user show "$TIMER" -p NextElapseUSecRealtime --value)"
-if [[ -n "$NEXT" ]]; then log "OK    next elapse = $NEXT"; else log "FAIL  timer has no scheduled next run"; fail=1; fi
 
 # The OnFailure wiring is the whole point of the escalator, and a missing
 # directive is invisible until the day it was supposed to fire. Assert it.
@@ -152,15 +210,6 @@ else
 fi
 
 if [[ -n "$HEAL_SERVICE" ]]; then
-  check "healer timer enabled" "$(systemctl --user is-enabled "$HEAL_TIMER" 2>&1)" "enabled"
-  check "healer timer active"  "$(systemctl --user is-active  "$HEAL_TIMER" 2>&1)" "active"
-  HEAL_NEXT="$(systemctl --user show "$HEAL_TIMER" -p NextElapseUSecMonotonic --value)"
-  HEAL_NEXT_NORMALIZED="$(printf '%s' "$HEAL_NEXT" | tr '[:upper:]' '[:lower:]')"
-  case "$HEAL_NEXT_NORMALIZED" in
-    ""|n/a|infinity|infinite|never|-)
-      log "FAIL  healer timer has no scheduled next run"; fail=1 ;;
-    *) log "OK    healer next elapse = $HEAL_NEXT" ;;
-  esac
   if systemctl --user show "$HEAL_SERVICE" -p OnFailure --value | grep -q "$HEAL_NOTIFY"; then
     log "OK    healer OnFailure = $HEAL_NOTIFY"
   else
@@ -186,6 +235,77 @@ if [[ -n "$HEAL_SERVICE" ]]; then
   fi
 fi
 
+# Prove the installed scripts run without touching either live state file.
+PROBE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/watchdog-install.XXXXXX")"
+CHECK_PROBE_STATE="$PROBE_DIR/check-state.json"
+HEAL_PROBE_STATE="$PROBE_DIR/healer-state.json"
+
+if OUT="$(/usr/bin/python3 "$DEST/check.py" --dry-run --state-file "$CHECK_PROBE_STATE" 2>&1)"; then
+  log "OK    dry-run exited 0"
+  echo "$OUT" | sed 's/^/          /'
+else
+  log "FAIL  dry-run exited non-zero:"; echo "$OUT" | sed 's/^/          /'; fail=1
+fi
+
+if [[ -n "$HEAL_SERVICE" ]]; then
+  if OUT="$(/usr/bin/python3 "$DEST/self_heal.py" --dry-run --state-file "$HEAL_PROBE_STATE" 2>&1)"; then
+    log "OK    healer dry-run exited 0"
+    echo "$OUT" | sed 's/^/          /'
+  else
+    log "FAIL  healer dry-run exited non-zero:"
+    echo "$OUT" | sed 's/^/          /'; fail=1
+  fi
+fi
+
+if [[ "$fail" -ne 0 ]]; then
+  echo "[install] INSTALL INCOMPLETE — pre-activation gate failed" >&2
+  exit 1
+fi
+
+# --- 4. activate ---
+ACTIVATION_STARTED=1
+track_activation "$TIMER"
+systemctl --user enable "$TIMER" >/dev/null
+systemctl --user start  "$TIMER"
+if [[ -n "$HEAL_SERVICE" ]]; then
+  track_activation "$HEAL_TIMER"
+  systemctl --user enable "$HEAL_TIMER" >/dev/null
+  systemctl --user start  "$HEAL_TIMER"
+fi
+if [[ -n "${BEAT:-}" ]]; then
+  track_activation "$BEAT"
+  systemctl --user enable "$BEAT" >/dev/null
+  systemctl --user restart "$BEAT"
+fi
+
+# A monotonic timer (OnUnitActiveSec) can end up enabled+active with NO next
+# elapse when the service has not run recently — that is how a re-enabled timer
+# silently never fires. These use OnCalendar so it should not happen, but assert
+# it rather than trust it.
+if [[ -z "$(systemctl --user show "$TIMER" -p NextElapseUSecRealtime --value)" ]]; then
+  log "timer has no next elapse — priming by running the service once"
+  systemctl --user start "$SERVICE" || true
+fi
+
+# --- 5. post-activation assertions ---
+check "timer enabled" "$(systemctl --user is-enabled "$TIMER" 2>&1)" "enabled"
+check "timer active"  "$(systemctl --user is-active  "$TIMER" 2>&1)" "active"
+
+NEXT="$(systemctl --user show "$TIMER" -p NextElapseUSecRealtime --value)"
+if [[ -n "$NEXT" ]]; then log "OK    next elapse = $NEXT"; else log "FAIL  timer has no scheduled next run"; fail=1; fi
+
+if [[ -n "$HEAL_SERVICE" ]]; then
+  check "healer timer enabled" "$(systemctl --user is-enabled "$HEAL_TIMER" 2>&1)" "enabled"
+  check "healer timer active"  "$(systemctl --user is-active  "$HEAL_TIMER" 2>&1)" "active"
+  HEAL_NEXT="$(systemctl --user show "$HEAL_TIMER" -p NextElapseUSecMonotonic --value)"
+  HEAL_NEXT_NORMALIZED="$(printf '%s' "$HEAL_NEXT" | tr '[:upper:]' '[:lower:]')"
+  case "$HEAL_NEXT_NORMALIZED" in
+    ""|n/a|infinity|infinite|never|-)
+      log "FAIL  healer timer has no scheduled next run"; fail=1 ;;
+    *) log "OK    healer next elapse = $HEAL_NEXT" ;;
+  esac
+fi
+
 # The heartbeat is what the OTHER box reads to know this one is alive, so a
 # silently dead server here disables the peer's only view of this host.
 if [[ -n "${BEAT:-}" ]]; then
@@ -202,33 +322,6 @@ if [[ -n "${BEAT:-}" ]]; then
     else
       log "FAIL  heartbeat not reachable on $TSIP:8299"; fail=1
     fi
-  fi
-fi
-
-# Prove the installed scripts run without touching either live state file.
-PROBE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/watchdog-install.XXXXXX")"
-CHECK_PROBE_STATE="$PROBE_DIR/check-state.json"
-HEAL_PROBE_STATE="$PROBE_DIR/healer-state.json"
-cleanup_probe_dir() {
-  rm -f "$CHECK_PROBE_STATE" "$HEAL_PROBE_STATE"
-  rmdir "$PROBE_DIR" 2>/dev/null || true
-}
-trap cleanup_probe_dir EXIT
-
-if OUT="$(/usr/bin/python3 "$DEST/check.py" --dry-run --state-file "$CHECK_PROBE_STATE" 2>&1)"; then
-  log "OK    dry-run exited 0"
-  echo "$OUT" | sed 's/^/          /'
-else
-  log "FAIL  dry-run exited non-zero:"; echo "$OUT" | sed 's/^/          /'; fail=1
-fi
-
-if [[ -n "$HEAL_SERVICE" ]]; then
-  if OUT="$(/usr/bin/python3 "$DEST/self_heal.py" --dry-run --state-file "$HEAL_PROBE_STATE" 2>&1)"; then
-    log "OK    healer dry-run exited 0"
-    echo "$OUT" | sed 's/^/          /'
-  else
-    log "FAIL  healer dry-run exited non-zero:"
-    echo "$OUT" | sed 's/^/          /'; fail=1
   fi
 fi
 

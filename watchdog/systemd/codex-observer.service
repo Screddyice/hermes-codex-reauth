@@ -1,5 +1,5 @@
 [Unit]
-Description=Backstop watch — alert only when BOTH Hermes watchdogs are dark
+Description=Backstop watch for Hermes watchdogs without live peer coverage
 After=network-online.target tailscaled.service
 Wants=network-online.target
 # Any non-zero exit means the observer could not report through its own

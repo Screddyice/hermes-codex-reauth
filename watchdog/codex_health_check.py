@@ -114,10 +114,33 @@ def load_config(path: pathlib.Path) -> dict:
     # its auth store, because the wrong store yields a confident false "ok".
     observer = cfg.get("mode") == "observer"
     if observer:
-        if not cfg.get("peers"):
+        peers = cfg.get("peers")
+        if not peers:
             raise Disarmed(f"config {path} is an observer but watches no peers")
         if not cfg.get("host_label"):
             raise Disarmed(f"config {path} is missing required key 'host_label'")
+        labels = [peer.get("label") for peer in peers if isinstance(peer, dict)]
+        if len(labels) != len(peers) or any(not label for label in labels):
+            raise Disarmed(f"config {path} has an observer peer without a label")
+        if len(set(labels)) != len(labels):
+            raise Disarmed(f"config {path} has duplicate observer peer labels")
+        known = set(labels)
+        for peer in peers:
+            covered_by = peer.get("covered_by")
+            if covered_by is None:
+                continue
+            if not isinstance(covered_by, list) or any(
+                not isinstance(label, str) or not label for label in covered_by
+            ):
+                raise Disarmed(
+                    f"config {path} peer {peer['label']!r} has malformed covered_by"
+                )
+            unknown = set(covered_by) - known
+            if unknown or peer["label"] in covered_by:
+                raise Disarmed(
+                    f"config {path} peer {peer['label']!r} has unknown or self "
+                    "covered_by reference"
+                )
     else:
         if not cfg.get("hermes_home"):
             raise Disarmed(
@@ -357,9 +380,9 @@ def sibling_timers_ok(cfg: dict) -> tuple[str, str]:
 def read_peers(cfg: dict, fails: dict) -> tuple[str, str, dict]:
     """Watch one or more peers. ANY dark peer is reported.
 
-    The observer's rule is the opposite (see observe_peers): it stays quiet until
-    EVERY box is dark, because a live box already reports its own dark partner.
-    Here each peer is something nothing else watches, so each one counts.
+    The observer applies declared coverage (see observe_peers): it suppresses a
+    dark peer only when that peer names another watched peer whose heartbeat is
+    fresh. Here each peer is something nothing else watches, so each one counts.
 
     Accepts the older single ``peer`` object as well, so a host config that
     predates the list keeps working.
@@ -386,22 +409,23 @@ def read_peers(cfg: dict, fails: dict) -> tuple[str, str, dict]:
 
 
 def observe_peers(cfg: dict, fails: dict) -> tuple[str, str, dict]:
-    """Backstop for the one case the mutual watch cannot cover: BOTH boxes dark.
+    """Backstop for dark peers that have no proven-live watcher.
 
-    Alerts only when every watched peer is dark. While one box is still up, that
-    box already reports its dark partner, and a second alert for the same event is
-    the noise this repo keeps refusing to add.
+    Each peer may declare which other watched peers cover its lone outage. A
+    dark peer is suppressed only while one of those declared watchers has a
+    fresh heartbeat. Missing declarations preserve the older mutual-watch rule
+    by treating every other watched peer as a potential watcher.
 
-    Consequence worth stating: nothing watches the observer. If it dies, coverage
-    silently degrades to the mutual watch, which is where things stood before it
-    existed. It is a backstop, not a root of trust.
+    The observer itself remains covered by the TMN host's ordinary peer list;
+    this function chooses alert ownership only for the peers the observer reads.
     """
     peers = cfg.get("peers") or []
-    verdicts, dark, details = {}, [], []
+    verdicts, statuses, dark, details = {}, {}, [], []
     for peer in peers:
         label = peer.get("label") or peer.get("url", "peer")
         status, detail, n = read_peer({"peer": peer}, int(fails.get(label, 0)))
         verdicts[label] = n
+        statuses[label] = status
         details.append(f"{label}: {detail or status}")
         if status == "peer":
             dark.append(label)
@@ -409,6 +433,22 @@ def observe_peers(cfg: dict, fails: dict) -> tuple[str, str, dict]:
     if peers and len(dark) == len(peers):
         return "peer", ("every watched box is dark — " + "; ".join(details) +
                         ". Nothing is monitoring either Hermes bot."), verdicts
+    live = {label for label, status in statuses.items() if status == "ok"}
+    labels = set(statuses)
+    uncovered = []
+    for peer in peers:
+        label = peer.get("label") or peer.get("url", "peer")
+        if label not in dark:
+            continue
+        covered_by = peer.get("covered_by")
+        watchers = set(covered_by) if covered_by is not None else labels - {label}
+        if live.isdisjoint(watchers):
+            uncovered.append(label)
+    if uncovered:
+        return "peer", (
+            "watched box has no live coverage — "
+            + "; ".join(detail for detail in details if detail.split(":", 1)[0] in uncovered)
+        ), verdicts
     return "ok", "; ".join(details), verdicts
 
 

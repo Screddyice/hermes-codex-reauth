@@ -2628,6 +2628,180 @@ def test_installer_wires_healer_roles_without_adding_one_to_nebos():
     assert "healer OnFailure" in source
 
 
+def run_src_installer_scenario(
+    tmp_path,
+    *,
+    notifier_credentials=True,
+    heartbeat_reachable=True,
+    existing_artifacts=None,
+):
+    home = tmp_path / "home"
+    hermes_home = home / ".hermes"
+    hermes_home.mkdir(parents=True)
+    auth = healthy_singleton()
+    auth["providers"]["openai-codex"]["tokens"]["access_token"] = token_with_exp(
+        int(time.time()) + 3600
+    )
+    (hermes_home / "auth.json").write_text(json.dumps(auth))
+    (hermes_home / "config.yaml").write_text("model:\n  provider: openai-codex\n")
+
+    install_root = tmp_path / "watchdog"
+    shutil.copytree(WATCHDOG, install_root)
+    src_config_path = install_root / "hosts" / "src.json"
+    src_config = json.loads(src_config_path.read_text())
+    src_config["self_heal"].update(
+        write_test_hermes_contract(tmp_path / "installer-contract")
+    )
+    src_config_path.write_text(json.dumps(src_config))
+
+    dest = hermes_home / "codex-health"
+    unit_dir = home / ".config" / "systemd" / "user"
+    for relative, content in (existing_artifacts or {}).items():
+        root = unit_dir if relative.startswith("systemd/") else dest
+        target = root / relative.removeprefix("systemd/")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content)
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_state = tmp_path / "fake-systemd"
+    fake_state.mkdir()
+    (fake_state / "active.hermes-gateway.service").touch()
+    trace = tmp_path / "systemctl.trace"
+    systemctl = fake_bin / "systemctl"
+    systemctl.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$*\" >> \"$TRACE\"\n"
+        "[ \"$1\" = --user ] && shift\n"
+        "verb=$1\n"
+        "unit=${2:-}\n"
+        "case \"$verb\" in\n"
+        "  daemon-reload) exit 0 ;;\n"
+        "  is-enabled)\n"
+        "    if [ -f \"$FAKE_SYSTEMD_STATE/enabled.$unit\" ]; then echo enabled; else echo disabled; exit 1; fi ;;\n"
+        "  is-active)\n"
+        "    if [ -f \"$FAKE_SYSTEMD_STATE/active.$unit\" ]; then echo active; else echo inactive; exit 3; fi ;;\n"
+        "  enable) touch \"$FAKE_SYSTEMD_STATE/enabled.$unit\" ;;\n"
+        "  disable) rm -f \"$FAKE_SYSTEMD_STATE/enabled.$unit\" ;;\n"
+        "  start|restart) touch \"$FAKE_SYSTEMD_STATE/active.$unit\" ;;\n"
+        "  stop) rm -f \"$FAKE_SYSTEMD_STATE/active.$unit\" ;;\n"
+        "  show)\n"
+        "    case \"$*\" in\n"
+        "      *OnFailure*)\n"
+        "        case \"$unit\" in\n"
+        "          hermes-codex-self-heal.service) echo hermes-codex-self-heal-notify.service ;;\n"
+        "          *) echo hermes-codex-health-notify.service ;;\n"
+        "        esac ;;\n"
+        "      *NextElapseUSecRealtime*) echo 'Mon 2026-08-31 12:00:00 UTC' ;;\n"
+        "      *NextElapseUSecMonotonic*) echo '2min 30s' ;;\n"
+        "    esac ;;\n"
+        "esac\n"
+    )
+    systemctl.chmod(0o755)
+    commands = {
+        "loginctl": "#!/bin/sh\necho yes\n",
+        "tailscale": "#!/bin/sh\necho 100.79.251.126\n",
+        "curl": "#!/bin/sh\n[ \"$FAKE_HEARTBEAT_REACHABLE\" = 1 ]\n",
+    }
+    for name, body in commands.items():
+        command = fake_bin / name
+        command.write_text(body)
+        command.chmod(0o755)
+
+    env = os.environ.copy()
+    env.update({
+        "HOME": str(home),
+        "USER": "hermes",
+        "PATH": f"{fake_bin}:/usr/bin:/bin",
+        "TRACE": str(trace),
+        "FAKE_SYSTEMD_STATE": str(fake_state),
+        "FAKE_HEARTBEAT_REACHABLE": "1" if heartbeat_reachable else "0",
+    })
+    if notifier_credentials:
+        env.update({
+            "TELEGRAM_BOT_TOKEN": "test-token",
+            "TELEGRAM_HOME_CHANNEL": "123",
+        })
+    else:
+        env.pop("TELEGRAM_BOT_TOKEN", None)
+        env.pop("TELEGRAM_HOME_CHANNEL", None)
+
+    completed = subprocess.run(
+        ["/bin/bash", str(install_root / "install.sh"), "--host", "src"],
+        text=True,
+        capture_output=True,
+        env=env,
+        timeout=30,
+    )
+    return completed, trace.read_text(), dest, unit_dir, fake_state
+
+
+def test_installer_missing_notifier_credentials_never_activates_healer(tmp_path):
+    completed, trace, _, _, _ = run_src_installer_scenario(
+        tmp_path, notifier_credentials=False
+    )
+
+    assert completed.returncode == 1
+    assert "escalator cannot resolve" in completed.stdout
+    assert "enable hermes-codex-self-heal.timer" not in trace
+    assert "start hermes-codex-self-heal.timer" not in trace
+
+
+def test_installer_rolls_back_every_new_activation_after_late_failure(tmp_path):
+    completed, trace, _, _, fake_state = run_src_installer_scenario(
+        tmp_path, heartbeat_reachable=False
+    )
+
+    assert completed.returncode == 1
+    assert "heartbeat not reachable" in completed.stdout
+    for unit in (
+        "hermes-codex-health.timer",
+        "hermes-codex-self-heal.timer",
+        "hermes-codex-heartbeat.service",
+    ):
+        assert f"--user stop {unit}" in trace
+        assert f"--user disable {unit}" in trace
+        assert not (fake_state / f"active.{unit}").exists()
+        assert not (fake_state / f"enabled.{unit}").exists()
+
+
+def test_installer_retains_private_preoverwrite_restore_snapshot(tmp_path):
+    prior = {
+        "check.py": "old check\n",
+        "config.json": "old config\n",
+        "self_heal.py": "old healer\n",
+        "systemd/hermes-codex-health.service": "old check unit\n",
+        "systemd/hermes-codex-self-heal.timer": "old healer timer\n",
+    }
+    completed, _, dest, _, _ = run_src_installer_scenario(
+        tmp_path, existing_artifacts=prior
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    snapshots = list((dest / "install-backups").iterdir())
+    assert len(snapshots) == 1
+    snapshot = snapshots[0]
+    assert snapshot.name[:8].isdigit()
+    assert stat.S_IMODE(snapshot.stat().st_mode) == 0o700
+    assert (snapshot / "files" / "check.py").read_text() == "old check\n"
+    assert (snapshot / "files" / "config.json").read_text() == "old config\n"
+    assert (snapshot / "files" / "self_heal.py").read_text() == "old healer\n"
+    assert (
+        snapshot / "systemd" / "hermes-codex-health.service"
+    ).read_text() == "old check unit\n"
+    assert (
+        snapshot / "systemd" / "hermes-codex-self-heal.timer"
+    ).read_text() == "old healer timer\n"
+    backed_up = [
+        path for path in snapshot.rglob("*") if path.is_file()
+    ]
+    assert backed_up
+    assert all(stat.S_IMODE(path.stat().st_mode) == 0o600 for path in backed_up)
+    restore_map = (snapshot / "restore-map.tsv").read_text()
+    assert "files/check.py\t" + str(dest / "check.py") in restore_map
+    assert "systemd/hermes-codex-health.service\t" in restore_map
+
+
 @pytest.mark.parametrize(("heal_next", "expect_success"), [
     ("2min 30s", True),
     ("infinity", False),

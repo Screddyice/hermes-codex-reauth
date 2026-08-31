@@ -42,7 +42,7 @@ run a healer every 15 minutes.
 | `@Screddy_bot` codex | `~/.hermes/auth.json` | src (`hermes`) | Telegram + email |
 | `@Teamnebula_bot` codex | `~/.hermes/auth.json` | neb-ops-gcp (`shawn_teamnebula_ai`) | Slack `#tmn-ops` + email |
 | **NEBOS v2 Claude** | `CLAUDE_CODE_OAUTH_TOKEN` in `nebos-dev` Secret Manager | hermes-tmn (`screddy`) | Slack `#tmn-ops` + email |
-| **both Codex watchdogs** | the two heartbeats, over the tailnet | hermes-tmn (observer) | Telegram DM |
+| **uncovered Codex watchdog outage** | the two heartbeats, over the tailnet | hermes-tmn (observer) | Telegram DM |
 
 The two hosts use an interleaved half-cycle: TMN runs at 00/06/12/18:35, and src
 runs at 03/09/15/21:35. Each box gets a passive check every six hours. The
@@ -321,16 +321,19 @@ account, and no new signal type, because a dark peer is reported through the sam
 
 ### The backstop: hermes-tmn-observer
 
-Mutual watching leaves one hole — both boxes dark at once, with no one left to
-report it. The legacy `hermes-tmn` VM closes it. It is a third always-on host on the
-tailnet, it holds no Hermes credential and checks none, and it reads both
-heartbeats four times a day on `01,07,13,19:35`, offset from both Hermes hosts so
-a fleet-wide outage surfaces within about 90 minutes.
+The post-migration topology is asymmetric: `neb-ops-gcp` can watch `src` and the
+observer, but `src` cannot reach Team Nebula hosts. The legacy `hermes-tmn` VM
+closes the uncovered paths. It is a third always-on host on the tailnet, holds no
+Hermes credential, and reads both heartbeats four times a day on
+`01,07,13,19:35`, offset from both Hermes hosts.
 
-**It alerts only when EVERY watched box is dark.** While one box is up, that box
-already reports its dark partner, and a second alert for the same event is the
-noise this repo keeps refusing to add. A test pins that behaviour, and the drill
-below confirmed it live.
+Each observer peer declares `covered_by`, the other live peers that already own
+its lone outage. A dark `src` stays quiet while `neb-ops-gcp` has a fresh
+heartbeat because the TMN watchdog reports it. A dark `neb-ops-gcp` alerts from
+the observer even while `src` is fresh because `src` has no route back into the
+Team Nebula tailnet. If both are dark, the observer alerts for the combined
+outage. Malformed, self-referential, or unknown coverage declarations disarm the
+observer instead of guessing.
 
 It alerts by Telegram DM, and that is a deliberate choice of secret: the observer
 needed some credential, and a bot token can only speak as a bot Shawn owns, where
@@ -468,10 +471,17 @@ Copy the repository to the target and run the installer as that role's user.
 Targets do not run `git pull`. Install peer key material and pinned host keys
 before installing a role whose config names peers.
 
-The installer preserves `state.json`, `self-heal-state.json`, and `backups/`. It
-checks check and healer timer enablement, active state, next elapses,
-`OnFailure=`, linger, heartbeat reachability, notifier credentials, and isolated
-dry-runs before it reports success.
+The installer preserves `state.json`, `self-heal-state.json`, and `backups/`.
+Before overwrite, it copies every existing deployed script, config, and unit file
+into a private timestamped `install-backups/` snapshot and writes
+`restore-map.tsv` with each retained source and deployment target.
+
+Before it enables or starts a unit, the installer checks healer readiness,
+`OnFailure=`, linger, notifier credentials, and isolated check and healer
+dry-runs. A failed preflight activates nothing. After preflight, it tracks each
+unit that was disabled or inactive before the run. A later failure stops and
+disables only those newly activated units. Timer state, next elapses, and
+heartbeat reachability remain post-activation success gates.
 
 ## Verify
 
@@ -554,7 +564,10 @@ Run the probe by hand when you need live headroom. Keep it off healthy schedules
 
 1. Create the role's `SELF_HEAL_PAUSED` file.
 2. Disable the role's healer timer with `systemctl --user disable --now <timer>`.
-3. Restore the prior scripts and unit files from the install backup.
+3. Select the newest private snapshot under the role's
+   `install-backups/<UTC timestamp>.<suffix>/` directory. Use
+   `restore-map.tsv` to restore files from its `files/` and `systemd/`
+   directories to the listed targets.
 4. Run `systemctl --user daemon-reload`.
 5. Restart the original health timer and heartbeat service.
 6. Verify their active state and next elapse before removing the maintenance lock.

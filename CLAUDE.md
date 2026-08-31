@@ -62,9 +62,12 @@ is precisely the class of mistake this repo exists to catch. There is a test.
 **A local failure outranks the peer watch.** The peer is only consulted when this
 box's own verdict is `ok`. Reporting a dark peer while this box's credential is
 broken buries the more urgent problem.
-**The observer alerts only when EVERY peer is dark.** While one Hermes box is up
-it reports its dark partner, so an alert from `hermes-tmn-observer` would page
-twice for one event. Widening it to "any peer dark" adds noise.
+**The observer alerts only for a dark peer without declared live coverage.**
+`neb-ops-gcp` owns lone `src` and observer outages, so a fresh TMN heartbeat
+suppresses the observer's duplicate `src` page. `src` cannot watch Team Nebula,
+so a lone dark `neb-ops-gcp` must alert from the observer. Coverage references
+must name another committed observer peer; malformed, self, or unknown references
+disarm the check.
 
 **Observer mode is not a loophole in the `hermes_home` rule.** It is exempt purely
 because it inspects no credential; any config without `mode: observer` must still
