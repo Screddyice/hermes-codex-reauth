@@ -6,6 +6,7 @@ import importlib.util
 import json
 import pathlib
 import stat
+import subprocess
 import sys
 import time
 import traceback
@@ -43,7 +44,8 @@ class ScriptedRunner:
         self.timeouts.append(timeout)
         if not self.results:
             raise AssertionError(f"unexpected command: {argv}")
-        return self.results.pop(0)
+        scripted = self.results.pop(0)
+        return scripted(argv, timeout) if callable(scripted) else scripted
 
 
 def local_cfg():
@@ -58,6 +60,382 @@ def local_cfg():
             "peers": [],
         },
     }
+
+
+def token_with_exp(exp: int) -> str:
+    claims = {
+        "https://api.openai.com/auth": {"chatgpt_account_id": "acct"},
+        "exp": exp,
+    }
+    payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+    return f"h.{payload}.s"
+
+
+def healthy_singleton():
+    return {"providers": {"openai-codex": {"tokens": {
+        "access_token": token_with_exp(2000), "refresh_token": "refresh"
+    }}}}
+
+
+def expired_refreshable_singleton():
+    return {"providers": {"openai-codex": {"tokens": {
+        "access_token": token_with_exp(900), "refresh_token": "refresh"
+    }}}}
+
+
+def dead_singleton():
+    return {"providers": {"openai-codex": {
+        "tokens": {"access_token": token_with_exp(900), "refresh_token": ""},
+        "last_auth_error": {"code": "refresh_token_reused", "relogin_required": True,
+                            "at": "2026-08-31T00:00:00Z"},
+        "last_refresh": "2026-08-30T00:00:00Z",
+    }}}
+
+
+def fully_blocked_pool(reset_at: int):
+    return {"credential_pool": {"openai-codex": [{
+        "id": "quota", "label": "quota", "auth_type": "oauth",
+        "access_token": token_with_exp(3000), "refresh_token": "refresh",
+        "last_status": "exhausted", "last_error_code": 429,
+        "last_error_reset_at": reset_at,
+    }]}}
+
+
+def stale_singleton_with_healthy_manual_pool():
+    auth = dead_singleton()
+    auth["credential_pool"] = {"openai-codex": [{
+        "id": "manual", "label": "manual", "source": "manual:oauth",
+        "auth_type": "oauth", "access_token": token_with_exp(3000),
+        "refresh_token": "manual-refresh", "last_status": "ok", "priority": 1,
+    }]}
+    return auth
+
+
+@pytest.mark.parametrize(("auth", "now", "expected"), [
+    (healthy_singleton(), 1000, "none"),
+    (expired_refreshable_singleton(), 1000, "warmup"),
+    (dead_singleton(), 1000, "human_2fa"),
+    (fully_blocked_pool(reset_at=2000), 1000, "wait_quota"),
+    (fully_blocked_pool(reset_at=2000), 2000, "warmup"),
+    (stale_singleton_with_healthy_manual_pool(), 1000, "warmup"),
+])
+def test_credential_action(auth, now, expected):
+    assert healer.credential_action(auth, now) == expected
+
+
+def test_quota_without_a_renewable_credential_requires_human_2fa():
+    auth = fully_blocked_pool(reset_at=2000)
+    auth["credential_pool"]["openai-codex"][0]["refresh_token"] = ""
+
+    assert healer.credential_action(auth, 1000) == "human_2fa"
+
+
+@pytest.mark.parametrize("code", [
+    "refresh_token_reused",
+    "invalid_grant",
+    "token_revoked",
+    "token_invalidated",
+    "invalid_token",
+    "dead",
+])
+def test_terminal_credential_codes_require_human_2fa(code):
+    auth = healthy_singleton()
+    auth["providers"]["openai-codex"]["last_auth_error"] = {"code": code}
+
+    assert healer.credential_action(auth, 1000) == "human_2fa"
+
+
+def test_healthy_pool_alternate_replaces_a_terminal_entry():
+    auth = {"credential_pool": {"openai-codex": [
+        {
+            "id": "dead", "last_status": "dead", "last_error_code": "invalid_grant",
+            "access_token": token_with_exp(900), "refresh_token": "",
+            "priority": 0,
+        },
+        {
+            "id": "manual", "source": "manual:oauth", "last_status": "ok",
+            "access_token": token_with_exp(3000), "refresh_token": "manual-refresh",
+            "priority": 1,
+        },
+    ]}}
+
+    assert healer.credential_action(auth, 1000) == "warmup"
+
+
+def test_backup_is_private_and_retains_five_newest(tmp_path):
+    auth = tmp_path / "auth.json"
+    auth.write_text('{"providers": {}}')
+    backups = tmp_path / "backups"
+    for now in range(1000, 1006):
+        path = healer.backup_auth(auth, backups, now)
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert len(list(backups.glob("*-auth.json"))) == 5
+
+
+def test_warmup_is_pinned_safe_and_bounded():
+    runner = ScriptedRunner([result(0, "OK")])
+    outcome = healer.run_hermes_warmup(local_cfg(), runner)
+    assert outcome.returncode == 0
+    assert runner.calls == [[
+        "hermes", "--safe-mode", "--provider", "openai-codex",
+        "-m", "openai-codex/gpt-5.5", "-z", "Reply with exactly: OK"
+    ]]
+    assert runner.timeouts == [120]
+
+
+def test_warmup_runtime_kills_process_group_on_timeout(monkeypatch):
+    events = []
+
+    class TimedOutProcess:
+        pid = 4321
+        returncode = None
+
+        def communicate(self, timeout=None):
+            events.append(("communicate", timeout))
+            if timeout is not None:
+                raise subprocess.TimeoutExpired("hermes", timeout)
+            self.returncode = -9
+            return "", "timed out"
+
+    def fake_popen(argv, **kwargs):
+        events.append(("popen", list(argv), kwargs))
+        return TimedOutProcess()
+
+    monkeypatch.setattr(healer.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(healer.os, "killpg", lambda pid, sig: events.append(("killpg", pid, sig)))
+
+    outcome = healer.run_command(["hermes"], timeout=120)
+
+    assert outcome.returncode != 0
+    assert events[0][2]["start_new_session"] is True
+    assert [event[0] for event in events] == ["popen", "communicate", "killpg", "communicate"]
+
+
+def write_auth(tmp_path, auth):
+    path = tmp_path / "auth.json"
+    path.write_text(json.dumps(auth))
+    return path
+
+
+def write_cfg(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(local_cfg()))
+    return path
+
+
+def test_expired_credential_is_backed_up_warmed_restarted_and_probed_once(tmp_path):
+    auth_path = write_auth(tmp_path, expired_refreshable_singleton())
+    cfg_path = write_cfg(tmp_path)
+
+    def warmup_after_backup(_argv, _timeout):
+        snapshots = list((tmp_path / "backups").glob("*-auth.json"))
+        assert len(snapshots) == 1
+        assert stat.S_IMODE(snapshots[0].stat().st_mode) == 0o600
+        return result(0, "OK")
+
+    runner = ScriptedRunner([
+        warmup_after_backup,
+        result(0),
+        result(0, "active"),
+        result(0, "OK"),
+    ])
+
+    ok, detail = healer.repair_credential(
+        local_cfg(), cfg_path, auth_path, {"faults": {}}, runner, 1000, False
+    )
+
+    assert ok is True
+    assert "verified" in detail
+    assert runner.calls == [
+        ["hermes", "--safe-mode", "--provider", "openai-codex",
+         "-m", "openai-codex/gpt-5.5", "-z", "Reply with exactly: OK"],
+        ["systemctl", "--user", "restart", "hermes-gateway.service"],
+        ["systemctl", "--user", "is-active", "hermes-gateway.service"],
+        [sys.executable, str(WATCHDOG / "codex_auth_probe.py"),
+         "--config", str(cfg_path)],
+    ]
+    assert runner.timeouts == [120, 20, 20, 40]
+
+
+def test_terminal_credential_requires_human_2fa_without_mutation(tmp_path):
+    auth_path = write_auth(tmp_path, dead_singleton())
+    state = {"faults": {}}
+    runner = ScriptedRunner([])
+
+    ok, detail = healer.repair_credential(
+        local_cfg(), write_cfg(tmp_path), auth_path, state, runner, 1000, False
+    )
+
+    assert ok is False
+    assert "human 2FA" in detail
+    assert runner.calls == []
+    assert not (tmp_path / "backups").exists()
+    assert state == {"faults": {}}
+
+
+def test_quota_before_reset_makes_no_request_and_leaves_state_unchanged(tmp_path):
+    auth_path = write_auth(tmp_path, fully_blocked_pool(reset_at=2000))
+    state = {"faults": {}}
+    runner = ScriptedRunner([])
+
+    ok, detail = healer.repair_credential(
+        local_cfg(), write_cfg(tmp_path), auth_path, state, runner, 1000, False
+    )
+
+    assert ok is True
+    assert "2000" in detail
+    assert runner.calls == []
+    assert not (tmp_path / "backups").exists()
+    assert state == {"faults": {}}
+
+
+def test_quota_at_reset_gets_only_one_attempt_for_that_window(tmp_path):
+    auth_path = write_auth(tmp_path, fully_blocked_pool(reset_at=2000))
+    cfg_path = write_cfg(tmp_path)
+    state = {"faults": {}}
+    runner = ScriptedRunner([
+        result(0, "OK"), result(0), result(0, "active"), result(0, "OK")
+    ])
+
+    first_ok, _ = healer.repair_credential(
+        local_cfg(), cfg_path, auth_path, state, runner, 2000, False
+    )
+    second_runner = ScriptedRunner([])
+    second_ok, second_detail = healer.repair_credential(
+        local_cfg(), cfg_path, auth_path, state, second_runner, 2001, False
+    )
+
+    assert first_ok is True
+    assert second_ok is True
+    assert "already attempted" in second_detail
+    assert state["quota_attempt_reset_at"] == 2000
+    assert len([call for call in runner.calls if call[0] == "hermes"]) == 1
+    assert len([call for call in runner.calls if "codex_auth_probe.py" in call[1]]) == 1
+    assert second_runner.calls == []
+
+
+def test_fresh_probe_quota_records_new_reset_without_second_request(tmp_path):
+    auth_path = write_auth(tmp_path, fully_blocked_pool(reset_at=2000))
+    cfg_path = write_cfg(tmp_path)
+    state = {"faults": {}}
+
+    def warmup_records_next_reset(_argv, _timeout):
+        auth_path.write_text(json.dumps(fully_blocked_pool(reset_at=3000)))
+        return result(0, "QUOTA")
+
+    runner = ScriptedRunner([
+        warmup_records_next_reset,
+        result(0),
+        result(0, "active"),
+        result(3, "QUOTA"),
+    ])
+
+    ok, detail = healer.repair_credential(
+        local_cfg(), cfg_path, auth_path, state, runner, 2000, False
+    )
+
+    assert ok is True
+    assert "3000" in detail
+    assert state["quota_attempt_reset_at"] == 2000
+    assert state["quota_reset_at"] == 3000
+    assert len([call for call in runner.calls if call[0] == "hermes"]) == 1
+    assert len([call for call in runner.calls if "codex_auth_probe.py" in call[1]]) == 1
+    assert len(runner.calls) == 4
+
+    next_runner = ScriptedRunner([
+        result(0), result(0), result(0, "active"), result(0)
+    ])
+    next_ok, _ = healer.repair_credential(
+        local_cfg(), cfg_path, auth_path, state, next_runner, 3000, False
+    )
+
+    assert next_ok is True
+    assert len([call for call in next_runner.calls if call[0] == "hermes"]) == 1
+    assert len([call for call in next_runner.calls if "codex_auth_probe.py" in call[1]]) == 1
+
+
+def test_unknown_probe_marks_verification_failure_and_preserves_backup(tmp_path):
+    auth_path = write_auth(tmp_path, expired_refreshable_singleton())
+    runner = ScriptedRunner([
+        result(0, "OK"), result(0), result(0, "active"), result(2, "UNKNOWN")
+    ])
+
+    ok, detail = healer.repair_credential(
+        local_cfg(), write_cfg(tmp_path), auth_path, {"faults": {}},
+        runner, 1000, False
+    )
+
+    assert ok is False
+    assert "verification failed" in detail
+    assert len(list((tmp_path / "backups").glob("*-auth.json"))) == 1
+    assert len([call for call in runner.calls if "codex_auth_probe.py" in call[1]]) == 1
+
+
+def test_broken_probe_uses_exit_code_even_when_output_says_ok(tmp_path):
+    auth_path = write_auth(tmp_path, expired_refreshable_singleton())
+    runner = ScriptedRunner([
+        result(0), result(0), result(0, "active"), result(1, "OK")
+    ])
+
+    ok, detail = healer.repair_credential(
+        local_cfg(), write_cfg(tmp_path), auth_path, {"faults": {}},
+        runner, 1000, False
+    )
+
+    assert ok is False
+    assert "human 2FA" in detail
+
+
+def test_warmup_failure_redacts_and_caps_output_while_preserving_backup(tmp_path):
+    auth_path = write_auth(tmp_path, expired_refreshable_singleton())
+    token = token_with_exp(9999)
+    runner = ScriptedRunner([result(1, f"Bearer {token} " + "x" * 1000)])
+
+    ok, detail = healer.repair_credential(
+        local_cfg(), write_cfg(tmp_path), auth_path, {"faults": {}},
+        runner, 1000, False
+    )
+
+    assert ok is False
+    assert token not in detail
+    assert len(detail) <= 500
+    assert len(list((tmp_path / "backups").glob("*-auth.json"))) == 1
+    assert len(runner.calls) == 1
+
+
+def test_credential_repair_rereads_auth_before_gateway_restart(tmp_path):
+    auth_path = write_auth(tmp_path, expired_refreshable_singleton())
+
+    def warmup_leaves_terminal_singleton(_argv, _timeout):
+        auth_path.write_text(json.dumps(dead_singleton()))
+        return result(0)
+
+    runner = ScriptedRunner([warmup_leaves_terminal_singleton])
+
+    ok, detail = healer.repair_credential(
+        local_cfg(), write_cfg(tmp_path), auth_path, {"faults": {}},
+        runner, 1000, False
+    )
+
+    assert ok is False
+    assert "recoverable credential" in detail
+    assert len(runner.calls) == 1
+
+
+def test_credential_dry_run_has_no_commands_backup_or_state_changes(tmp_path):
+    auth_path = write_auth(tmp_path, expired_refreshable_singleton())
+    state = {"faults": {}}
+    runner = ScriptedRunner([])
+
+    ok, detail = healer.repair_credential(
+        local_cfg(), write_cfg(tmp_path), auth_path, state, runner, 1000, True
+    )
+
+    assert ok is True
+    assert detail.startswith("dry-run:")
+    assert runner.calls == []
+    assert not (tmp_path / "backups").exists()
+    assert state == {"faults": {}}
 
 
 def test_disabled_timer_is_enabled_started_and_verified():
