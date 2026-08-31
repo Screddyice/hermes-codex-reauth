@@ -134,7 +134,7 @@ fi
 if [[ -n "$HEAL_SERVICE" ]]; then
   check "healer timer enabled" "$(systemctl --user is-enabled "$HEAL_TIMER" 2>&1)" "enabled"
   check "healer timer active"  "$(systemctl --user is-active  "$HEAL_TIMER" 2>&1)" "active"
-  HEAL_NEXT="$(systemctl --user show "$HEAL_TIMER" -p NextElapseUSecRealtime --value)"
+  HEAL_NEXT="$(systemctl --user show "$HEAL_TIMER" -p NextElapseUSecMonotonic --value)"
   if [[ -n "$HEAL_NEXT" ]]; then
     log "OK    healer next elapse = $HEAL_NEXT"
   else

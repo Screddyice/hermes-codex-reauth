@@ -1007,6 +1007,7 @@ def load_config(path: pathlib.Path) -> dict:
         raise Disarmed("peer repair allowlist is invalid")
     for peer in peers:
         validate_peer(peer)
+        _validate_stale_after(peer)
 
     observer = cfg.get("mode") == "observer"
     if observer:

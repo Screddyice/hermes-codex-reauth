@@ -1494,6 +1494,35 @@ def test_cli_invokes_peer_handler_and_persists_peer_state(tmp_path, monkeypatch)
     assert saved["faults"]["peer.neb-ops-gcp"]["alerted"] is True
 
 
+def test_cli_rejects_bad_peer_stale_threshold_before_any_boundary(
+    tmp_path, monkeypatch
+):
+    peer = valid_peer(tmp_path / "peer", label="neb-ops-gcp")
+    peer["stale_after_s"] = "soon"
+    cfg_path = write_cli_config(tmp_path, peers=[peer])
+    state_path = tmp_path / "self-heal-state.json"
+    calls = []
+
+    def forbidden(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("malformed config crossed a healer boundary")
+
+    monkeypatch.setattr(healer, "repair_health_timer", forbidden)
+    monkeypatch.setattr(healer, "repair_gateway", forbidden)
+    monkeypatch.setattr(healer, "repair_credential", forbidden)
+    monkeypatch.setattr(healer, "handle_peer", forbidden)
+    monkeypatch.setattr(healer, "run_command", forbidden)
+    monkeypatch.setattr(healer, "peer_heartbeat", forbidden)
+    monkeypatch.setattr(healer, "backup_auth", forbidden)
+    monkeypatch.setattr(healer, "save_state", forbidden)
+
+    with pytest.raises(healer.Disarmed, match="stale threshold"):
+        healer.run(CliArgs(cfg_path, state_path))
+
+    assert calls == []
+    assert not state_path.exists()
+
+
 def test_cli_dry_run_has_no_state_command_network_backup_or_credential_mutation(
     tmp_path, monkeypatch
 ):
@@ -1705,7 +1734,12 @@ def test_installer_preserves_healer_state_and_backups_and_checks_runtime(
         "          hermes-codex-self-heal.service) echo hermes-codex-health-notify.service ;;\n"
         "          *) echo hermes-codex-health-notify.service ;;\n"
         "        esac ;;\n"
-        "      *) echo 'Mon 2026-08-31 12:00:00 UTC' ;;\n"
+        "      *NextElapseUSecRealtime*)\n"
+        "        case \"$2\" in\n"
+        "          *self-heal*.timer) : ;;\n"
+        "          *) echo 'Mon 2026-08-31 12:00:00 UTC' ;;\n"
+        "        esac ;;\n"
+        "      *NextElapseUSecMonotonic*) echo '2min 30s' ;;\n"
         "    esac ;;\n"
         "esac\n"
     )
@@ -1746,6 +1780,10 @@ def test_installer_preserves_healer_state_and_backups_and_checks_runtime(
     assert "enable hermes-codex-self-heal.timer" in trace_text
     assert "start hermes-codex-self-heal.timer" in trace_text
     assert "show hermes-codex-self-heal.timer" in trace_text
+    assert (
+        "show hermes-codex-self-heal.timer -p NextElapseUSecMonotonic --value"
+        in trace_text
+    )
     assert "show hermes-codex-self-heal.service -p OnFailure --value" in trace_text
     assert "healer dry-run exited 0" in completed.stdout
 
