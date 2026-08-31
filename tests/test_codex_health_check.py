@@ -18,6 +18,7 @@ import base64
 import importlib.util
 import json
 import pathlib
+import sys
 import time
 
 import pytest
@@ -28,6 +29,7 @@ WATCHDOG = REPO / "watchdog"
 
 
 def _load(name: str):
+    sys.path.insert(0, str(WATCHDOG))
     spec = importlib.util.spec_from_file_location(name, WATCHDOG / f"{name}.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -423,7 +425,8 @@ def test_quota_reset_parsed_from_the_python_repr_body():
     reset = int(time.time()) + 1234
     e = {"last_status": "exhausted", "last_error_code": 429,
          "last_error_message": "Error code: 429 - {'error': {'resets_at': %d}}" % reset}
-    assert chk._reset_at_of(e) == float(reset)
+    import auth_state
+    assert auth_state.reset_at_of(e) == float(reset)
 
 
 def test_quota_alert_never_offers_the_reauth_link():

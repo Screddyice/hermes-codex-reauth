@@ -66,13 +66,16 @@ import time
 import urllib.error
 import urllib.request
 
+from auth_state import (
+    PROVIDER,
+    QUOTA_STALE_S,
+    entry_quota_blocked,
+    quota_blocked,
+    renewable_pool_entries,
+)
+
 HOME = pathlib.Path.home()
 HERE = pathlib.Path(__file__).resolve().parent
-PROVIDER = "openai-codex"
-# A pooled credential whose last error is older than this, with no reset time to
-# judge by, is not evidence of a current block. A live exhaustion re-stamps
-# last_status_at on every attempt, so a fresh outage always clears this bar.
-QUOTA_STALE_S = 6 * 3600
 COMPOSIO_EXEC = "https://backend.composio.dev/api/v3/tools/execute/GMAIL_SEND_EMAIL"
 LINEAR_URL = "https://api.linear.app/graphql"
 SLACK_URL = "https://slack.com/api/chat.postMessage"
@@ -223,93 +226,6 @@ def plan_of(access_token: str) -> str:
     except Exception:
         return ""
     return str((claims.get("https://api.openai.com/auth") or {}).get("chatgpt_plan_type") or "")
-
-
-def _reset_at_of(entry: dict):
-    """When the quota window rolls, from the 429 body Hermes stored verbatim.
-
-    The body is a Python repr of OpenAI's JSON, not JSON, so it is matched rather
-    than parsed. ``resets_at`` is the only authority worth trusting here: it is
-    what distinguishes "blocked right now" from "was blocked last week".
-    """
-    explicit = entry.get("last_error_reset_at")
-    if explicit:
-        try:
-            return float(explicit)
-        except (TypeError, ValueError):
-            pass
-    m = re.search(r"['\"]resets_at['\"]\s*:\s*(\d{9,})", str(entry.get("last_error_message") or ""))
-    return float(m.group(1)) if m else None
-
-
-def _entry_quota_blocked(entry: dict, now: float, stale_s: int) -> tuple[bool, float | None]:
-    """Is this one pooled credential currently refused for quota?"""
-    status = str(entry.get("last_status") or "").lower()
-    code = str(entry.get("last_error_code") or "")
-    msg = str(entry.get("last_error_message") or "").lower()
-    looks_quota = status == "exhausted" or (
-        code == "429" and ("usage_limit" in msg or "usage limit" in msg))
-    if not looks_quota:
-        return False, None
-
-    reset = _reset_at_of(entry)
-    if reset is not None:
-        # Authoritative in both directions: still blocked until it rolls, and
-        # definitively clear afterwards, so a spent window stops paging by itself.
-        return reset > now, reset
-
-    try:
-        at = float(entry.get("last_status_at") or 0)
-    except (TypeError, ValueError):
-        at = 0.0
-    return (now - at) <= stale_s, None
-
-
-def quota_blocked(auth: dict, now: float | None = None,
-                  stale_s: int = QUOTA_STALE_S) -> tuple[bool, str]:
-    """True when EVERY pooled Codex credential is refused for quota.
-
-    The pool is a failover set, so one usable entry means the gateway can still
-    answer and there is nothing to page about. Only a fully blocked pool stops
-    the bot.
-    """
-    pool = (auth.get("credential_pool") or {}).get(PROVIDER) or []
-    if not pool:
-        return False, ""
-
-    now = time.time() if now is None else now
-    blocked = []
-    for entry in pool:
-        is_blocked, reset = _entry_quota_blocked(entry, now, stale_s)
-        if not is_blocked:
-            return False, ""
-        blocked.append((entry, reset))
-
-    labels = ", ".join(str(e.get("label") or e.get("id") or "?") for e, _ in blocked)
-    resets = [r for _, r in blocked if r]
-    when = (time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(max(resets)))
-            if resets else "unknown")
-    plural = "s" if len(blocked) > 1 else ""
-    return True, (f"{len(blocked)} pooled credential{plural} out of quota ({labels}); "
-                  f"window resets {when}")
-
-
-def renewable_pool_entries(auth: dict) -> list[dict]:
-    """Pooled credentials Hermes can still refresh and route through.
-
-    A populated credential pool is Hermes' runtime source of truth. The legacy
-    providers block can retain a terminal refresh error after a manual pooled
-    credential has taken over, so mixing the two sources produces false pages.
-    """
-    pool = (auth.get("credential_pool") or {}).get(PROVIDER) or []
-    renewable = []
-    for entry in pool:
-        tokens = entry.get("tokens") or entry
-        if str(entry.get("last_status") or "").lower() == "dead":
-            continue
-        if tokens.get("refresh_token"):
-            renewable.append(entry)
-    return sorted(renewable, key=lambda entry: int(entry.get("priority") or 0))
 
 
 def write_heartbeat(path: pathlib.Path, cfg: dict, status: str) -> None:
@@ -528,7 +444,7 @@ def detect(auth_path: pathlib.Path, gateway_unit: str) -> tuple[str, str]:
                             "pooled credential")
         now = time.time()
         active = next((entry for entry in renewable
-                       if not _entry_quota_blocked(entry, now, QUOTA_STALE_S)[0]),
+                       if not entry_quota_blocked(entry, now, QUOTA_STALE_S)[0]),
                       renewable[0])
         prov = active
 
