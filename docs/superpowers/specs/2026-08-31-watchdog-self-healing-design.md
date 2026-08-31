@@ -1,9 +1,11 @@
 # Watchdog Self-Healing Design
 
 **Date:** 2026-08-31  
-**Status:** Approved scope, pending implementation plan  
+**Status:** Approved; implementation plan ready  
 **Branch:** `fix/watchdog-post-migration-topology`  
 **PR:** `Screddyice/hermes-codex-reauth#29`
+
+**Plan:** `docs/superpowers/plans/2026-08-31-watchdog-self-healing.md`
 
 ## Problem
 
