@@ -1913,6 +1913,75 @@ def test_credential_refresh_cycle_restarts_gateway_at_most_once(
     assert refresh_index < restart_indexes[0]
 
 
+def test_due_quota_refresh_failed_restart_persists_only_pending_state(
+    tmp_path, monkeypatch
+):
+    cfg_path = write_cli_config(tmp_path)
+    cfg = json.loads(cfg_path.read_text())
+    auth_path = pathlib.Path(cfg["hermes_home"]) / "auth.json"
+    auth_path.write_text(json.dumps(fully_blocked_pool(reset_at=3000)))
+    state_path = tmp_path / "self-heal-state.json"
+    state_path.write_text(json.dumps({
+        "faults": {},
+        "credential_refresh_attempt": {
+            "lineage": "pool:quota",
+            "refresh_fingerprint": hashlib.sha256(b"refresh").hexdigest(),
+            "started_at": 2000,
+            "status": "quota",
+            "reset_at": 3000,
+        },
+        "quota_attempt_reset_at": 2000,
+        "quota_reset_at": 3000,
+        "quota_retry_action": "refresh",
+    }))
+    calls = []
+
+    monkeypatch.setattr(healer.time, "time", lambda: 3000)
+    monkeypatch.setattr(
+        healer, "run_refresh_readiness",
+        lambda *_args, **_kwargs: result(0, '{"status":"ready"}'),
+    )
+    monkeypatch.setattr(
+        healer, "repair_health_timer",
+        lambda *_args, **_kwargs: (True, "timer healthy"),
+    )
+
+    def runner(argv, _timeout):
+        calls.append(list(argv))
+        if argv == ["systemctl", "--user", "is-active", "hermes-gateway.service"]:
+            return result(1, "inactive")
+        if argv == ["systemctl", "--user", "restart", "hermes-gateway.service"]:
+            return result(1, stderr="restart failed")
+        if "--plan" in argv:
+            return planned("pool:quota")
+        if "--refresh" in argv:
+            recovered = healthy_singleton()
+            recovered["providers"]["openai-codex"]["tokens"][
+                "access_token"
+            ] = token_with_exp(5000)
+            auth_path.write_text(json.dumps(recovered))
+            return persisted()
+        raise AssertionError(f"unexpected command: {argv}")
+
+    monkeypatch.setattr(healer, "run_command", runner)
+
+    assert healer.run(CliArgs(cfg_path, state_path)) == 1
+
+    state = healer.load_state(state_path)
+    assert state["credential_pending_phase"] == "gateway_restart"
+    assert state["credential_refresh_attempt"]["status"] == "persisted"
+    assert state["quota_attempt_reset_at"] == 3000
+    assert "quota_reset_at" not in state
+    assert "quota_retry_action" not in state
+    assert state["faults"]["local.credential"]["last_attempt"] == 3000
+    assert "local.gateway" not in state["faults"]
+    assert len([call for call in calls if "--refresh" in call]) == 1
+    assert calls.count([
+        "systemctl", "--user", "restart", "hermes-gateway.service"
+    ]) == 1
+    assert not any("codex_auth_probe.py" in part for call in calls for part in call)
+
+
 def test_failed_credential_owned_restart_persists_pending_gateway_phase(
     tmp_path, monkeypatch
 ):

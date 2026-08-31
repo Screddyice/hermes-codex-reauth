@@ -1125,7 +1125,7 @@ git diff --check
 
 Expected: each command exits zero.
 
-- [x] **Step 5: Run local-first fusion on the pure decision unit**
+- [ ] **Step 5: Run local-first fusion on the pure decision unit**
 
 Extract `credential_action` and its table-driven cases to task files under the projectless `work/` directory. Run:
 
@@ -1134,6 +1134,10 @@ llmjury solve --task "$task_file" --cases "$cases_file" --entry-point credential
 ```
 
 Accept the result only when exit code is zero and JSON contains `"verified": true`. Record any OpenRouter escalation and winning model in the PR body.
+
+The urgent Fusion run was interrupted and remains unverified. It produced no
+accepted candidate and no winning model. Run this step again before claiming
+Fusion passed or marking the PR ready.
 
 - [x] **Step 6: Review the final diff against the spec**
 

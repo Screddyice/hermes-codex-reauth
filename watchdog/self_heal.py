@@ -608,6 +608,8 @@ def repair_credential(
         return False, _bounded_detail(
             f"no recoverable credential after refresh; backup retained at {backup_path}"
         )
+    state.pop("quota_reset_at", None)
+    state.pop("quota_retry_action", None)
     state["credential_pending_phase"] = "gateway_restart"
     persist_state()
     return _resume_credential_pending(
