@@ -888,6 +888,21 @@ def test_peer_validation_rejects_non_tailnet_addresses(tmp_path, ip):
         healer.validate_peer(peer)
 
 
+@pytest.mark.parametrize(("field", "value"), [
+    ("health_timer", "--no-block.timer"),
+    ("check_service", "--system.service"),
+    ("heartbeat_service", "--wait.service"),
+])
+def test_peer_validation_rejects_units_that_can_become_systemctl_options(
+    tmp_path, field, value
+):
+    peer = valid_peer(tmp_path)
+    peer[field] = value
+
+    with pytest.raises(healer.Disarmed):
+        healer.validate_peer(peer)
+
+
 def test_peer_validation_requires_tailnet_and_private_identity(tmp_path):
     identity = tmp_path / "id_ed25519"
     identity.write_text("test key path")
@@ -897,6 +912,7 @@ def test_peer_validation_requires_tailnet_and_private_identity(tmp_path):
     peer = {
         "label": "neb-ops-gcp", "ip": "100.74.25.61", "ssh_user": "hermes",
         "identity_file": str(identity), "known_hosts": str(known_hosts),
+        "maintenance_lock": "/home/hermes/.hermes/codex-health/SELF_HEAL_PAUSED",
         "health_timer": "hermes-codex-health-tmn.timer",
         "check_service": "hermes-codex-health-tmn.service",
         "heartbeat_service": "hermes-codex-heartbeat-tmn.service",
@@ -908,6 +924,25 @@ def test_peer_validation_requires_tailnet_and_private_identity(tmp_path):
 def test_peer_validation_rejects_group_or_world_readable_identity(tmp_path, mode):
     peer = valid_peer(tmp_path)
     pathlib.Path(peer["identity_file"]).chmod(mode)
+
+    with pytest.raises(healer.Disarmed):
+        healer.validate_peer(peer)
+
+
+def test_peer_validation_rejects_group_or_world_writable_known_hosts(tmp_path):
+    peer = valid_peer(tmp_path)
+    pathlib.Path(peer["known_hosts"]).chmod(0o666)
+
+    with pytest.raises(healer.Disarmed):
+        healer.validate_peer(peer)
+
+
+def test_peer_validation_rejects_openssh_token_expansion_in_file_paths(tmp_path):
+    peer = valid_peer(tmp_path)
+    identity = tmp_path / "%h-identity"
+    identity.write_text("test-key-material")
+    identity.chmod(0o600)
+    peer["identity_file"] = str(identity)
 
     with pytest.raises(healer.Disarmed):
         healer.validate_peer(peer)
@@ -976,6 +1011,273 @@ def test_peer_validation_formatted_failure_does_not_echo_ip_value(tmp_path):
     assert sentinel not in rendered
 
 
+def test_peer_repair_uses_pinned_host_and_fixed_systemd_commands(tmp_path):
+    peer = valid_peer(tmp_path)
+    runner = repair_runner()
+
+    ok, detail = healer.repair_peer(
+        peer, runner, fetch_heartbeat=lambda _: {"at": 2000}, dry_run=False
+    )
+
+    base = [
+        "ssh", "-i", peer["identity_file"], "-o", "BatchMode=yes",
+        "-o", "StrictHostKeyChecking=yes", "-o",
+        f"UserKnownHostsFile={peer['known_hosts']}", "-o", "ConnectTimeout=10",
+        f"{peer['ssh_user']}@{peer['ip']}",
+    ]
+    assert ok is True
+    assert "verified" in detail
+    assert runner.calls == [
+        base + ["test", "-e", peer["maintenance_lock"]],
+        base + ["systemctl", "--user", "is-enabled", peer["health_timer"]],
+        base + ["systemctl", "--user", "enable", "--now", peer["health_timer"]],
+        base + ["systemctl", "--user", "restart", peer["heartbeat_service"]],
+        base + ["systemctl", "--user", "start", peer["check_service"]],
+        base + ["systemctl", "--user", "is-enabled", peer["health_timer"]],
+        base + ["systemctl", "--user", "is-active", peer["heartbeat_service"]],
+    ]
+    assert runner.timeouts == [20] * 7
+
+
+@pytest.mark.parametrize("args", [
+    ("restart", "hermes-codex-health-tmn.timer"),
+    ("enable", "--now", "hermes-codex-heartbeat-tmn.service"),
+    ("is-active", "hermes-codex-health-tmn.service"),
+    ("sudo", "systemctl", "restart", "hermes-gateway.service"),
+])
+def test_peer_systemctl_rejects_operations_outside_fixed_allowlist(tmp_path, args):
+    runner = ScriptedRunner([])
+
+    with pytest.raises(healer.Disarmed):
+        healer.ssh_systemctl(valid_peer(tmp_path), runner, *args)
+
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize("maintenance_lock", [
+    "/home/shawn_teamnebula_ai/.hermes/codex-health/SELF_HEAL_PAUSED;id",
+    "/home/shawn_teamnebula_ai/../root/SELF_HEAL_PAUSED",
+    "/tmp/SELF_HEAL_PAUSED",
+])
+def test_peer_repair_rejects_unsafe_maintenance_paths_before_ssh(
+    tmp_path, maintenance_lock
+):
+    peer = valid_peer(tmp_path)
+    peer["maintenance_lock"] = maintenance_lock
+    runner = ScriptedRunner([])
+
+    with pytest.raises(healer.Disarmed):
+        healer.repair_peer(peer, runner, fresh_heartbeat, dry_run=False)
+
+    assert runner.calls == []
+
+
+def test_peer_repair_rejects_bad_stale_threshold_before_ssh(tmp_path):
+    peer = valid_peer(tmp_path)
+    peer["stale_after_s"] = "soon"
+    runner = ScriptedRunner([])
+
+    with pytest.raises(healer.Disarmed):
+        healer.repair_peer(peer, runner, fresh_heartbeat, dry_run=False)
+
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize("masked_state", ["masked", "masked-runtime"])
+def test_peer_repair_leaves_masked_timer_unchanged(tmp_path, masked_state):
+    peer = valid_peer(tmp_path)
+    runner = ScriptedRunner([result(1), result(1, masked_state)])
+
+    ok, detail = healer.repair_peer(peer, runner, unreachable, dry_run=False)
+
+    assert ok is True
+    assert masked_state in detail
+    assert len(runner.calls) == 2
+
+
+def test_peer_repair_waits_for_two_misses_and_rearms_after_recovery(tmp_path):
+    state = {"peer_misses": {}, "peer_attempts": {}, "faults": {}}
+    peer = valid_peer(tmp_path, label="src")
+
+    first = healer.handle_peer(peer, state, unreachable, ScriptedRunner([]), now=1000)
+    second = healer.handle_peer(peer, state, unreachable, repair_runner(), now=1100)
+    recovered = healer.handle_peer(
+        peer, state, fresh_heartbeat, ScriptedRunner([]), now=1200
+    )
+
+    assert first.action == "wait"
+    assert second.action == "repair"
+    assert second.notify is True
+    assert recovered.action == "healthy"
+    assert "peer.src" not in state["faults"]
+    assert "src" not in state["peer_misses"]
+    assert "src" not in state["peer_attempts"]
+
+
+def test_peer_handler_calls_passive_heartbeat_helper_with_prior_misses(
+    tmp_path, monkeypatch
+):
+    calls = []
+
+    def unavailable(url, timeout):
+        calls.append((url, timeout))
+        raise OSError("unreachable")
+
+    monkeypatch.setattr(healer.urllib.request, "urlopen", unavailable)
+    state = {"peer_misses": {}, "peer_attempts": {}, "faults": {}}
+    peer = valid_peer(tmp_path, label="src")
+
+    outcome = healer.handle_peer(
+        peer, state, healer.peer_heartbeat, ScriptedRunner([]), now=1000
+    )
+
+    assert outcome.action == "wait"
+    assert calls == [("http://100.74.25.61:8299/heartbeat", 20)]
+
+
+def test_peer_handler_rejects_bad_stale_threshold_without_mutating_state(tmp_path):
+    peer = valid_peer(tmp_path)
+    peer["stale_after_s"] = "soon"
+    state = {"faults": {}}
+    original = json.dumps(state, sort_keys=True)
+    runner = ScriptedRunner([])
+
+    with pytest.raises(healer.Disarmed):
+        healer.handle_peer(peer, state, fresh_heartbeat, runner, now=1200)
+
+    assert json.dumps(state, sort_keys=True) == original
+    assert runner.calls == []
+
+
+def test_fresh_heartbeat_rearms_peer_even_when_remote_health_status_is_down(tmp_path):
+    peer = valid_peer(tmp_path, label="src")
+    state = {
+        "peer_misses": {"src": 1},
+        "peer_attempts": {"src": 1000},
+        "faults": {
+            "peer.src": {
+                "active": True,
+                "alerted": True,
+                "last_attempt": 1000,
+                "detail": "heartbeat unreachable",
+            }
+        },
+    }
+
+    outcome = healer.handle_peer(
+        peer,
+        state,
+        lambda _: {"at": 1200, "status": "down"},
+        ScriptedRunner([]),
+        now=1200,
+    )
+
+    assert outcome.action == "healthy"
+    assert state == {"peer_misses": {}, "peer_attempts": {}, "faults": {}}
+
+
+def test_maintenance_lock_preserves_attempt_cooldown_until_heartbeat_recovers(tmp_path):
+    peer = valid_peer(tmp_path, label="src")
+    state = {"peer_misses": {}, "peer_attempts": {}, "faults": {}}
+    healer.handle_peer(peer, state, unreachable, ScriptedRunner([]), now=1000)
+    locked_runner = ScriptedRunner([result(0)])
+
+    locked = healer.handle_peer(
+        peer, state, unreachable, locked_runner, now=1100, retry_s=21600
+    )
+    cooldown_runner = ScriptedRunner([])
+    cooldown = healer.handle_peer(
+        peer, state, unreachable, cooldown_runner, now=1200, retry_s=21600
+    )
+
+    assert locked.action == "wait" and locked.notify is False
+    assert state["peer_attempts"]["src"] == 1100
+    assert state["peer_misses"]["src"] >= 2
+    assert cooldown.action == "wait" and cooldown.notify is False
+    assert cooldown_runner.calls == []
+
+
+def test_continuing_peer_outage_retries_after_cooldown_without_renotifying(tmp_path):
+    state = {"peer_misses": {}, "peer_attempts": {}, "faults": {}}
+    peer = valid_peer(tmp_path, label="src")
+
+    healer.handle_peer(peer, state, unreachable, ScriptedRunner([]), now=1000)
+    first_repair = healer.handle_peer(
+        peer, state, unreachable, repair_runner(), now=1100, retry_s=21600
+    )
+    cooldown_runner = ScriptedRunner([])
+    cooldown = healer.handle_peer(
+        peer, state, unreachable, cooldown_runner, now=1200, retry_s=21600
+    )
+    retry = healer.handle_peer(
+        peer, state, unreachable, repair_runner(), now=22700, retry_s=21600
+    )
+
+    assert first_repair.action == "repair" and first_repair.notify is True
+    assert cooldown.action == "wait" and cooldown.notify is False
+    assert cooldown_runner.calls == []
+    assert retry.action == "repair" and retry.notify is False
+    assert state["peer_attempts"]["src"] == 22700
+
+
+def test_committed_peer_repair_allowlists_match_one_way_tailnet_topology():
+    tmn = json.loads((WATCHDOG / "hosts" / "tmn.json").read_text())
+    observer = json.loads(
+        (WATCHDOG / "hosts" / "hermes-tmn-observer.json").read_text()
+    )
+    src = json.loads((WATCHDOG / "hosts" / "src.json").read_text())
+
+    assert tmn["self_heal"]["peers"] == [
+        {
+            "label": "src",
+            "ip": "100.79.251.126",
+            "ssh_user": "hermes",
+            "identity_file": "~/.ssh/watchdog-repair",
+            "known_hosts": "~/.ssh/watchdog-repair-known_hosts",
+            "maintenance_lock": "/home/hermes/.hermes/codex-health/SELF_HEAL_PAUSED",
+            "health_timer": "hermes-codex-health.timer",
+            "check_service": "hermes-codex-health.service",
+            "heartbeat_service": "hermes-codex-heartbeat.service",
+        },
+        {
+            "label": "hermes-tmn-observer",
+            "ip": "100.126.215.66",
+            "ssh_user": "ubuntu",
+            "identity_file": "~/.ssh/watchdog-repair",
+            "known_hosts": "~/.ssh/watchdog-repair-known_hosts",
+            "maintenance_lock": "/home/ubuntu/.watchdog-observer/SELF_HEAL_PAUSED",
+            "health_timer": "codex-observer.timer",
+            "check_service": "codex-observer.service",
+            "heartbeat_service": "codex-observer-heartbeat.service",
+        },
+    ]
+    assert observer["self_heal"]["peers"] == [
+        {
+            "label": "src",
+            "ip": "100.79.251.126",
+            "ssh_user": "hermes",
+            "identity_file": "~/.ssh/watchdog-repair",
+            "known_hosts": "~/.ssh/watchdog-repair-known_hosts",
+            "maintenance_lock": "/home/hermes/.hermes/codex-health/SELF_HEAL_PAUSED",
+            "health_timer": "hermes-codex-health.timer",
+            "check_service": "hermes-codex-health.service",
+            "heartbeat_service": "hermes-codex-heartbeat.service",
+        },
+        {
+            "label": "neb-ops-gcp",
+            "ip": "100.74.25.61",
+            "ssh_user": "shawn_teamnebula_ai",
+            "identity_file": "~/.ssh/watchdog-repair",
+            "known_hosts": "~/.ssh/watchdog-repair-known_hosts",
+            "maintenance_lock": "/home/shawn_teamnebula_ai/.hermes/codex-health/SELF_HEAL_PAUSED",
+            "health_timer": "hermes-codex-health-tmn.timer",
+            "check_service": "hermes-codex-health-tmn.service",
+            "heartbeat_service": "hermes-codex-heartbeat-tmn.service",
+        },
+    ]
+    assert not (src.get("self_heal") or {}).get("peers")
+
+
 def test_command_result_is_immutable_value_object():
     command_result = result(0, "ok")
 
@@ -983,20 +1285,38 @@ def test_command_result_is_immutable_value_object():
         command_result.returncode = 1
 
 
-def valid_peer(tmp_path):
+def valid_peer(tmp_path, label="neb-ops-gcp"):
     tmp_path.mkdir(parents=True, exist_ok=True)
-    identity = tmp_path / "id_ed25519"
-    identity.write_text("test identity")
+    identity = tmp_path / "watchdog-repair"
+    identity.write_text("test-key-material")
     identity.chmod(0o600)
-    known_hosts = tmp_path / "known_hosts"
-    known_hosts.write_text("100.74.25.61 ssh-ed25519 pinned")
+    known_hosts = tmp_path / "watchdog-repair-known_hosts"
+    known_hosts.write_text("100.74.25.61 ssh-ed25519 test-key")
     return {
-        "label": "neb-ops-gcp",
+        "label": label,
         "ip": "100.74.25.61",
-        "ssh_user": "hermes",
+        "ssh_user": "shawn_teamnebula_ai",
         "identity_file": str(identity),
         "known_hosts": str(known_hosts),
+        "maintenance_lock": (
+            "/home/shawn_teamnebula_ai/.hermes/codex-health/SELF_HEAL_PAUSED"
+        ),
         "health_timer": "hermes-codex-health-tmn.timer",
         "check_service": "hermes-codex-health-tmn.service",
         "heartbeat_service": "hermes-codex-heartbeat-tmn.service",
     }
+
+
+def unreachable(_peer):
+    raise OSError("unreachable")
+
+
+def fresh_heartbeat(_peer):
+    return {"at": 1200, "status": "ok"}
+
+
+def repair_runner():
+    return ScriptedRunner([
+        result(1), result(1, "disabled"), result(0), result(0), result(0),
+        result(0, "enabled"), result(0, "active"),
+    ])

@@ -3,6 +3,32 @@
   "bot_label": "both Hermes bots",
   "mode": "observer",
   "renotify_s": 86400,
+  "self_heal": {
+    "peers": [
+      {
+        "label": "src",
+        "ip": "100.79.251.126",
+        "ssh_user": "hermes",
+        "identity_file": "~/.ssh/watchdog-repair",
+        "known_hosts": "~/.ssh/watchdog-repair-known_hosts",
+        "maintenance_lock": "/home/hermes/.hermes/codex-health/SELF_HEAL_PAUSED",
+        "health_timer": "hermes-codex-health.timer",
+        "check_service": "hermes-codex-health.service",
+        "heartbeat_service": "hermes-codex-heartbeat.service"
+      },
+      {
+        "label": "neb-ops-gcp",
+        "ip": "100.74.25.61",
+        "ssh_user": "shawn_teamnebula_ai",
+        "identity_file": "~/.ssh/watchdog-repair",
+        "known_hosts": "~/.ssh/watchdog-repair-known_hosts",
+        "maintenance_lock": "/home/shawn_teamnebula_ai/.hermes/codex-health/SELF_HEAL_PAUSED",
+        "health_timer": "hermes-codex-health-tmn.timer",
+        "check_service": "hermes-codex-health-tmn.service",
+        "heartbeat_service": "hermes-codex-heartbeat-tmn.service"
+      }
+    ]
+  },
   "subject": "Action needed: BOTH Hermes watchdogs are dark",
   "ticket_title": "Both Hermes watchdogs dark — reported by hermes-tmn-observer",
   "peers": [

@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 
 from auth_state import full_pool_reset_at, quota_blocked, selected_codex_credential
 
@@ -23,6 +24,8 @@ HERE = pathlib.Path(__file__).resolve().parent
 COMMAND_CAPTURE_LIMIT = 64 * 1024
 UNIT_TOKEN = re.compile(r"^[A-Za-z0-9_.@-]+$")
 SSH_USER = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+PEER_LABEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+LOCAL_FILE_PATH = re.compile(r"^(?:~/|/)[A-Za-z0-9_./@+-]+$")
 JWT_TOKEN = re.compile(r"\b[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*\b")
 LONG_TOKEN = re.compile(r"\b[A-Za-z0-9_-]{40,}\b")
 BEARER_TOKEN = re.compile(r"(?i)\bBearer\s+\S+")
@@ -51,6 +54,21 @@ class CommandResult:
     returncode: int
     stdout: str = ""
     stderr: str = ""
+
+
+@dataclasses.dataclass(frozen=True)
+class PeerResult:
+    action: str
+    ok: bool
+    detail: str
+    notify: bool = False
+
+
+@dataclasses.dataclass(frozen=True)
+class _PeerRepairResult:
+    ok: bool
+    detail: str
+    skipped: bool = False
 
 
 def run_command(argv: list[str], timeout: int = 20) -> CommandResult:
@@ -479,6 +497,260 @@ def _gateway_can_recover(auth: dict) -> bool:
     )
 
 
+def ssh_base(peer: dict) -> list[str]:
+    """Build the pinned OpenSSH argv for one validated tailnet peer."""
+    return _ssh_base(validate_peer(peer))
+
+
+def _ssh_base(peer: dict) -> list[str]:
+    return [
+        "ssh", "-i", peer["identity_file"], "-o", "BatchMode=yes",
+        "-o", "StrictHostKeyChecking=yes", "-o",
+        f"UserKnownHostsFile={peer['known_hosts']}", "-o", "ConnectTimeout=10",
+        f"{peer['ssh_user']}@{peer['ip']}",
+    ]
+
+
+def ssh_systemctl(peer: dict, run_cmd, *args: str) -> CommandResult:
+    """Run one peer-specific systemd operation from the fixed allowlist."""
+    validated = validate_peer(peer)
+    allowed = {
+        ("is-enabled", validated["health_timer"]),
+        ("enable", "--now", validated["health_timer"]),
+        ("restart", validated["heartbeat_service"]),
+        ("start", validated["check_service"]),
+        ("is-active", validated["heartbeat_service"]),
+    }
+    if tuple(args) not in allowed:
+        raise Disarmed("peer systemd operation is not allowed")
+    return run_cmd(_ssh_base(validated) + ["systemctl", "--user", *args], 20)
+
+
+def peer_heartbeat(peer: dict, previous_misses: int) -> tuple[str, str, int]:
+    """Fetch and classify one peer heartbeat without mutating peer state."""
+    validated = validate_peer(peer)
+    if isinstance(previous_misses, bool) or not isinstance(previous_misses, int):
+        raise Disarmed("peer miss count is invalid")
+    if previous_misses < 0:
+        raise Disarmed("peer miss count is invalid")
+    label = validated["label"]
+    stale_after = _validate_stale_after(validated)
+    url = f"http://{validated['ip']}:8299/heartbeat"
+    try:
+        with urllib.request.urlopen(url, timeout=20) as response:
+            heartbeat = json.loads(response.read())
+        if not isinstance(heartbeat, dict):
+            raise ValueError("heartbeat is malformed")
+        at = heartbeat.get("at")
+        if isinstance(at, bool) or not isinstance(at, (int, float)):
+            raise ValueError("heartbeat timestamp is malformed")
+    except Exception as exc:
+        misses = previous_misses + 1
+        detail = f"{label} heartbeat unreachable ({type(exc).__name__}), {misses} consecutive"
+        return ("peer" if misses >= 2 else "unknown"), detail, misses
+
+    age = int(time.time() - at)
+    if age > stale_after:
+        return "peer", f"{label} heartbeat is stale by {age} seconds", 0
+    return "ok", f"{label} heartbeat is {max(age, 0)} seconds old", 0
+
+
+def repair_peer(
+    peer: dict,
+    run_cmd,
+    fetch_heartbeat,
+    dry_run: bool,
+) -> tuple[bool, str]:
+    """Repair one allowlisted peer timer and heartbeat, then read postconditions."""
+    outcome = _repair_peer(peer, run_cmd, fetch_heartbeat, dry_run)
+    return outcome.ok, outcome.detail
+
+
+def _repair_peer(
+    peer: dict,
+    run_cmd,
+    fetch_heartbeat,
+    dry_run: bool,
+) -> _PeerRepairResult:
+    validated = validate_peer(peer)
+    _validate_stale_after(validated)
+    if dry_run:
+        commands = [
+            _ssh_base(validated) + ["test", "-e", validated["maintenance_lock"]],
+            _ssh_base(validated) + [
+                "systemctl", "--user", "enable", "--now", validated["health_timer"]
+            ],
+            _ssh_base(validated) + [
+                "systemctl", "--user", "restart", validated["heartbeat_service"]
+            ],
+            _ssh_base(validated) + [
+                "systemctl", "--user", "start", validated["check_service"]
+            ],
+        ]
+        return _PeerRepairResult(
+            True, "dry-run: " + " ; ".join(" ".join(argv) for argv in commands)
+        )
+
+    lock = run_cmd(
+        _ssh_base(validated) + ["test", "-e", validated["maintenance_lock"]], 20
+    )
+    if lock.returncode == 0:
+        return _PeerRepairResult(
+            True, "peer maintenance lock is present; leaving peer unchanged", skipped=True
+        )
+    if lock.returncode != 1:
+        return _PeerRepairResult(False, "peer maintenance lock could not be checked")
+
+    enabled = ssh_systemctl(validated, run_cmd, "is-enabled", validated["health_timer"])
+    enabled_state = enabled.stdout.strip().lower()
+    if enabled_state in {"masked", "masked-runtime"}:
+        return _PeerRepairResult(
+            True,
+            f"peer health timer is {enabled_state}; leaving it unchanged",
+            skipped=True,
+        )
+    if enabled.returncode != 0:
+        if enabled_state != "disabled":
+            return _PeerRepairResult(False, "peer health timer state could not be read")
+        repaired = ssh_systemctl(
+            validated, run_cmd, "enable", "--now", validated["health_timer"]
+        )
+        if repaired.returncode != 0:
+            return _PeerRepairResult(False, "peer health timer enable failed")
+    elif enabled_state != "enabled":
+        return _PeerRepairResult(False, "peer health timer is not enabled")
+
+    heartbeat_restart = ssh_systemctl(
+        validated, run_cmd, "restart", validated["heartbeat_service"]
+    )
+    if heartbeat_restart.returncode != 0:
+        return _PeerRepairResult(False, "peer heartbeat restart failed")
+    check_start = ssh_systemctl(validated, run_cmd, "start", validated["check_service"])
+    if check_start.returncode != 0:
+        return _PeerRepairResult(False, "peer health check start failed")
+
+    enabled = ssh_systemctl(validated, run_cmd, "is-enabled", validated["health_timer"])
+    active = ssh_systemctl(validated, run_cmd, "is-active", validated["heartbeat_service"])
+    if enabled.returncode != 0 or enabled.stdout.strip().lower() != "enabled":
+        return _PeerRepairResult(False, "peer health timer did not become enabled")
+    if active.returncode != 0 or active.stdout.strip().lower() != "active":
+        return _PeerRepairResult(False, "peer heartbeat service did not become active")
+    try:
+        heartbeat = _call_heartbeat(fetch_heartbeat, validated, 0)
+    except Exception as exc:
+        return _PeerRepairResult(
+            False, f"peer heartbeat postcondition failed ({type(exc).__name__})"
+        )
+    if not _heartbeat_fetch_succeeded(heartbeat):
+        return _PeerRepairResult(False, "peer heartbeat postcondition failed")
+    return _PeerRepairResult(True, "peer timer, check, and heartbeat repair verified")
+
+
+def handle_peer(
+    peer: dict,
+    state: dict,
+    fetch_heartbeat,
+    run_cmd,
+    now: int,
+    retry_s: int = 21600,
+) -> PeerResult:
+    """Wait for two misses, then edge-trigger one bounded peer repair."""
+    validated = validate_peer(peer)
+    _validate_stale_after(validated)
+    _validate_state(state)
+    if isinstance(now, bool) or not isinstance(now, int):
+        raise Disarmed("peer repair time is invalid")
+    if isinstance(retry_s, bool) or not isinstance(retry_s, int) or retry_s <= 0:
+        raise Disarmed("peer retry interval is invalid")
+
+    label = validated["label"]
+    fault_key = f"peer.{label}"
+    misses = state.setdefault("peer_misses", {})
+    attempts = state.setdefault("peer_attempts", {})
+    try:
+        heartbeat = _call_heartbeat(fetch_heartbeat, validated, misses.get(label, 0))
+        healthy, detail = _heartbeat_is_healthy(heartbeat, now, validated)
+    except Disarmed:
+        raise
+    except Exception as exc:
+        healthy = False
+        detail = f"{label} heartbeat unreachable ({type(exc).__name__})"
+
+    if healthy:
+        misses.pop(label, None)
+        attempts.pop(label, None)
+        clear_fault(state, fault_key)
+        return PeerResult("healthy", True, detail)
+
+    miss_count = misses.get(label, 0) + 1
+    misses[label] = miss_count
+    if miss_count < 2:
+        return PeerResult("wait", True, f"{detail}; first consecutive miss")
+
+    last_attempt = attempts.get(label)
+    if last_attempt is not None and now - last_attempt < retry_s:
+        remaining = retry_s - (now - last_attempt)
+        return PeerResult("wait", False, f"{detail}; retry in {remaining} seconds")
+
+    attempts[label] = now
+    repair = _repair_peer(validated, run_cmd, fetch_heartbeat, dry_run=False)
+    if repair.skipped:
+        return PeerResult("wait", True, repair.detail)
+    if repair.ok:
+        misses.pop(label, None)
+        attempts.pop(label, None)
+        clear_fault(state, fault_key)
+        return PeerResult("repair", True, repair.detail)
+
+    notify = fault_transition(state, fault_key, repair.detail, now)
+    return PeerResult("repair", False, repair.detail, notify=notify)
+
+
+def _heartbeat_fetch_succeeded(heartbeat: object) -> bool:
+    if isinstance(heartbeat, tuple) and len(heartbeat) == 3:
+        return heartbeat[0] == "ok"
+    if not isinstance(heartbeat, dict):
+        return False
+    at = heartbeat.get("at")
+    return (
+        not isinstance(at, bool)
+        and isinstance(at, (int, float))
+        and at > 0
+    )
+
+
+def _call_heartbeat(fetch_heartbeat, peer: dict, previous_misses: int):
+    if fetch_heartbeat is peer_heartbeat:
+        return fetch_heartbeat(peer, previous_misses)
+    return fetch_heartbeat(peer)
+
+
+def _heartbeat_is_healthy(
+    heartbeat: object, now: int, peer: dict
+) -> tuple[bool, str]:
+    label = peer["label"]
+    if isinstance(heartbeat, tuple) and len(heartbeat) == 3:
+        verdict, detail, _ = heartbeat
+        return verdict == "ok", str(detail)
+    if not _heartbeat_fetch_succeeded(heartbeat):
+        return False, f"{label} heartbeat is malformed or unhealthy"
+    stale_after = _validate_stale_after(peer)
+
+    age = now - heartbeat["at"]
+    if age > stale_after:
+        return False, f"{label} heartbeat is stale by {int(age)} seconds"
+    return True, f"{label} heartbeat is fresh"
+
+
+def _validate_stale_after(peer: dict) -> int | float:
+    stale_after = peer.get("stale_after_s", 46800)
+    if isinstance(stale_after, bool) or not isinstance(stale_after, (int, float)):
+        raise Disarmed("peer stale threshold is invalid")
+    if stale_after <= 0:
+        raise Disarmed("peer stale threshold is invalid")
+    return stale_after
+
+
 def load_state(path: pathlib.Path) -> dict:
     """Load valid persisted healer state, or stop before a repair action."""
     path = pathlib.Path(path)
@@ -565,13 +837,18 @@ def validate_peer(peer: dict) -> dict:
     if address not in TAILNET:
         raise Disarmed("peer address is outside the tailnet")
 
+    label = peer.get("label")
+    if not isinstance(label, str) or not PEER_LABEL.fullmatch(label):
+        raise Disarmed("peer label is invalid")
+
     ssh_user = peer.get("ssh_user")
     if not isinstance(ssh_user, str) or not SSH_USER.fullmatch(ssh_user):
         raise Disarmed("peer SSH user is invalid")
 
-    validate_unit(peer.get("health_timer"), ".timer")
-    validate_unit(peer.get("check_service"), ".service")
-    validate_unit(peer.get("heartbeat_service"), ".service")
+    _validate_maintenance_lock(peer.get("maintenance_lock"), ssh_user)
+    _validate_peer_unit(peer.get("health_timer"), ".timer")
+    _validate_peer_unit(peer.get("check_service"), ".service")
+    _validate_peer_unit(peer.get("heartbeat_service"), ".service")
     _validate_private_regular_file(peer.get("identity_file"), "identity")
     _validate_regular_file(peer.get("known_hosts"), "known-hosts")
     return dict(peer)
@@ -604,6 +881,20 @@ def _validate_state(state: object) -> None:
         isinstance(quota_reset, bool) or not isinstance(quota_reset, (int, float))
     ):
         raise Disarmed("state file is malformed")
+    _validate_peer_state_map(state.get("peer_misses"), "misses")
+    _validate_peer_state_map(state.get("peer_attempts"), "attempts")
+
+
+def _validate_peer_state_map(value: object, label: str) -> None:
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        raise Disarmed("state file is malformed")
+    for peer_label, recorded in value.items():
+        if not isinstance(peer_label, str) or not PEER_LABEL.fullmatch(peer_label):
+            raise Disarmed("state file is malformed")
+        if isinstance(recorded, bool) or not isinstance(recorded, int) or recorded < 0:
+            raise Disarmed(f"peer {label} state is malformed")
 
 
 def _validate_private_regular_file(value: object, label: str) -> None:
@@ -626,9 +917,40 @@ def _validate_regular_file(value: object, label: str) -> None:
         raise Disarmed(f"{label} file is unavailable") from exc
     if not stat.S_ISREG(file_stat.st_mode):
         raise Disarmed(f"{label} file is not regular")
+    if file_stat.st_size == 0:
+        raise Disarmed(f"{label} file is empty")
+    if file_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise Disarmed(f"{label} file permissions are unsafe")
 
 
 def _path_from_value(value: object, label: str) -> pathlib.Path:
     if not isinstance(value, str) or not value:
         raise Disarmed(f"{label} file is invalid")
-    return pathlib.Path(value)
+    if not LOCAL_FILE_PATH.fullmatch(value):
+        raise Disarmed(f"{label} file is invalid")
+    path = pathlib.Path(value).expanduser()
+    if not path.is_absolute() or ".." in pathlib.PurePath(value).parts:
+        raise Disarmed(f"{label} file is invalid")
+    return path
+
+
+def _validate_peer_unit(value: object, suffix: str) -> str:
+    unit = validate_unit(value, suffix)
+    if unit.startswith("-"):
+        raise Disarmed("peer unit must not be an option")
+    return unit
+
+
+def _validate_maintenance_lock(value: object, ssh_user: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise Disarmed("peer maintenance lock is invalid")
+    path = pathlib.PurePosixPath(value)
+    if (
+        not path.is_absolute()
+        or ".." in path.parts
+        or any(not UNIT_TOKEN.fullmatch(part) for part in path.parts[1:])
+        or path.parts[:3] != ("/", "home", ssh_user)
+        or path.name != "SELF_HEAL_PAUSED"
+    ):
+        raise Disarmed("peer maintenance lock is invalid")
+    return value

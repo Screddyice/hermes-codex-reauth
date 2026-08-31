@@ -3,6 +3,32 @@
   "bot_label": "@Teamnebula_bot",
   "hermes_home": "~/.hermes",
   "gateway_unit": "hermes-gateway.service",
+  "self_heal": {
+    "peers": [
+      {
+        "label": "src",
+        "ip": "100.79.251.126",
+        "ssh_user": "hermes",
+        "identity_file": "~/.ssh/watchdog-repair",
+        "known_hosts": "~/.ssh/watchdog-repair-known_hosts",
+        "maintenance_lock": "/home/hermes/.hermes/codex-health/SELF_HEAL_PAUSED",
+        "health_timer": "hermes-codex-health.timer",
+        "check_service": "hermes-codex-health.service",
+        "heartbeat_service": "hermes-codex-heartbeat.service"
+      },
+      {
+        "label": "hermes-tmn-observer",
+        "ip": "100.126.215.66",
+        "ssh_user": "ubuntu",
+        "identity_file": "~/.ssh/watchdog-repair",
+        "known_hosts": "~/.ssh/watchdog-repair-known_hosts",
+        "maintenance_lock": "/home/ubuntu/.watchdog-observer/SELF_HEAL_PAUSED",
+        "health_timer": "codex-observer.timer",
+        "check_service": "codex-observer.service",
+        "heartbeat_service": "codex-observer-heartbeat.service"
+      }
+    ]
+  },
   "reauth_url": "https://auth.openai.com/codex/device",
   "renotify_s": 86400,
   "subject": "Action needed: Team Nebula Hermes lost its Codex sign-in (neb-ops-gcp)",
