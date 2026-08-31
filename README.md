@@ -40,12 +40,12 @@ One watchdog per host, 4 runs a day, silent unless something is wrong.
 
 | Target | Credential watched | Runs on | Alerts to |
 |---|---|---|---|
-| `@Screddy_bot` codex | `~/.hermes/auth.json` | hostinger (`ubuntu`) | email |
+| `@Screddy_bot` codex | `~/.hermes/auth.json` | src (`hermes`) | Telegram + email |
 | `@Teamnebula_bot` codex | `~/.hermes/profiles/tmn/auth.json` | hermes-tmn (`screddy`) | Slack `#tmn-ops` + email |
 | **NEBOS v2 Claude** | `CLAUDE_CODE_OAUTH_TOKEN` in `nebos-dev` Secret Manager | hermes-tmn (`screddy`) | Slack `#tmn-ops` + email |
 | **both watchdogs** | the two heartbeats, over the tailnet | neb-ops-gcp (observer) | Telegram DM |
 
-The two hosts are **interleaved on the half-cycle** — TMN on 00/06/12/18:35, hostinger on
+The two hosts are **interleaved on the half-cycle** — TMN on 00/06/12/18:35, src on
 03/09/15/21:35 — so each box is checked every 6h while the fleet as a whole is
 checked every 3h, and the two can never alert in the same minute.
 
@@ -55,9 +55,9 @@ watchdog/
   notify_failure.py       last-resort escalator, fired by OnFailure=
   heartbeat_server.py     serves this box's heartbeat to its peer, tailnet only
   codex_auth_probe.py     live probe — OPERATOR TOOL, not on any timer
-  hosts/{hostinger,tmn,neb-ops}.json   everything host-specific
+  hosts/{src,tmn,neb-ops}.json         everything host-specific
   systemd/                12 units, byte-identical to what is deployed
-  install.sh              --host {hostinger|tmn|nebos-claude|neb-ops}
+  install.sh              --host {src|tmn|nebos-claude|neb-ops}
 ```
 
 **Everything host-specific lives in `hosts/*.json`** — auth store, gateway unit,
@@ -189,7 +189,7 @@ locally through systemd: enabled, scheduled, and triggered within
 to rot. A never-triggered timer reads as a fresh install rather than a fault, and
 a systemctl error reads as uncheckable rather than broken.
 
-Only hermes-tmn carries one (`nebos-claude-health.timer`). hostinger runs a single
+Only hermes-tmn carries one (`nebos-claude-health.timer`). src runs a single
 watchdog, so it has no sibling to pair with.
 
 The `sibling` verdict is its own kind, with prose that says plainly that the box's
@@ -198,11 +198,10 @@ local and certain where the peer watch is remote and inferential.
 
 ## Alerting
 
-Routing differs per box, set on 2026-08-17. `@Screddy_bot` on hostinger is Shawn's
-own assistant, so it emails him and stays out of the team channel. `@Teamnebula_bot`
+Routing differs per box, set on 2026-08-17. `@Screddy_bot` on src is Shawn's
+own assistant, so it DMs and emails him and stays out of the team channel. `@Teamnebula_bot`
 on hermes-tmn is company infrastructure with no fallback provider, so it posts to
-Slack `#tmn-ops` **and** emails. hostinger's Linear ticketing was dropped in the
-same pass.
+Slack `#tmn-ops` **and** emails. src does not create Linear tickets.
 
 The personal box carries two channels since 2026-08-24: Telegram, then email.
 Telegram reuses `TELEGRAM_BOT_TOKEN`, the same secret `notify_failure.py`
@@ -274,9 +273,8 @@ Hermes Telegram bot token is a different secret from a different vendor, it is
 already on both boxes, and it fails visibly — if that token dies, the bot stops
 answering and you know within minutes.
 
-It matters most on hostinger, which alerts through email alone. If that Composio
-key rotates away, `env_val` returns empty and the run exits 1 having told nobody.
-Now it exits 1 *and* DMs you.
+On src, Telegram still delivers when a Composio key rotation breaks email.
+`notify_failure.py` also sends a Telegram DM when the scheduled check exits 1.
 
 `notify_failure.py` imports nothing from the health checks, on purpose. A last
 resort that depends on the component which just failed is not a last resort, so it
@@ -285,16 +283,19 @@ wording rather than staying silent when `config.json` is unreadable. `install.sh
 dry-runs it on every deploy, so a notifier that could never fire fails the install
 instead of waiting to disappoint you.
 
-## The two boxes watch each other
+## The three-node watch graph
 
 `OnFailure=` needs a run to hook, so it cannot fire for a check that never runs.
-That gap is covered by a mutual peer watch, added 2026-08-17: each check writes a
-heartbeat, serves it on the tailnet, and reads its peer's. A box that stops
-reporting gets called out by the other one, through channels that already work.
+The peer watch covers that gap. Each check writes a heartbeat and serves it on
+its Tailscale address. hermes-tmn and neb-ops-gcp read src through a one-device
+share from the consulting tailnet into the Team Nebula tailnet. The share grants
+Team Nebula access to src without giving src access to company nodes.
 
 ```
-hostinger  ──reads──▶ http://100.126.215.66:8299/heartbeat  (hermes-tmn)
-hermes-tmn ──reads──▶ http://100.98.215.63:8299/heartbeat   (hostinger)
+hermes-tmn  ──reads──▶ http://100.79.251.126:8299/heartbeat  (src)
+hermes-tmn  ──reads──▶ http://100.74.25.61:8299/heartbeat    (neb-ops-gcp)
+neb-ops-gcp ──reads──▶ http://100.79.251.126:8299/heartbeat  (src)
+neb-ops-gcp ──reads──▶ http://100.126.215.66:8299/heartbeat  (hermes-tmn)
 ```
 
 Two failure shapes, handled differently on purpose:
@@ -343,15 +344,15 @@ Observer mode is not a loophole in the `hermes_home` rule. A config with no
 only because it inspects no credential. Both halves have tests.
 
 **The observer is watched too.** It serves a heartbeat like the others, and
-hermes-tmn reads it. Only that one box does: if both Hermes boxes watched the
-observer, a single dead observer would page twice for one event. So the ring has
-no unwatched node — hostinger ↔ hermes-tmn → neb-ops-gcp → back.
+hermes-tmn reads it. The observer reads src and hermes-tmn, while hermes-tmn
+reads src and the observer. Every node has a watcher, and one dead node produces
+one alert path.
 
 **What remains uncovered:** all three hosts dark at once, which now requires three
 independent failures across two providers and two regions.
 
 The heartbeat server binds the tailnet address from `tailscale ip -4` and refuses
-to start without one. It never falls back to `0.0.0.0`: hostinger has a public IP,
+to start without one. It never falls back to `0.0.0.0`: src has a public IP,
 and a monitoring tool that quietly opens a public port is the failure this repo
 exists to prevent. The payload carries no secrets — host label, unit, timestamp,
 last verdict.
@@ -388,7 +389,7 @@ would page every interval.
 ## Install
 
 ```bash
-./watchdog/install.sh --host hostinger    # or --host tmn
+./watchdog/install.sh --host src           # or --host tmn
 ```
 
 Idempotent. Never touches `state.json` — a reinstall must not reset an

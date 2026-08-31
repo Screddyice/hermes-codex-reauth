@@ -7,9 +7,9 @@
   "ticket_title": "Both Hermes watchdogs dark — reported by neb-ops-gcp",
   "peers": [
     {
-      "label": "hostinger",
+      "label": "src",
       "bot_label": "@Screddy_bot",
-      "url": "http://100.98.215.63:8299/heartbeat",
+      "url": "http://100.79.251.126:8299/heartbeat",
       "stale_after_s": 46800
     },
     {
@@ -32,7 +32,7 @@
     "the other itself, so a single failure never reaches this host.",
     "",
     "Check, per box:",
-    "  ssh hostinger 'systemctl --user list-timers | grep codex-health'",
+    "  ssh screddy-hermes 'systemctl --user list-timers | grep codex-health'",
     "  gcloud compute ssh hermes-tmn --project teamnebula-os --zone us-central1-a \\",
     "      --tunnel-through-iap --command 'systemctl --user list-timers | grep codex-health'",
     "",

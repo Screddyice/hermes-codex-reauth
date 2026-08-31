@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Install the codex watchdog on a Hermes host. Idempotent; safe to re-run.
 #
-#   ./install.sh --host hostinger        # user ubuntu,  ~/.hermes
+#   ./install.sh --host src              # user hermes,   ~/.hermes
 #   ./install.sh --host tmn              # user screddy, ~/.hermes/profiles/tmn
 #
 # No usernames or absolute home paths are hardcoded — everything derives from
@@ -31,12 +31,12 @@ done
 # a live call, since its token is an opaque string with no local metadata.
 CHECK_SRC="$HERE/codex_health_check.py"
 case "$HOST" in
-  hostinger)    DEST="$HOME/.hermes/codex-health";               TIMER="hermes-codex-health.timer";     SERVICE="hermes-codex-health.service";     NOTIFY="hermes-codex-health-notify.service";     BEAT="hermes-codex-heartbeat.service" ;;
+  src)          DEST="$HOME/.hermes/codex-health";               TIMER="hermes-codex-health.timer";     SERVICE="hermes-codex-health.service";     NOTIFY="hermes-codex-health-notify.service";     BEAT="hermes-codex-heartbeat.service" ;;
   tmn)          DEST="$HOME/.hermes/profiles/tmn/codex-health";  TIMER="hermes-codex-health-tmn.timer"; SERVICE="hermes-codex-health-tmn.service"; NOTIFY="hermes-codex-health-tmn-notify.service"; BEAT="hermes-codex-heartbeat-tmn.service" ;;
   nebos-claude) DEST="$HOME/.hermes/profiles/tmn/claude-health"; TIMER="nebos-claude-health.timer";     SERVICE="nebos-claude-health.service";     NOTIFY="nebos-claude-health-notify.service"
                 CHECK_SRC="$HERE/claude_health_check.py" ;;
   neb-ops)      DEST="$HOME/.watchdog-observer";                 TIMER="codex-observer.timer";          SERVICE="codex-observer.service";          NOTIFY="codex-observer-notify.service";     BEAT="codex-observer-heartbeat.service" ;;
-  *) echo "usage: $0 --host {hostinger|tmn|nebos-claude|neb-ops}" >&2; exit 2 ;;
+  *) echo "usage: $0 --host {src|tmn|nebos-claude|neb-ops}" >&2; exit 2 ;;
 esac
 
 CFG_SRC="$HERE/hosts/$HOST.json"

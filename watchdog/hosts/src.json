@@ -1,12 +1,12 @@
 {
-  "host_label": "hostinger",
+  "host_label": "src",
   "bot_label": "@Screddy_bot",
   "hermes_home": "~/.hermes",
   "gateway_unit": "hermes-gateway.service",
   "reauth_url": "https://auth.openai.com/codex/device",
   "renotify_s": 86400,
-  "subject": "Action needed: personal Hermes lost its Codex sign-in (hostinger)",
-  "ticket_title": "Codex sign-in lost — personal Hermes (hostinger)",
+  "subject": "Action needed: personal Hermes lost its Codex sign-in (src)",
+  "ticket_title": "Codex sign-in lost — personal Hermes (src)",
   "channels": {
     "telegram": {
       "chat_id": "6056863584",
@@ -27,7 +27,7 @@
     "a person at a browser. Until someone runs these steps the bot stays down.",
     "",
     "1. SSH to the box:",
-    "   ssh hostinger",
+    "   ssh screddy-hermes",
     "",
     "2. Start the device-code login (default profile — no --profile flag here):",
     "   hermes auth add openai-codex --type oauth --no-browser",
@@ -64,8 +64,8 @@
     "last silently invalidates the other. The credential `label` field is cosmetic —",
     "compare the refresh-token fingerprint printed in this alert, not labels."
   ],
-  "quota_subject": "Action needed: personal Hermes is out of Codex quota (hostinger)",
-  "quota_ticket_title": "Codex quota exhausted — personal Hermes (hostinger)",
+  "quota_subject": "Action needed: personal Hermes is out of Codex quota (src)",
+  "quota_ticket_title": "Codex quota exhausted — personal Hermes (src)",
   "quota_note": [
     "This box has a local Ollama fallback configured, so an exhausted plan degrades",
     "@Screddy_bot rather than killing it outright. Lower urgency than the same alert from",
@@ -74,11 +74,5 @@
     "@Screddy_bot and @Teamnebula_bot are on SEPARATE ChatGPT accounts — confirm which one",
     "this credential is attached to before changing a plan. The refresh-token fingerprint in",
     "this alert identifies the credential; the account itself is in the access-token claims."
-  ],
-  "peer": {
-    "label": "hermes-tmn",
-    "bot_label": "@Teamnebula_bot",
-    "url": "http://100.126.215.66:8299/heartbeat",
-    "stale_after_s": 46800
-  }
+  ]
 }

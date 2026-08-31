@@ -3,7 +3,7 @@
 ## Project Overview
 
 Monitoring for OpenAI Codex (ChatGPT-plan) OAuth on the two Hermes hosts
-(`neb-brain-hostinger` and the GCP VM `hermes-tmn`).
+(`src` and the GCP VM `hermes-tmn`).
 
 Despite the repo name, **it no longer re-authenticates anything.** 2FA made
 unattended device-code reauth impossible, so every mutating path was removed on
@@ -19,7 +19,7 @@ URL stability. See the README.
 
 ```bash
 pytest                                   # the whole suite
-./watchdog/install.sh --host hostinger   # deploy (or --host tmn)
+./watchdog/install.sh --host src         # deploy (or --host tmn)
 ```
 
 ## Layout
@@ -50,13 +50,11 @@ resolution and stays stdlib-only. A last resort that depends on the component
 which just failed is not a last resort. A test asserts the absence of those
 imports.
 
-**Its transport must stay independent of the alert channels.** Telegram is chosen
-because its token is a different secret from a different vendor: a
-`TMN_COMPOSIO_API_KEY` rotation kills hostinger's only channel and leaves the
-escalator working. Swapping it for a second email would silently undo the whole
-point.
+**Its transport must stay independent of the alert channels.** Telegram uses a
+different vendor and secret from Composio email. A `TMN_COMPOSIO_API_KEY`
+rotation can break email on `src` while Telegram keeps the escalator working.
 
-**The heartbeat server binds the tailnet address, never `0.0.0.0`.** hostinger has
+**The heartbeat server binds the tailnet address, never `0.0.0.0`.** `src` has
 a public IP. `heartbeat_server.py` resolves the bind from `tailscale ip -4` and
 exits 1 when it cannot, because a monitoring tool that quietly opens a public port
 is precisely the class of mistake this repo exists to catch. There is a test.

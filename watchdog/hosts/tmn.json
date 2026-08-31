@@ -57,7 +57,7 @@
     "running), so codex being down means @Teamnebula_bot is fully dead rather than degraded.",
     "Treat it as higher urgency than the personal box.",
     "",
-    "Use a FRESH authorization, not a copy of the one hostinger holds. Both boxes previously",
+    "Use a FRESH authorization, not a copy of the one src holds. Both boxes previously",
     "shared one OAuth lineage, and whichever refreshes last silently invalidates the other —",
     "that is what caused the July outage. The credential `label` field is cosmetic and reads",
     "the same on both boxes; compare the refresh-token fingerprint printed in this alert."
@@ -79,9 +79,9 @@
   ],
   "peers": [
     {
-      "label": "hostinger",
+      "label": "src",
       "bot_label": "@Screddy_bot",
-      "url": "http://100.98.215.63:8299/heartbeat",
+      "url": "http://100.79.251.126:8299/heartbeat",
       "stale_after_s": 46800
     },
     {
