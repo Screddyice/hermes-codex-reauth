@@ -8,7 +8,11 @@ import os
 import pathlib
 import re
 import stat
+import subprocess
 import tempfile
+import time
+
+from auth_state import quota_blocked, selected_codex_credential
 
 TAILNET = ipaddress.ip_network("100.64.0.0/10")
 UNIT_TOKEN = re.compile(r"^[A-Za-z0-9_.@-]+$")
@@ -24,6 +28,144 @@ class CommandResult:
     returncode: int
     stdout: str = ""
     stderr: str = ""
+
+
+def run_command(argv: list[str], timeout: int = 20) -> CommandResult:
+    """Run one fixed local command without a shell."""
+    completed = subprocess.run(
+        argv,
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=timeout,
+    )
+    return CommandResult(completed.returncode, completed.stdout, completed.stderr)
+
+
+def systemctl(run_cmd, *args: str) -> CommandResult:
+    """Run one local user-systemd command through the injected runner."""
+    return run_cmd(["systemctl", "--user", *args], 20)
+
+
+def repair_health_timer(cfg: dict, run_cmd, dry_run: bool) -> tuple[bool, str]:
+    """Repair the configured health timer once, then prove its schedule."""
+    timer, check_service = _local_timer_units(cfg)
+    if dry_run:
+        argv = ["systemctl", "--user", "enable", "--now", timer]
+        return True, f"dry-run: {' '.join(argv)}"
+
+    enabled = systemctl(run_cmd, "is-enabled", timer)
+    enabled_state = enabled.stdout.strip().lower()
+    if enabled_state in {"masked", "masked-runtime"}:
+        return True, f"health timer is {enabled_state}; leaving it unchanged"
+
+    if enabled.returncode != 0:
+        if enabled_state != "disabled":
+            return False, "health timer is not enabled"
+        repair = systemctl(run_cmd, "enable", "--now", timer)
+        if repair.returncode != 0:
+            return False, "health timer enable failed"
+        return _verify_timer(run_cmd, timer)
+
+    active, next_elapse = _timer_status(run_cmd, timer)
+    if active and _has_next_elapse(next_elapse):
+        return True, "health timer is active and scheduled"
+
+    restarted = systemctl(run_cmd, "restart", timer)
+    if restarted.returncode != 0:
+        return False, "health timer restart failed"
+    started = systemctl(run_cmd, "start", check_service)
+    if started.returncode != 0:
+        return False, "health check service start failed"
+    return _verify_timer(run_cmd, timer)
+
+
+def _local_timer_units(cfg: dict) -> tuple[str, str]:
+    if not isinstance(cfg, dict) or not isinstance(cfg.get("self_heal"), dict):
+        raise Disarmed("self-heal configuration is malformed")
+    self_heal = cfg["self_heal"]
+    return (
+        validate_unit(self_heal.get("health_timer"), ".timer"),
+        validate_unit(self_heal.get("check_service"), ".service"),
+    )
+
+
+def _timer_status(run_cmd, timer: str) -> tuple[bool, str]:
+    active = systemctl(run_cmd, "is-active", timer)
+    next_elapse = systemctl(
+        run_cmd, "show", timer, "--property=NextElapseUSecRealtime", "--value"
+    )
+    return active.returncode == 0 and active.stdout.strip() == "active", next_elapse.stdout.strip()
+
+
+def _verify_timer(run_cmd, timer: str) -> tuple[bool, str]:
+    enabled = systemctl(run_cmd, "is-enabled", timer)
+    active, next_elapse = _timer_status(run_cmd, timer)
+    if enabled.returncode == 0 and active and _has_next_elapse(next_elapse):
+        return True, f"health timer is active and scheduled for {next_elapse}"
+    return False, "health timer did not become enabled, active, and scheduled"
+
+
+def _has_next_elapse(value: str) -> bool:
+    return value.strip().lower() not in {"", "n/a", "[not set]"}
+
+
+def repair_gateway(
+    cfg: dict, auth: dict, run_cmd, dry_run: bool, sleeper=time.sleep
+) -> tuple[bool, str]:
+    """Restart an inactive local gateway once when passive auth state permits it."""
+    if not isinstance(cfg, dict):
+        raise Disarmed("self-heal configuration is malformed")
+    gateway = validate_unit(cfg.get("gateway_unit"), ".service")
+    self_heal = cfg.get("self_heal")
+    if not isinstance(self_heal, dict):
+        raise Disarmed("self-heal configuration is malformed")
+    if dry_run:
+        argv = ["systemctl", "--user", "restart", gateway]
+        return True, f"dry-run: {' '.join(argv)}"
+
+    current = systemctl(run_cmd, "is-active", gateway)
+    if current.returncode == 0 and current.stdout.strip() == "active":
+        return True, "gateway is active"
+
+    if not _gateway_can_recover(auth):
+        return False, "gateway is inactive and no recoverable credential is available"
+    if not self_heal.get("gateway_restart"):
+        return False, "gateway restart is disabled"
+
+    restarted = systemctl(run_cmd, "restart", gateway)
+    if restarted.returncode != 0:
+        return False, "gateway restart failed"
+
+    for attempt in range(10):
+        current = systemctl(run_cmd, "is-active", gateway)
+        if current.returncode == 0 and current.stdout.strip() == "active":
+            return True, "gateway is active after restart"
+        if attempt < 9:
+            sleeper(1)
+    return False, "gateway did not become active after restart"
+
+
+def _gateway_can_recover(auth: dict) -> bool:
+    if not isinstance(auth, dict):
+        return False
+    try:
+        if selected_codex_credential(auth) is not None:
+            return True
+        exhausted, _ = quota_blocked(auth)
+        pool = (auth.get("credential_pool") or {}).get("openai-codex") or []
+    except (AttributeError, TypeError, ValueError):
+        return False
+    if not exhausted:
+        return False
+    if not isinstance(pool, list):
+        return False
+    return any(
+        isinstance(entry, dict)
+        and str(entry.get("last_status") or "").lower() != "dead"
+        and bool((entry.get("tokens") or entry).get("refresh_token"))
+        for entry in pool
+    )
 
 
 def load_state(path: pathlib.Path) -> dict:

@@ -14,6 +14,7 @@ import pytest
 
 HERE = pathlib.Path(__file__).resolve().parent
 WATCHDOG = HERE.parent / "watchdog"
+sys.path.insert(0, str(WATCHDOG))
 
 
 def load_healer():
@@ -57,6 +58,191 @@ def local_cfg():
             "peers": [],
         },
     }
+
+
+def test_disabled_timer_is_enabled_started_and_verified():
+    runner = ScriptedRunner([
+        result(1, "disabled"),
+        result(0),
+        result(0, "enabled"),
+        result(0, "active"),
+        result(0, "Mon 2026-08-31 18:35:00 +08"),
+    ])
+
+    ok, detail = healer.repair_health_timer(local_cfg(), runner, dry_run=False)
+
+    assert ok is True
+    assert runner.calls[1] == [
+        "systemctl", "--user", "enable", "--now", "hermes-codex-health.timer"
+    ]
+    assert "scheduled" in detail
+
+
+@pytest.mark.parametrize("status", ["masked", "masked-runtime"])
+def test_masked_timer_is_respected_without_mutation(status):
+    runner = ScriptedRunner([result(1, status)])
+
+    ok, detail = healer.repair_health_timer(local_cfg(), runner, dry_run=False)
+
+    assert ok is True
+    assert status in detail
+    assert len(runner.calls) == 1
+
+
+def test_enabled_unscheduled_timer_restarts_and_starts_the_check_service_once():
+    runner = ScriptedRunner([
+        result(0, "enabled"),
+        result(0, "active"),
+        result(0, ""),
+        result(0),
+        result(0),
+        result(0, "enabled"),
+        result(0, "active"),
+        result(0, "Mon 2026-08-31 18:35:00 +08"),
+    ])
+
+    ok, detail = healer.repair_health_timer(local_cfg(), runner, dry_run=False)
+
+    assert ok is True
+    assert "scheduled" in detail
+    assert runner.calls == [
+        ["systemctl", "--user", "is-enabled", "hermes-codex-health.timer"],
+        ["systemctl", "--user", "is-active", "hermes-codex-health.timer"],
+        ["systemctl", "--user", "show", "hermes-codex-health.timer",
+         "--property=NextElapseUSecRealtime", "--value"],
+        ["systemctl", "--user", "restart", "hermes-codex-health.timer"],
+        ["systemctl", "--user", "start", "hermes-codex-health.service"],
+        ["systemctl", "--user", "is-enabled", "hermes-codex-health.timer"],
+        ["systemctl", "--user", "is-active", "hermes-codex-health.timer"],
+        ["systemctl", "--user", "show", "hermes-codex-health.timer",
+         "--property=NextElapseUSecRealtime", "--value"],
+    ]
+
+
+def test_timer_dry_run_returns_fixed_argv_without_running_commands():
+    runner = ScriptedRunner([])
+
+    ok, detail = healer.repair_health_timer(local_cfg(), runner, dry_run=True)
+
+    assert ok is True
+    assert detail == (
+        "dry-run: systemctl --user enable --now hermes-codex-health.timer"
+    )
+    assert runner.calls == []
+
+
+def test_timer_rejects_unsafe_configured_units_before_running_commands():
+    runner = ScriptedRunner([])
+    cfg = local_cfg()
+    cfg["self_heal"]["health_timer"] = "timer;reboot.timer"
+
+    with pytest.raises(healer.Disarmed):
+        healer.repair_health_timer(cfg, runner, dry_run=False)
+
+    assert runner.calls == []
+
+
+def test_inactive_gateway_restarts_when_a_credential_can_recover():
+    runner = ScriptedRunner([
+        result(3, "inactive"), result(0), result(0, "active")
+    ])
+    auth = {"providers": {"openai-codex": {"tokens": {
+        "access_token": "access", "refresh_token": "refresh"
+    }}}}
+    original_auth = json.dumps(auth, sort_keys=True)
+
+    ok, detail = healer.repair_gateway(
+        local_cfg(), auth, runner, dry_run=False, sleeper=lambda _: None
+    )
+
+    assert ok is True
+    assert ["systemctl", "--user", "restart", "hermes-gateway.service"] in runner.calls
+    assert "active" in detail
+    assert json.dumps(auth, sort_keys=True) == original_auth
+
+
+def test_terminal_credential_blocks_gateway_restart():
+    runner = ScriptedRunner([result(3, "inactive")])
+    auth = {"credential_pool": {"openai-codex": [{
+        "id": "dead", "auth_type": "oauth", "access_token": "",
+        "refresh_token": "", "last_status": "dead"
+    }]}}
+
+    ok, detail = healer.repair_gateway(
+        local_cfg(), auth, runner, dry_run=False, sleeper=lambda _: None
+    )
+
+    assert ok is False
+    assert "credential" in detail
+    assert len(runner.calls) == 1
+
+
+def test_malformed_credential_pool_blocks_gateway_restart():
+    runner = ScriptedRunner([result(3, "inactive")])
+
+    ok, detail = healer.repair_gateway(
+        local_cfg(), {"credential_pool": ["invalid"]}, runner,
+        dry_run=False, sleeper=lambda _: None
+    )
+
+    assert ok is False
+    assert "credential" in detail
+    assert len(runner.calls) == 1
+
+
+def test_active_gateway_is_left_unchanged_without_inspecting_credentials():
+    runner = ScriptedRunner([result(0, "active")])
+
+    ok, detail = healer.repair_gateway(
+        local_cfg(), {"credential_pool": {}}, runner, dry_run=False, sleeper=lambda _: None
+    )
+
+    assert ok is True
+    assert detail == "gateway is active"
+    assert runner.calls == [
+        ["systemctl", "--user", "is-active", "hermes-gateway.service"]
+    ]
+
+
+def test_quota_blocked_but_renewable_pool_permits_one_gateway_restart():
+    runner = ScriptedRunner([
+        result(3, "inactive"), result(0), result(0, "active")
+    ])
+    auth = {"credential_pool": {"openai-codex": [{
+        "id": "quota", "auth_type": "oauth", "refresh_token": "refresh",
+        "last_status": "exhausted", "last_error_code": "429",
+        "last_error_reset_at": time.time() + 600,
+    }]}}
+
+    ok, detail = healer.repair_gateway(
+        local_cfg(), auth, runner, dry_run=False, sleeper=lambda _: None
+    )
+
+    assert ok is True
+    assert "active" in detail
+    assert runner.calls[1] == [
+        "systemctl", "--user", "restart", "hermes-gateway.service"
+    ]
+
+
+def test_gateway_polls_at_most_ten_times_after_one_restart():
+    sleeps = []
+    runner = ScriptedRunner([
+        result(3, "inactive"), result(0), *[result(3, "inactive") for _ in range(10)]
+    ])
+    auth = {"providers": {"openai-codex": {"tokens": {"refresh_token": "refresh"}}}}
+
+    ok, detail = healer.repair_gateway(
+        local_cfg(), auth, runner, dry_run=False, sleeper=sleeps.append
+    )
+
+    assert ok is False
+    assert "did not become active" in detail
+    assert len(sleeps) == 9
+    assert len(runner.calls) == 12
+    assert runner.calls.count([
+        "systemctl", "--user", "restart", "hermes-gateway.service"
+    ]) == 1
 
 
 def test_state_is_atomic_private_and_rearms_after_recovery(tmp_path):
