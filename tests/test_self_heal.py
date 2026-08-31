@@ -225,6 +225,40 @@ def test_quota_blocked_but_renewable_pool_permits_one_gateway_restart():
     ]
 
 
+def test_revoked_quota_entry_blocks_gateway_restart():
+    runner = ScriptedRunner([result(3, "inactive")])
+    auth = {"credential_pool": {"openai-codex": [{
+        "id": "revoked", "auth_type": "oauth", "refresh_token": "refresh",
+        "last_status": "revoked", "last_error_code": "429",
+        "last_error_message": "usage_limit", "last_error_reset_at": time.time() + 600,
+    }]}}
+
+    ok, detail = healer.repair_gateway(
+        local_cfg(), auth, runner, dry_run=False, sleeper=lambda _: None
+    )
+
+    assert ok is False
+    assert "credential" in detail
+    assert len(runner.calls) == 1
+
+
+def test_malformed_quota_tokens_block_gateway_restart(monkeypatch):
+    runner = ScriptedRunner([result(3, "inactive")])
+    auth = {"credential_pool": {"openai-codex": [{
+        "id": "quota", "tokens": "bad", "last_status": "exhausted"
+    }]}}
+    monkeypatch.setattr(healer, "selected_codex_credential", lambda _: None)
+    monkeypatch.setattr(healer, "quota_blocked", lambda _: (True, "quota"))
+
+    ok, detail = healer.repair_gateway(
+        local_cfg(), auth, runner, dry_run=False, sleeper=lambda _: None
+    )
+
+    assert ok is False
+    assert "credential" in detail
+    assert len(runner.calls) == 1
+
+
 def test_gateway_polls_at_most_ten_times_after_one_restart():
     sleeps = []
     runner = ScriptedRunner([

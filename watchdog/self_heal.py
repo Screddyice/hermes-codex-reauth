@@ -162,7 +162,8 @@ def _gateway_can_recover(auth: dict) -> bool:
         return False
     return any(
         isinstance(entry, dict)
-        and str(entry.get("last_status") or "").lower() != "dead"
+        and str(entry.get("last_status") or "").lower() == "exhausted"
+        and isinstance(entry.get("tokens") or entry, dict)
         and bool((entry.get("tokens") or entry).get("refresh_token"))
         for entry in pool
     )
