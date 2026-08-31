@@ -16,10 +16,10 @@
 - Keep `hermes_home` explicit in each non-observer host config.
 - Preserve `down`, `quota`, `peer`, `sibling`, and `unknown` verdict semantics.
 - Run no live Codex request during a healthy healer cycle.
-- Let Hermes write OAuth tokens. The healer may back up `auth.json` but must not edit token fields.
+- Use the pinned stdlib-only helper for one direct OAuth refresh. Import no Hermes agent or plugin module.
 - Do not call `hermes auth reset openai-codex`.
 - Do not automate device-code login or 2FA.
-- Use one Hermes warmup and one live probe per credential repair attempt.
+- Record the attempt before one direct refresh. Run one live probe only after verified persistence.
 - Require strict host-key checking and `100.64.0.0/10` addresses for peer SSH.
 - Use fixed remote systemd commands, strict token validation, no `sudo`, and no user-provided shell fragments.
 - Write healer state atomically with mode `0600`.
@@ -34,8 +34,10 @@
 
 - Create `watchdog/auth_state.py`: shared passive parsing and credential selection.
 - Create `watchdog/self_heal.py`: local repair, credential recovery, peer repair, state, and CLI.
+- Create `watchdog/hermes_codex_refresh.py`: isolated contract validation, refresh, atomic persistence, and verification.
 - Create `tests/test_auth_state.py`: shared auth-state behavior.
 - Create `tests/test_self_heal.py`: healer unit and integration behavior.
+- Create `tests/test_hermes_codex_refresh.py`: direct-refresh isolation and persistence behavior.
 - Modify `watchdog/codex_health_check.py`: import shared auth helpers without changing verdicts.
 - Modify `watchdog/codex_auth_probe.py`: probe the selected pooled credential.
 - Modify `watchdog/notify_failure.py`: render healer-specific escalation text.

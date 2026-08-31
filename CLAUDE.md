@@ -72,13 +72,16 @@ hard-fail with no auth store. There is a test asserting both halves.
 
 
 **Keep healer mutation bounded.** One cycle may attempt one local timer repair,
-one gateway restart, one backed-up Hermes credential warmup plus one probe, and
+one gateway restart, one backed-up direct credential refresh plus one probe, and
 one repair per allowlisted peer. The healer must verify each postcondition.
 
-**Let Hermes write OAuth state.** The healer may make a mode-`0600` copy of
-`auth.json`, retain five snapshots, and invoke one pinned Hermes warmup. It must
-not edit token fields, restore an old snapshot, call `hermes auth reset`, redeem
-usage-reset credits, or automate device-code login and 2FA.
+**Keep direct OAuth refresh isolated and contract-pinned.** The healer may make
+a mode-`0600` copy of `auth.json`, retain five snapshots, and invoke the
+stdlib-only refresh helper through the pinned Hermes Python runtime. The helper
+must validate the installed Hermes version and source hashes before one request,
+hold `auth.lock` through atomic persistence, and import no agent or plugin code.
+It must not restore an old snapshot, call `hermes auth reset`, redeem usage-reset
+credits, or automate device-code login and 2FA.
 
 **Keep peer SSH fixed and narrow.** Accept Tailscale IPs and committed users,
 paths, and unit names only. Require a private identity and pinned host-key file.

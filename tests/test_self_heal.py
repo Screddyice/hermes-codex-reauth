@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import dataclasses
+import hashlib
 import http.server
 import importlib.util
 import json
@@ -34,8 +35,63 @@ def load_healer():
 healer = load_healer()
 
 
+TEST_AUTH_SOURCE = '''
+AUTH_STORE_VERSION = 1
+AUTH_LOCK_TIMEOUT_SECONDS = 15.0
+CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
+CODEX_RATE_LIMITED_CODE = "codex_rate_limited"
+def _auth_lock_path(): pass
+def _auth_store_lock(timeout_seconds=AUTH_LOCK_TIMEOUT_SECONDS): pass
+def _load_auth_store(auth_file=None): pass
+def _save_auth_store(auth_store): pass
+def refresh_codex_oauth_pure(access_token, refresh_token, *, timeout_seconds=20.0): pass
+'''
+
+
+TEST_POOL_SOURCE = '''
+class CredentialPool:
+    def _sync_device_code_entry_to_auth_store(self, entry): pass
+    def _refresh_entry(self, entry, *, force): pass
+'''
+
+
+def write_test_hermes_contract(tmp_path, python_body='#!/bin/sh\necho \'{"status":"ready"}\'\n'):
+    runtime = tmp_path / "hermes-runtime"
+    runtime.mkdir(parents=True, exist_ok=True)
+    python = runtime / "python"
+    python.write_text(python_body)
+    python.chmod(0o700)
+    auth_module = runtime / "hermes_cli" / "auth.py"
+    pool_module = runtime / "agent" / "credential_pool.py"
+    auth_module.parent.mkdir()
+    pool_module.parent.mkdir()
+    auth_module.write_text(TEST_AUTH_SOURCE)
+    pool_module.write_text(TEST_POOL_SOURCE)
+    return {
+        "hermes_python": str(python),
+        "hermes_version": "0.16.0",
+        "hermes_auth_module": str(auth_module),
+        "hermes_auth_sha256": hashlib.sha256(auth_module.read_bytes()).hexdigest(),
+        "hermes_credential_pool_module": str(pool_module),
+        "hermes_credential_pool_sha256": hashlib.sha256(pool_module.read_bytes()).hexdigest(),
+    }
+
+
 def result(returncode: int, stdout: str = "", stderr: str = ""):
     return healer.CommandResult(returncode, stdout, stderr)
+
+
+def planned(lineage="singleton", refresh_token="refresh"):
+    return result(0, json.dumps({
+        "status": "planned",
+        "lineage": lineage,
+        "refresh_fingerprint": hashlib.sha256(refresh_token.encode()).hexdigest(),
+    }))
+
+
+def persisted():
+    return result(0, '{"status":"persisted"}')
 
 
 class ScriptedRunner:
@@ -60,8 +116,12 @@ def local_cfg():
             "health_timer": "hermes-codex-health.timer",
             "check_service": "hermes-codex-health.service",
             "gateway_restart": True,
-            "codex_model": "openai-codex/gpt-5.5",
-            "hermes_executable": "/opt/hermes-agent/venv/bin/hermes",
+            "hermes_python": "/opt/hermes-agent/venv/bin/python",
+            "hermes_version": "0.16.0",
+            "hermes_auth_module": "/opt/hermes-agent/hermes_cli/auth.py",
+            "hermes_auth_sha256": "0e7be1c3e1e5c5c36e2b8f118ff51acb573d4a12207dc2fc6eb6b9f092af383f",
+            "hermes_credential_pool_module": "/opt/hermes-agent/agent/credential_pool.py",
+            "hermes_credential_pool_sha256": "be1a45cb8e2b34463b079941b0c9c18f76f8bc7d2c22282696783eca389a99fb",
             "retry_s": 21600,
             "peers": [],
         },
@@ -93,10 +153,7 @@ def write_cli_config(tmp_path, *, peers=None, observer=False):
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir(exist_ok=True)
         (hermes_home / "auth.json").write_text(json.dumps(healthy_singleton()))
-        hermes_executable = tmp_path / "bin" / "hermes"
-        hermes_executable.parent.mkdir(exist_ok=True)
-        hermes_executable.write_text("#!/bin/sh\nexit 0\n")
-        hermes_executable.chmod(0o700)
+        contract = write_test_hermes_contract(tmp_path)
         cfg = {
             "host_label": "test-host",
             "hermes_home": str(hermes_home),
@@ -105,8 +162,7 @@ def write_cli_config(tmp_path, *, peers=None, observer=False):
                 "health_timer": "hermes-codex-health.timer",
                 "check_service": "hermes-codex-health.service",
                 "gateway_restart": True,
-                "codex_model": "openai-codex/gpt-5.5",
-                "hermes_executable": str(hermes_executable),
+                **contract,
                 "maintenance_lock": str(tmp_path / "SELF_HEAL_PAUSED"),
                 "retry_s": 21600,
                 "peers": peers or [],
@@ -172,7 +228,7 @@ def stale_singleton_with_healthy_manual_pool():
     (dead_singleton(), 1000, "human_2fa"),
     (fully_blocked_pool(reset_at=2000), 1000, "wait_quota"),
     (fully_blocked_pool(reset_at=2000), 2000, "warmup"),
-    (stale_singleton_with_healthy_manual_pool(), 1000, "warmup"),
+    (stale_singleton_with_healthy_manual_pool(), 1000, "none"),
 ])
 def test_credential_action(auth, now, expected):
     assert healer.credential_action(auth, now) == expected
@@ -200,7 +256,7 @@ def test_terminal_credential_codes_require_human_2fa(code):
     assert healer.credential_action(auth, 1000) == "human_2fa"
 
 
-def test_healthy_pool_alternate_replaces_a_terminal_entry():
+def test_healthy_pool_alternate_outranks_a_terminal_entry():
     auth = {"credential_pool": {"openai-codex": [
         {
             "id": "dead", "last_status": "dead", "last_error_code": "invalid_grant",
@@ -214,7 +270,7 @@ def test_healthy_pool_alternate_replaces_a_terminal_entry():
         },
     ]}}
 
-    assert healer.credential_action(auth, 1000) == "warmup"
+    assert healer.credential_action(auth, 1000) == "none"
 
 
 def test_backup_is_private_and_retains_five_newest(tmp_path):
@@ -246,78 +302,96 @@ def test_backup_destination_is_private_before_auth_bytes_are_copied(tmp_path, mo
     assert observed == [(0o600, 0)]
 
 
-def test_warmup_is_pinned_safe_and_bounded():
-    runner = ScriptedRunner([result(0, "OK")])
-    outcome = healer.run_hermes_warmup(local_cfg(), runner)
+def test_refresh_helper_is_pinned_isolated_and_bounded():
+    runner = ScriptedRunner([result(0, '{"status":"ready"}')])
+    outcome = healer.run_refresh_readiness(local_cfg(), runner)
     assert outcome.returncode == 0
     assert runner.calls == [[
-        "/opt/hermes-agent/venv/bin/hermes",
-        "--safe-mode", "--provider", "openai-codex",
-        "-m", "openai-codex/gpt-5.5", "-z", "Reply with exactly: OK"
+        "/opt/hermes-agent/venv/bin/python",
+        "-I", str(WATCHDOG / "hermes_codex_refresh.py"),
+        "--expected-python", "/opt/hermes-agent/venv/bin/python",
+        "--expected-version", "0.16.0",
+        "--auth-module", "/opt/hermes-agent/hermes_cli/auth.py",
+        "--auth-sha256", "0e7be1c3e1e5c5c36e2b8f118ff51acb573d4a12207dc2fc6eb6b9f092af383f",
+        "--pool-module", "/opt/hermes-agent/agent/credential_pool.py",
+        "--pool-sha256", "be1a45cb8e2b34463b079941b0c9c18f76f8bc7d2c22282696783eca389a99fb",
+        "--check-readiness",
     ]]
-    assert runner.timeouts == [120]
+    assert runner.timeouts == [20]
 
 
-@pytest.mark.parametrize("hermes_executable", ["hermes", "bin/hermes"])
-def test_config_rejects_bare_or_relative_hermes_executable(
-    tmp_path, hermes_executable
+@pytest.mark.parametrize("hermes_python", ["python", "bin/python"])
+def test_config_rejects_bare_or_relative_hermes_python(
+    tmp_path, hermes_python
 ):
     cfg_path = write_cli_config(tmp_path)
     cfg = json.loads(cfg_path.read_text())
-    cfg["self_heal"]["hermes_executable"] = hermes_executable
+    cfg["self_heal"]["hermes_python"] = hermes_python
     cfg_path.write_text(json.dumps(cfg))
 
-    with pytest.raises(healer.Disarmed, match="Hermes executable"):
+    with pytest.raises(healer.Disarmed, match="Hermes Python"):
         healer.load_config(cfg_path)
 
 
-def test_config_rejects_missing_hermes_executable(tmp_path):
+def test_config_rejects_missing_hermes_python(tmp_path):
     cfg_path = write_cli_config(tmp_path)
     cfg = json.loads(cfg_path.read_text())
-    cfg["self_heal"]["hermes_executable"] = str(tmp_path / "missing-hermes")
+    cfg["self_heal"]["hermes_python"] = str(tmp_path / "missing-python")
     cfg_path.write_text(json.dumps(cfg))
 
-    with pytest.raises(healer.Disarmed, match="Hermes executable"):
+    with pytest.raises(healer.Disarmed, match="Hermes Python"):
         healer.load_config(cfg_path)
 
 
-def test_config_requires_hermes_executable_for_credential_roles(tmp_path):
+def test_config_requires_hermes_python_for_credential_roles(tmp_path):
     cfg_path = write_cli_config(tmp_path)
     cfg = json.loads(cfg_path.read_text())
-    del cfg["self_heal"]["hermes_executable"]
+    del cfg["self_heal"]["hermes_python"]
     cfg_path.write_text(json.dumps(cfg))
 
-    with pytest.raises(healer.Disarmed, match="Hermes executable"):
+    with pytest.raises(healer.Disarmed, match="Hermes Python"):
         healer.load_config(cfg_path)
 
 
-def test_config_rejects_directory_as_hermes_executable(tmp_path):
+def test_config_rejects_directory_as_hermes_python(tmp_path):
     cfg_path = write_cli_config(tmp_path)
     cfg = json.loads(cfg_path.read_text())
-    cfg["self_heal"]["hermes_executable"] = str(tmp_path)
+    cfg["self_heal"]["hermes_python"] = str(tmp_path)
     cfg_path.write_text(json.dumps(cfg))
 
     with pytest.raises(healer.Disarmed, match="regular file"):
         healer.load_config(cfg_path)
 
 
-def test_config_rejects_non_executable_hermes_file(tmp_path):
+def test_config_rejects_non_executable_hermes_python(tmp_path):
     cfg_path = write_cli_config(tmp_path)
     cfg = json.loads(cfg_path.read_text())
-    hermes_executable = tmp_path / "non-executable-hermes"
-    hermes_executable.write_text("#!/bin/sh\nexit 0\n")
-    hermes_executable.chmod(0o600)
-    cfg["self_heal"]["hermes_executable"] = str(hermes_executable)
+    hermes_python = tmp_path / "non-executable-python"
+    hermes_python.write_text("#!/bin/sh\nexit 0\n")
+    hermes_python.chmod(0o600)
+    cfg["self_heal"]["hermes_python"] = str(hermes_python)
     cfg_path.write_text(json.dumps(cfg))
 
-    with pytest.raises(healer.Disarmed, match="Hermes executable"):
+    with pytest.raises(healer.Disarmed, match="Hermes Python"):
         healer.load_config(cfg_path)
+
+
+def test_config_accepts_a_pinned_venv_python_symlink(tmp_path):
+    cfg_path = write_cli_config(tmp_path)
+    cfg = json.loads(cfg_path.read_text())
+    target = pathlib.Path(cfg["self_heal"]["hermes_python"])
+    symlink = target.with_name("venv-python")
+    symlink.symlink_to(target)
+    cfg["self_heal"]["hermes_python"] = str(symlink)
+    cfg_path.write_text(json.dumps(cfg))
+
+    assert healer.load_config(cfg_path)["self_heal"]["hermes_python"] == str(symlink)
 
 
 def test_cli_readiness_rejects_dependency_before_any_mutation(tmp_path, monkeypatch):
     cfg_path = write_cli_config(tmp_path)
     cfg = json.loads(cfg_path.read_text())
-    cfg["self_heal"]["hermes_executable"] = str(tmp_path / "missing-hermes")
+    cfg["self_heal"]["hermes_python"] = str(tmp_path / "missing-python")
     cfg_path.write_text(json.dumps(cfg))
     crossed = []
 
@@ -430,39 +504,48 @@ def write_cfg(tmp_path):
     return path
 
 
-def test_expired_credential_is_backed_up_warmed_restarted_and_probed_once(tmp_path):
+def test_expired_credential_is_backed_up_refreshed_restarted_and_probed_once(tmp_path):
     auth_path = write_auth(tmp_path, expired_refreshable_singleton())
     cfg_path = write_cfg(tmp_path)
+    state = {"faults": {}}
+    persisted_states = []
 
-    def warmup_after_backup(_argv, _timeout):
+    def refresh_after_backup(_argv, _timeout):
         snapshots = list((tmp_path / "backups").glob("*-auth.json"))
         assert len(snapshots) == 1
         assert stat.S_IMODE(snapshots[0].stat().st_mode) == 0o600
-        return result(0, "OK")
+        assert persisted_states[-1]["credential_refresh_attempt"]["status"] == "in_flight"
+        return persisted()
 
     runner = ScriptedRunner([
-        warmup_after_backup,
+        planned(),
+        refresh_after_backup,
         result(0),
         result(0, "active"),
         result(0, "OK"),
     ])
 
     ok, detail = healer.repair_credential(
-        local_cfg(), cfg_path, auth_path, {"faults": {}}, runner, 1000, False
+        local_cfg(), cfg_path, auth_path, state, runner, 1000, False,
+        persist_state=lambda: persisted_states.append(
+            json.loads(json.dumps(state))
+        ),
     )
 
     assert ok is True
     assert "verified" in detail
-    assert runner.calls == [
-        ["/opt/hermes-agent/venv/bin/hermes",
-         "--safe-mode", "--provider", "openai-codex",
-         "-m", "openai-codex/gpt-5.5", "-z", "Reply with exactly: OK"],
+    assert "--plan" in runner.calls[0]
+    assert "--refresh" in runner.calls[1]
+    assert runner.calls[2:] == [
         ["systemctl", "--user", "restart", "hermes-gateway.service"],
         ["systemctl", "--user", "is-active", "hermes-gateway.service"],
         [sys.executable, str(WATCHDOG / "codex_auth_probe.py"),
          "--config", str(cfg_path)],
     ]
-    assert runner.timeouts == [120, 20, 20, 40]
+    assert runner.timeouts == [20, 40, 20, 20, 40]
+    assert [saved["credential_refresh_attempt"]["status"] for saved in persisted_states] == [
+        "in_flight", "persisted"
+    ]
 
 
 def test_terminal_credential_requires_human_2fa_without_mutation(tmp_path):
@@ -502,7 +585,7 @@ def test_quota_at_reset_gets_only_one_attempt_for_that_window(tmp_path):
     cfg_path = write_cfg(tmp_path)
     state = {"faults": {}}
     runner = ScriptedRunner([
-        result(0, "OK"), result(0), result(0, "active"), result(0, "OK")
+        planned("pool:quota"), persisted(), result(0), result(0, "active"), result(0, "OK")
     ])
 
     first_ok, _ = healer.repair_credential(
@@ -518,27 +601,20 @@ def test_quota_at_reset_gets_only_one_attempt_for_that_window(tmp_path):
     assert "already attempted" in second_detail
     assert state["quota_attempt_reset_at"] == 2000
     assert len([
-        call for call in runner.calls
-        if call[0] == local_cfg()["self_heal"]["hermes_executable"]
+        call for call in runner.calls if "--refresh" in call
     ]) == 1
     assert len([call for call in runner.calls if "codex_auth_probe.py" in call[1]]) == 1
     assert second_runner.calls == []
 
 
-def test_fresh_probe_quota_records_new_reset_without_second_request(tmp_path):
+def test_refresh_429_records_new_reset_without_probe_or_second_request(tmp_path):
     auth_path = write_auth(tmp_path, fully_blocked_pool(reset_at=2000))
     cfg_path = write_cfg(tmp_path)
     state = {"faults": {}}
 
-    def warmup_records_next_reset(_argv, _timeout):
-        auth_path.write_text(json.dumps(fully_blocked_pool(reset_at=3000)))
-        return result(0, "QUOTA")
-
     runner = ScriptedRunner([
-        warmup_records_next_reset,
-        result(0),
-        result(0, "active"),
-        result(3, "QUOTA"),
+        planned("pool:quota"),
+        result(3, '{"status":"quota","reset_at":3000}'),
     ])
 
     ok, detail = healer.repair_credential(
@@ -550,14 +626,13 @@ def test_fresh_probe_quota_records_new_reset_without_second_request(tmp_path):
     assert state["quota_attempt_reset_at"] == 2000
     assert state["quota_reset_at"] == 3000
     assert len([
-        call for call in runner.calls
-        if call[0] == local_cfg()["self_heal"]["hermes_executable"]
+        call for call in runner.calls if "--refresh" in call
     ]) == 1
-    assert len([call for call in runner.calls if "codex_auth_probe.py" in call[1]]) == 1
-    assert len(runner.calls) == 4
+    assert not any("codex_auth_probe.py" in call for call in runner.calls)
+    assert len(runner.calls) == 2
 
     next_runner = ScriptedRunner([
-        result(0), result(0), result(0, "active"), result(0)
+        planned("pool:quota"), persisted(), result(0), result(0, "active"), result(0)
     ])
     next_ok, _ = healer.repair_credential(
         local_cfg(), cfg_path, auth_path, state, next_runner, 3000, False
@@ -565,8 +640,7 @@ def test_fresh_probe_quota_records_new_reset_without_second_request(tmp_path):
 
     assert next_ok is True
     assert len([
-        call for call in next_runner.calls
-        if call[0] == local_cfg()["self_heal"]["hermes_executable"]
+        call for call in next_runner.calls if "--refresh" in call
     ]) == 1
     assert len([call for call in next_runner.calls if "codex_auth_probe.py" in call[1]]) == 1
 
@@ -574,7 +648,7 @@ def test_fresh_probe_quota_records_new_reset_without_second_request(tmp_path):
 def test_unknown_probe_marks_verification_failure_and_preserves_backup(tmp_path):
     auth_path = write_auth(tmp_path, expired_refreshable_singleton())
     runner = ScriptedRunner([
-        result(0, "OK"), result(0), result(0, "active"), result(2, "UNKNOWN")
+        planned(), persisted(), result(0), result(0, "active"), result(2, "UNKNOWN")
     ])
 
     ok, detail = healer.repair_credential(
@@ -591,7 +665,7 @@ def test_unknown_probe_marks_verification_failure_and_preserves_backup(tmp_path)
 def test_broken_probe_uses_exit_code_even_when_output_says_ok(tmp_path):
     auth_path = write_auth(tmp_path, expired_refreshable_singleton())
     runner = ScriptedRunner([
-        result(0), result(0), result(0, "active"), result(1, "OK")
+        planned(), persisted(), result(0), result(0, "active"), result(1, "OK")
     ])
 
     ok, detail = healer.repair_credential(
@@ -603,10 +677,12 @@ def test_broken_probe_uses_exit_code_even_when_output_says_ok(tmp_path):
     assert "human 2FA" in detail
 
 
-def test_warmup_failure_redacts_and_caps_output_while_preserving_backup(tmp_path):
+def test_refresh_failure_redacts_and_caps_output_while_preserving_backup(tmp_path):
     auth_path = write_auth(tmp_path, expired_refreshable_singleton())
     token = token_with_exp(9999)
-    runner = ScriptedRunner([result(1, f"Bearer {token} " + "x" * 1000)])
+    runner = ScriptedRunner([
+        planned(), result(1, f"Bearer {token} " + "x" * 1000)
+    ])
 
     ok, detail = healer.repair_credential(
         local_cfg(), write_cfg(tmp_path), auth_path, {"faults": {}},
@@ -617,7 +693,7 @@ def test_warmup_failure_redacts_and_caps_output_while_preserving_backup(tmp_path
     assert token not in detail
     assert len(detail) <= 500
     assert len(list((tmp_path / "backups").glob("*-auth.json"))) == 1
-    assert len(runner.calls) == 1
+    assert len(runner.calls) == 2
 
 
 @pytest.mark.parametrize(
@@ -636,11 +712,11 @@ def test_quoted_json_token_fields_are_redacted_in_rendered_detail(tmp_path, fiel
 def test_credential_repair_rereads_auth_before_gateway_restart(tmp_path):
     auth_path = write_auth(tmp_path, expired_refreshable_singleton())
 
-    def warmup_leaves_terminal_singleton(_argv, _timeout):
+    def refresh_leaves_terminal_singleton(_argv, _timeout):
         auth_path.write_text(json.dumps(dead_singleton()))
-        return result(0)
+        return persisted()
 
-    runner = ScriptedRunner([warmup_leaves_terminal_singleton])
+    runner = ScriptedRunner([planned(), refresh_leaves_terminal_singleton])
 
     ok, detail = healer.repair_credential(
         local_cfg(), write_cfg(tmp_path), auth_path, {"faults": {}},
@@ -649,7 +725,7 @@ def test_credential_repair_rereads_auth_before_gateway_restart(tmp_path):
 
     assert ok is False
     assert "recoverable credential" in detail
-    assert len(runner.calls) == 1
+    assert len(runner.calls) == 2
 
 
 def test_credential_dry_run_has_no_commands_backup_or_state_changes(tmp_path):
@@ -1754,8 +1830,12 @@ def test_shipped_role_configs_have_exact_local_healer_settings():
         "health_timer": "hermes-codex-health.timer",
         "check_service": "hermes-codex-health.service",
         "gateway_restart": True,
-        "codex_model": "openai-codex/gpt-5.5",
-        "hermes_executable": "/opt/hermes-agent/venv/bin/hermes",
+        "hermes_python": "/opt/hermes-agent/venv/bin/python",
+        "hermes_version": "0.16.0",
+        "hermes_auth_module": "/opt/hermes-agent/hermes_cli/auth.py",
+        "hermes_auth_sha256": "0e7be1c3e1e5c5c36e2b8f118ff51acb573d4a12207dc2fc6eb6b9f092af383f",
+        "hermes_credential_pool_module": "/opt/hermes-agent/agent/credential_pool.py",
+        "hermes_credential_pool_sha256": "be1a45cb8e2b34463b079941b0c9c18f76f8bc7d2c22282696783eca389a99fb",
         "maintenance_lock": "~/.hermes/codex-health/SELF_HEAL_PAUSED",
         "retry_s": 21600,
     }
@@ -1763,10 +1843,12 @@ def test_shipped_role_configs_have_exact_local_healer_settings():
         "health_timer": "hermes-codex-health-tmn.timer",
         "check_service": "hermes-codex-health-tmn.service",
         "gateway_restart": True,
-        "codex_model": "openai-codex/gpt-5.5",
-        "hermes_executable": (
-            "/home/shawn_teamnebula_ai/.hermes/hermes-agent/venv/bin/hermes"
-        ),
+        "hermes_python": "/home/shawn_teamnebula_ai/.hermes/hermes-agent/venv/bin/python",
+        "hermes_version": "0.16.0",
+        "hermes_auth_module": "/home/shawn_teamnebula_ai/.hermes/hermes-agent/hermes_cli/auth.py",
+        "hermes_auth_sha256": "0e7be1c3e1e5c5c36e2b8f118ff51acb573d4a12207dc2fc6eb6b9f092af383f",
+        "hermes_credential_pool_module": "/home/shawn_teamnebula_ai/.hermes/hermes-agent/agent/credential_pool.py",
+        "hermes_credential_pool_sha256": "be1a45cb8e2b34463b079941b0c9c18f76f8bc7d2c22282696783eca389a99fb",
         "maintenance_lock": "~/.hermes/codex-health/SELF_HEAL_PAUSED",
         "retry_s": 21600,
     }
@@ -1831,14 +1913,13 @@ def test_installer_preserves_healer_state_and_backups_and_checks_runtime(
     )
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    fake_hermes = fake_bin / "hermes"
-    fake_hermes.write_text("#!/bin/sh\nexit 0\n")
-    fake_hermes.chmod(0o755)
     install_root = tmp_path / "watchdog"
     shutil.copytree(WATCHDOG, install_root)
     src_config_path = install_root / "hosts" / "src.json"
     src_config = json.loads(src_config_path.read_text())
-    src_config["self_heal"]["hermes_executable"] = str(fake_hermes)
+    src_config["self_heal"].update(
+        write_test_hermes_contract(tmp_path / "installer-contract")
+    )
     src_config_path.write_text(json.dumps(src_config))
     trace = tmp_path / "systemctl.trace"
     systemctl = fake_bin / "systemctl"

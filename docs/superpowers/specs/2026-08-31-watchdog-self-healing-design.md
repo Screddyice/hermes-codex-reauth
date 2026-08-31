@@ -121,8 +121,9 @@ existing Telegram notifier through `OnFailure=`. Each timer will use
 `watchdog/install.sh` will install, enable, start, and assert the healer units.
 The installer will preserve both watchdog state files across deployment. Before
 it enables a credential-host healer timer, it will validate the role's absolute
-`self_heal.hermes_executable` as a readable, executable regular file. The
-observer has no credential mutation path and omits that field.
+Hermes Python path, package version, auth and credential-pool module paths,
+SHA-256 pins, and minimal AST contract. The observer has no credential mutation
+path and omits those fields.
 
 ## Local Repair Flows
 
@@ -154,26 +155,30 @@ restart becomes a repair fault and triggers the first-failure alert path.
 
 ### Credential pool and refresh
 
-The healer will use Hermes as the sole writer of OAuth state. It will never edit
-token fields.
+The healer will invoke a stdlib-only direct-refresh helper through the pinned
+Hermes Python runtime. The helper will import no Hermes agent or plugin module.
 
 Before the first credential mutation for an incident, it will copy `auth.json`
 to `<healer-dir>/backups/<UTC timestamp>-auth.json`, set mode `0600`, and retain
 the five newest snapshots. Logs will name the snapshot path without token data.
 
-The healer will run one bounded Hermes one-shot under the mutation lock when
+The healer will run one bounded direct refresh under the mutation lock when
 passive state shows either condition:
 
 - another renewable pool entry can replace the failed entry;
 - an access token expired while its refresh token remains present.
 
-The one-shot will pin the `openai-codex` provider and the host-configured Codex
-model, pass `--safe-mode`, use a fixed prompt, and enforce a 120-second timeout.
-Safe mode removes rules, plugins, and tools while the CLI flags retain the
-provider and model selection. Hermes owns pool selection, token rotation,
-terminal-entry quarantine, and persistence.
+The helper will validate the installed Hermes version, source hashes, OAuth
+endpoint, function signatures, lock path, and pool persistence semantics before
+the request. It will select one unique eligible lineage, hold Hermes'
+`auth.lock` across one request and one mode-`0600` atomic write, fsync the file
+and directory, and verify the persisted lineage. Manual pool entries stay
+independent. A `device_code` entry updates the singleton only when both stores
+held the same token pair before refresh.
 
-The healer will restart the gateway after the one-shot, then run one pool-aware
+The healer will record the attempt in its durable state before the request. A
+timeout, malformed response, or partial persistence blocks reuse of that refresh
+token. The healer will restart the gateway after verified persistence, then run one pool-aware
 live probe. Probe results control the outcome:
 
 - `OK`: clear the repair fault and record recovery.
@@ -181,7 +186,7 @@ live probe. Probe results control the outcome:
 - `BROKEN`: alert with the human device-code runbook.
 - `UNKNOWN`: preserve the prior state and alert that verification failed.
 
-The healer will not run a warmup when the selected entry has a terminal error
+The healer will not run a refresh when the selected entry has a terminal error
 and no viable alternate pool entry exists. It will also stop when the pool has
 no renewable entry or refresh token. A stale terminal singleton does not block a
 healthy manual pool entry. The unrecoverable cases require a person to complete
@@ -191,14 +196,16 @@ healthy manual pool entry. The unrecoverable cases require a person to complete
 
 The healer will make no Codex request before the latest recorded reset time for
 a fully blocked pool. The first healer run at or after that time will run one
-pinned Hermes one-shot, restart the gateway, and run one live probe.
+pinned direct refresh. Verified persistence gets one gateway restart and one
+live probe.
 
 The healer will not call `hermes auth reset`. Hermes pool selection already
 releases entries after `last_error_reset_at`, while `auth reset` clears terminal
 state that should stay quarantined.
 
 A new 429 stores the next reset and ends the attempt. The healer will wait for
-that reset before another request.
+that reset before another request. It will not restart the gateway or run the
+probe after a refresh-endpoint 429.
 
 ## Peer Repair
 
@@ -273,7 +280,12 @@ will remain host-specific.
     "health_timer": "hermes-codex-health.timer",
     "check_service": "hermes-codex-health.service",
     "gateway_restart": true,
-    "codex_model": "openai-codex/gpt-5.5",
+    "hermes_python": "/opt/hermes-agent/venv/bin/python",
+    "hermes_version": "0.16.0",
+    "hermes_auth_module": "/opt/hermes-agent/hermes_cli/auth.py",
+    "hermes_auth_sha256": "<reviewed SHA-256>",
+    "hermes_credential_pool_module": "/opt/hermes-agent/agent/credential_pool.py",
+    "hermes_credential_pool_sha256": "<reviewed SHA-256>",
     "maintenance_lock": "~/.hermes/codex-health/SELF_HEAL_PAUSED",
     "retry_s": 21600,
     "peers": []
@@ -281,7 +293,8 @@ will remain host-specific.
 }
 ```
 
-Observer config will set `gateway_restart` to false and omit `codex_model`.
+Observer config will set `gateway_restart` to false and omit the Hermes runtime
+and module pins.
 Peer entries will include Tailscale IP, SSH user, identity path, pinned
 `known_hosts`, and fixed unit names. No config will contain a private key or
 token.

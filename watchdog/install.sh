@@ -73,6 +73,7 @@ fi
 # The three Codex roles run the bounded healer. NEBOS Claude has no healer.
 if [[ -n "$HEAL_SERVICE" ]]; then
   install -m 0755 "$HERE/self_heal.py" "$DEST/self_heal.py"
+  install -m 0755 "$HERE/hermes_codex_refresh.py" "$DEST/hermes_codex_refresh.py"
 fi
 # The last-resort escalator lives beside the check it backs up, and reads that
 # check's config.json for host labels and hermes_home.

@@ -17,13 +17,15 @@ The retired design drove a browser through device-code login. OpenAI added 2FA,
 so the repository removed Chrome, Xvfb, Gmail OTP handling, residential proxy
 support, and scheduled live probes on 2026-08-11.
 
-The current healer lets Hermes own OAuth writes. It never edits tokens or calls
+The current healer uses a stdlib-only refresh helper that imports no Hermes
+agent, plugin, MCP, memory, rule, skill, or tool code. It never calls
 `hermes auth reset`. Before one eligible credential repair, it copies
 `auth.json` into the role directory's `backups/` directory, sets the snapshot to
-mode `0600`, and retains the newest five snapshots. It runs one pinned Hermes
-warmup, restarts the gateway, and runs one pool-aware live probe. Operators keep
-the backup as evidence. The healer never restores it because a failed refresh
-may have consumed a single-use refresh token.
+mode `0600`, and retains the newest five snapshots. The helper holds Hermes'
+`auth.lock` across one refresh request and one atomic write, verifies the saved
+lineage, then lets the healer restart the gateway and run one pool-aware live
+probe. Operators keep the backup as evidence. The healer never restores it
+because a failed refresh may have consumed a single-use refresh token.
 
 Terminal OAuth failures stop at the device-code runbook in the alert. A person
 must run `hermes auth add openai-codex --type oauth --no-browser`, enter the code
@@ -370,17 +372,19 @@ active, and next-elapse state after either action. It skips masked units.
 
 A pool whose renewable entries all report quota blocks causes no Codex request
 before the latest stored reset. The first healer cycle at or after that reset
-runs one warmup and one live probe. The state file records that reset attempt,
-so later 15-minute cycles do not repeat it. A fresh 429 stores the next reset
-and returns to passive waiting.
+runs one direct refresh. A successful persistence gets one live probe. The
+state file records the attempt before the request, so a timeout or lost response
+cannot reuse the same single-use token. A fresh 429 stores the next reset
+without a probe or second request and returns to passive waiting.
 
-Credential roles pin the Hermes CLI in `self_heal.hermes_executable`. `src` uses
-`/opt/hermes-agent/venv/bin/hermes`; Team Nebula uses
-`/home/shawn_teamnebula_ai/.hermes/hermes-agent/venv/bin/hermes`. The healer
-rejects a bare command name, relative path, missing file, directory, or file
-without read and execute access. `install.sh` runs this readiness check before
-it enables or starts the healer timer, so user-systemd does not depend on an
-interactive shell's `PATH`.
+Credential roles pin the Hermes Python runtime, version, `auth.py`, and
+`credential_pool.py`, including a SHA-256 for each source module. `src` uses
+`/opt/hermes-agent`; Team Nebula uses the Hermes checkout under
+`~/.hermes/hermes-agent`. The healer checks absolute paths, file type, hashes,
+and the refresh, lock, selection, and persistence signatures before mutation.
+`install.sh` runs the helper's readiness check before it enables or starts the
+timer. A Hermes upgrade stops the healer until an operator reviews and updates
+the source pins.
 
 Each failed repair raises one `OnFailure=` notification. Later cycles retry at
 the configured six-hour cooldown but exit without another notification while

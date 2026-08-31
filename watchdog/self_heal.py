@@ -21,6 +21,7 @@ import time
 import urllib.request
 
 from auth_state import full_pool_reset_at, quota_blocked, selected_codex_credential
+from hermes_codex_refresh import RefreshError, validate_source_contract
 
 TAILNET = ipaddress.ip_network("100.64.0.0/10")
 HERE = pathlib.Path(__file__).resolve().parent
@@ -159,10 +160,6 @@ def credential_action(auth: dict, now: float) -> str:
     expires_at = _jwt_exp(tokens.get("access_token"))
     if expires_at is None or expires_at <= now:
         return "warmup"
-    if pool and any(_credential_is_terminal(entry) for entry in pool if entry is not selected):
-        return "warmup"
-    if pool and _singleton_is_terminal(auth):
-        return "warmup"
     return "none"
 
 
@@ -196,20 +193,67 @@ def backup_auth(
     return backup_path
 
 
-def run_hermes_warmup(cfg: dict, run_cmd) -> CommandResult:
-    """Let Hermes perform one bounded refresh through its pinned provider."""
+def _refresh_helper_argv(cfg: dict) -> list[str]:
+    """Build the pinned, isolated helper prefix from validated config."""
     if not isinstance(cfg, dict) or not isinstance(cfg.get("self_heal"), dict):
         raise Disarmed("self-heal configuration is malformed")
-    model = cfg["self_heal"].get("codex_model")
-    if not isinstance(model, str) or not model:
-        raise Disarmed("Codex warmup model is invalid")
-    hermes_executable = cfg["self_heal"].get("hermes_executable")
-    if not isinstance(hermes_executable, str) or not hermes_executable:
-        raise Disarmed("Hermes executable is invalid")
-    return run_cmd([
-        hermes_executable, "--safe-mode", "--provider", "openai-codex",
-        "-m", model, "-z", "Reply with exactly: OK",
-    ], 120)
+    self_heal = cfg["self_heal"]
+    return [
+        self_heal["hermes_python"],
+        "-I",
+        str(HERE / "hermes_codex_refresh.py"),
+        "--expected-python",
+        self_heal["hermes_python"],
+        "--expected-version",
+        self_heal["hermes_version"],
+        "--auth-module",
+        self_heal["hermes_auth_module"],
+        "--auth-sha256",
+        self_heal["hermes_auth_sha256"],
+        "--pool-module",
+        self_heal["hermes_credential_pool_module"],
+        "--pool-sha256",
+        self_heal["hermes_credential_pool_sha256"],
+    ]
+
+
+def run_refresh_readiness(cfg: dict, run_cmd) -> CommandResult:
+    """Validate the pinned Hermes runtime without importing it."""
+    return run_cmd(_refresh_helper_argv(cfg) + ["--check-readiness"], 20)
+
+
+def plan_hermes_refresh(
+    cfg: dict, auth_path: pathlib.Path, run_cmd
+) -> CommandResult:
+    """Resolve one unique refresh lineage without making a provider request."""
+    return run_cmd(
+        _refresh_helper_argv(cfg)
+        + ["--plan", "--auth-json", str(pathlib.Path(auth_path))],
+        20,
+    )
+
+
+def run_hermes_refresh(
+    cfg: dict,
+    auth_path: pathlib.Path,
+    lineage: str,
+    refresh_fingerprint: str,
+    run_cmd,
+) -> CommandResult:
+    """Refresh one planned lineage with one bounded provider request."""
+    return run_cmd(
+        _refresh_helper_argv(cfg)
+        + [
+            "--refresh",
+            "--auth-json",
+            str(pathlib.Path(auth_path)),
+            "--lineage",
+            lineage,
+            "--refresh-fingerprint",
+            refresh_fingerprint,
+        ],
+        40,
+    )
 
 
 def run_live_probe(cfg_path: pathlib.Path, run_cmd) -> CommandResult:
@@ -230,9 +274,11 @@ def repair_credential(
     run_cmd,
     now: int,
     dry_run: bool,
+    persist_state=None,
 ) -> tuple[bool, str]:
-    """Perform at most one backed-up Hermes refresh and one live probe."""
+    """Perform at most one backed-up direct refresh and one live probe."""
     _validate_state(state)
+    persist_state = persist_state or (lambda: None)
     auth_path = pathlib.Path(auth_path)
     cfg_path = pathlib.Path(cfg_path)
     auth = _read_auth(auth_path)
@@ -247,26 +293,155 @@ def repair_credential(
         when = _format_reset(reset_at)
         return True, f"quota recovery waits until recorded reset {when}"
 
+    helper_reset = state.get("quota_reset_at")
+    if (
+        isinstance(helper_reset, (int, float))
+        and not isinstance(helper_reset, bool)
+        and now < helper_reset
+    ):
+        return True, f"quota recovery waits until recorded reset {_format_reset(float(helper_reset))}"
+
     if reset_at is not None and now >= reset_at:
         attempted_at = state.get("quota_attempt_reset_at")
-        if attempted_at == reset_at:
+        newer_helper_reset = state.get("quota_reset_at")
+        if attempted_at == reset_at and not (
+            isinstance(newer_helper_reset, (int, float))
+            and not isinstance(newer_helper_reset, bool)
+            and newer_helper_reset > reset_at
+            and now >= newer_helper_reset
+        ):
             return True, f"quota reset {_format_reset(reset_at)} was already attempted"
 
     if dry_run:
-        return True, "dry-run: back up auth, run one Hermes warmup, restart gateway, run one probe"
+        return True, "dry-run: plan one direct refresh, back up auth, refresh once, restart gateway, run one probe"
+
+    plan = plan_hermes_refresh(cfg, auth_path, run_cmd)
+    if plan.returncode != 0:
+        return False, _bounded_detail(
+            "Hermes refresh planning failed; no provider request attempted"
+        )
+    try:
+        planned = _parse_helper_payload(plan.stdout)
+        if planned.get("status") != "planned":
+            raise ValueError("unexpected helper status")
+        lineage = planned["lineage"]
+        refresh_fingerprint = planned["refresh_fingerprint"]
+        if (
+            not isinstance(lineage, str)
+            or not lineage
+            or not isinstance(refresh_fingerprint, str)
+            or len(refresh_fingerprint) != 64
+            or any(char not in "0123456789abcdef" for char in refresh_fingerprint)
+        ):
+            raise ValueError("malformed plan")
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return False, "Hermes refresh planning returned malformed state"
+
+    prior_attempt = state.get("credential_refresh_attempt")
+    if isinstance(prior_attempt, dict) and (
+        prior_attempt.get("refresh_fingerprint") == refresh_fingerprint
+    ):
+        prior_status = prior_attempt.get("status")
+        prior_reset = prior_attempt.get("reset_at")
+        if prior_status == "quota" and isinstance(prior_reset, (int, float)):
+            if now < prior_reset:
+                return True, (
+                    "quota recovery waits until recorded reset "
+                    f"{_format_reset(float(prior_reset))}"
+                )
+            if state.get("quota_attempt_reset_at") == prior_reset:
+                return True, (
+                    f"quota reset {_format_reset(float(prior_reset))} was already attempted"
+                )
+        else:
+            return False, (
+                "refresh token already has a recorded attempt; refusing an unsafe retry"
+            )
 
     backup_path = backup_auth(auth_path, cfg_path.parent / "backups", now)
     if reset_at is not None and now >= reset_at:
         state["quota_attempt_reset_at"] = reset_at
+    if (
+        isinstance(prior_attempt, dict)
+        and prior_attempt.get("status") == "quota"
+        and isinstance(prior_attempt.get("reset_at"), (int, float))
+        and now >= prior_attempt["reset_at"]
+    ):
+        state["quota_attempt_reset_at"] = prior_attempt["reset_at"]
+    state["credential_refresh_attempt"] = {
+        "lineage": lineage,
+        "refresh_fingerprint": refresh_fingerprint,
+        "started_at": now,
+        "status": "in_flight",
+        "reset_at": None,
+    }
+    persist_state()
 
-    warmup = run_hermes_warmup(cfg, run_cmd)
-    if warmup.returncode != 0:
-        return False, _command_failure("Hermes warmup failed", warmup, backup_path)
+    refreshed = run_hermes_refresh(
+        cfg,
+        auth_path,
+        lineage,
+        refresh_fingerprint,
+        run_cmd,
+    )
+    attempt = state["credential_refresh_attempt"]
+    if refreshed.returncode == 3:
+        try:
+            quota_payload = _parse_helper_payload(refreshed.stdout)
+            next_reset = float(quota_payload["reset_at"])
+            if quota_payload.get("status") != "quota" or next_reset <= now:
+                raise ValueError("invalid quota reset")
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            attempt["status"] = "uncertain"
+            persist_state()
+            return False, _command_failure(
+                "Codex refresh quota response had no safe reset",
+                refreshed,
+                backup_path,
+            )
+        attempt["status"] = "quota"
+        attempt["reset_at"] = next_reset
+        state["quota_reset_at"] = next_reset
+        persist_state()
+        return True, _bounded_detail(
+            f"quota remains blocked until recorded reset {_format_reset(next_reset)}; "
+            f"backup retained at {backup_path}"
+        )
+    if refreshed.returncode == 4:
+        attempt["status"] = "uncertain"
+        persist_state()
+        return False, _command_failure(
+            "Codex refresh result is uncertain; retry blocked",
+            refreshed,
+            backup_path,
+        )
+    if refreshed.returncode != 0:
+        attempt["status"] = "failed"
+        persist_state()
+        return False, _command_failure(
+            "Codex direct refresh failed",
+            refreshed,
+            backup_path,
+        )
+    try:
+        refresh_payload = _parse_helper_payload(refreshed.stdout)
+        if refresh_payload.get("status") != "persisted":
+            raise ValueError("unexpected helper status")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        attempt["status"] = "uncertain"
+        persist_state()
+        return False, _command_failure(
+            "Codex refresh persistence result is malformed",
+            refreshed,
+            backup_path,
+        )
+    attempt["status"] = "persisted"
+    persist_state()
 
     refreshed_auth = _read_auth(auth_path)
     if credential_action(refreshed_auth, now) == "human_2fa":
         return False, _bounded_detail(
-            f"no recoverable credential after warmup; backup retained at {backup_path}"
+            f"no recoverable credential after refresh; backup retained at {backup_path}"
         )
     gateway_ok, gateway_detail = repair_gateway(
         cfg,
@@ -292,6 +467,8 @@ def repair_credential(
     if probe.returncode == 3:
         next_reset = full_pool_reset_at(refreshed_auth, 0.0)
         if next_reset is None:
+            next_reset = _reset_at_from_text(probe.stdout + "\n" + probe.stderr)
+        if next_reset is None:
             return False, _command_failure(
                 "quota probe returned no recorded reset", probe, backup_path
             )
@@ -305,6 +482,18 @@ def repair_credential(
         probe,
         backup_path,
     )
+
+
+def _parse_helper_payload(output: str) -> dict:
+    payload = json.loads(output.strip())
+    if not isinstance(payload, dict):
+        raise ValueError("helper output is not an object")
+    return payload
+
+
+def _reset_at_from_text(value: str) -> float | None:
+    match = re.search(r"[\"']?resets_at[\"']?\s*[:=]\s*(\d{9,})", value)
+    return float(match.group(1)) if match else None
 
 
 def _read_auth(auth_path: pathlib.Path) -> dict:
@@ -901,6 +1090,32 @@ def _validate_state(state: object) -> None:
         isinstance(quota_reset, bool) or not isinstance(quota_reset, (int, float))
     ):
         raise Disarmed("state file is malformed")
+    refresh_attempt = state.get("credential_refresh_attempt")
+    if refresh_attempt is not None:
+        if not isinstance(refresh_attempt, dict):
+            raise Disarmed("state file is malformed")
+        if not isinstance(refresh_attempt.get("lineage"), str):
+            raise Disarmed("state file is malformed")
+        fingerprint = refresh_attempt.get("refresh_fingerprint")
+        if (
+            not isinstance(fingerprint, str)
+            or len(fingerprint) != 64
+            or any(char not in "0123456789abcdef" for char in fingerprint)
+        ):
+            raise Disarmed("state file is malformed")
+        started_at = refresh_attempt.get("started_at")
+        if isinstance(started_at, bool) or not isinstance(started_at, int):
+            raise Disarmed("state file is malformed")
+        if refresh_attempt.get("status") not in {
+            "in_flight", "persisted", "quota", "uncertain", "failed"
+        }:
+            raise Disarmed("state file is malformed")
+        attempt_reset = refresh_attempt.get("reset_at")
+        if attempt_reset is not None and (
+            isinstance(attempt_reset, bool)
+            or not isinstance(attempt_reset, (int, float))
+        ):
+            raise Disarmed("state file is malformed")
     _validate_peer_state_map(state.get("peer_misses"), "misses")
     _validate_peer_state_map(state.get("peer_attempts"), "attempts")
 
@@ -952,7 +1167,7 @@ def _validate_executable_file(value: object, label: str) -> pathlib.Path:
     if not path.is_absolute() or ".." in pathlib.PurePath(value).parts:
         raise Disarmed(f"{label} must be an absolute path")
     try:
-        file_stat = path.lstat()
+        file_stat = path.stat()
     except OSError as exc:
         raise Disarmed(f"{label} is unavailable") from exc
     if not stat.S_ISREG(file_stat.st_mode):
@@ -1039,12 +1254,20 @@ def load_config(path: pathlib.Path) -> dict:
             raise Disarmed("healer config has no Hermes home")
         _path_from_value(home, "Hermes home")
         validate_unit(cfg.get("gateway_unit"), ".service")
-        model = self_heal.get("codex_model")
-        if not isinstance(model, str) or model != "openai-codex/gpt-5.5":
-            raise Disarmed("Codex warmup model is invalid")
         _validate_executable_file(
-            self_heal.get("hermes_executable"), "Hermes executable"
+            self_heal.get("hermes_python"), "Hermes Python"
         )
+        if self_heal.get("hermes_version") != "0.16.0":
+            raise Disarmed("Hermes version pin is invalid")
+        try:
+            validate_source_contract(
+                self_heal.get("hermes_auth_module"),
+                self_heal.get("hermes_auth_sha256"),
+                self_heal.get("hermes_credential_pool_module"),
+                self_heal.get("hermes_credential_pool_sha256"),
+            )
+        except (RefreshError, TypeError) as exc:
+            raise Disarmed(f"Hermes refresh contract is invalid: {exc}") from exc
         if not self_heal["gateway_restart"]:
             raise Disarmed("local gateway repair must be enabled")
     return cfg
@@ -1120,7 +1343,17 @@ def run(args) -> int:
     )
     cfg = load_config(cfg_path)
     if getattr(args, "check_readiness", False):
-        print("healer configuration and executable are ready")
+        if cfg.get("mode") != "observer":
+            readiness = run_refresh_readiness(cfg, run_command)
+            if readiness.returncode != 0:
+                captured = "\n".join(
+                    part for part in (readiness.stdout, readiness.stderr) if part
+                )
+                detail = "Hermes refresh readiness failed"
+                if captured:
+                    detail += f"; output: {captured}"
+                raise Disarmed(_bounded_detail(detail))
+        print("healer configuration and refresh helper are ready")
         return 0
     state_path = (
         pathlib.Path(args.state_file).expanduser()
@@ -1176,6 +1409,7 @@ def run(args) -> int:
                     repair_credential(
                         cfg, cfg_path, auth_path, state, run_command, now,
                         dry_run=False,
+                        persist_state=lambda: save_state(state_path, state),
                     ),
                     now,
                 )
