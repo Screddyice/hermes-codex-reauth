@@ -68,7 +68,7 @@
 - Produces: `selected_codex_credential(auth: dict, now: float | None = None) -> dict | None`
 - Produces: `full_pool_reset_at(auth: dict, now: float | None = None) -> float | None`
 
-- [ ] **Step 1: Write failing shared-selection tests**
+- [x] **Step 1: Write failing shared-selection tests**
 
 Create `tests/test_auth_state.py` with literal pool records. Do not import helpers from the existing health-check tests.
 
@@ -135,13 +135,13 @@ def test_full_pool_reset_uses_latest_reset_when_every_entry_is_blocked():
     assert auth_state.full_pool_reset_at(auth, now=1000) == 2200
 ```
 
-- [ ] **Step 2: Run the new tests and verify RED**
+- [x] **Step 2: Run the new tests and verify RED**
 
 Run: `pytest -q tests/test_auth_state.py`
 
 Expected: FAIL because `watchdog/auth_state.py` does not exist.
 
-- [ ] **Step 3: Create the shared module**
+- [x] **Step 3: Create the shared module**
 
 Move the current reset, quota, and renewable-entry logic from `codex_health_check.py` into `auth_state.py`. Add normalized selection without changing the health-check behavior.
 
@@ -204,13 +204,13 @@ insert the watchdog directory into `sys.path` in the `_load` test helpers before
 executing modules. Production script execution already places the script
 directory on `sys.path`.
 
-- [ ] **Step 4: Run focused and regression tests**
+- [x] **Step 4: Run focused and regression tests**
 
 Run: `pytest -q tests/test_auth_state.py tests/test_codex_health_check.py`
 
 Expected: PASS with the existing health verdict tests unchanged.
 
-- [ ] **Step 5: Commit the extraction**
+- [x] **Step 5: Commit the extraction**
 
 ```bash
 git add watchdog/auth_state.py watchdog/codex_health_check.py tests/test_auth_state.py tests/test_codex_health_check.py
@@ -230,7 +230,7 @@ git commit -m "refactor(watchdog): share passive Codex auth state"
 - Produces: `resolve_credential(auth_path: pathlib.Path) -> tuple[str, str]`, returning access token and label.
 - Preserves exit codes: `0=OK`, `1=BROKEN`, `2=UNKNOWN`, `3=QUOTA`.
 
-- [ ] **Step 1: Add a failing pooled-token request test**
+- [x] **Step 1: Add a failing pooled-token request test**
 
 Add a helper that writes a stale singleton plus a healthy manual pool entry. Capture the outgoing request.
 
@@ -281,13 +281,13 @@ def jwt(account_id: str) -> str:
     return f"h.{payload}.s"
 ```
 
-- [ ] **Step 2: Run the pooled test and verify RED**
+- [x] **Step 2: Run the pooled test and verify RED**
 
 Run: `pytest -q tests/test_codex_auth_probe.py::test_probe_uses_selected_pool_entry_instead_of_stale_singleton`
 
 Expected: FAIL because the probe reads `providers.openai-codex.tokens`.
 
-- [ ] **Step 3: Normalize credential selection in the probe**
+- [x] **Step 3: Normalize credential selection in the probe**
 
 Load `auth_state.py` from the sibling directory and resolve the selected entry.
 Use the same plain sibling import as `codex_health_check.py`; update this test
@@ -304,13 +304,13 @@ def resolve_credential(auth_path: pathlib.Path) -> tuple[str, str]:
 
 Print the label in `OK`, `BROKEN`, `UNKNOWN`, and `QUOTA` output. Never print tokens.
 
-- [ ] **Step 4: Run the probe suite**
+- [x] **Step 4: Run the probe suite**
 
 Run: `pytest -q tests/test_codex_auth_probe.py`
 
 Expected: PASS for singleton and pool records.
 
-- [ ] **Step 5: Commit the pool-aware probe**
+- [x] **Step 5: Commit the pool-aware probe**
 
 ```bash
 git add watchdog/codex_auth_probe.py tests/test_codex_auth_probe.py
@@ -334,7 +334,7 @@ git commit -m "fix(watchdog): probe the active pooled credential"
 - Produces: `validate_peer(peer: dict) -> dict`
 - Produces: `CommandResult(returncode: int, stdout: str, stderr: str)`.
 
-- [ ] **Step 1: Write failing state and validation tests**
+- [x] **Step 1: Write failing state and validation tests**
 
 Start `tests/test_self_heal.py` with these module and command helpers:
 
@@ -432,13 +432,13 @@ def test_peer_validation_requires_tailnet_and_private_identity(tmp_path):
     assert healer.validate_peer(peer)["ip"] == "100.74.25.61"
 ```
 
-- [ ] **Step 2: Run the state tests and verify RED**
+- [x] **Step 2: Run the state tests and verify RED**
 
 Run: `pytest -q tests/test_self_heal.py`
 
 Expected: FAIL because `watchdog/self_heal.py` does not exist.
 
-- [ ] **Step 3: Implement atomic state and validation**
+- [x] **Step 3: Implement atomic state and validation**
 
 Use `tempfile.mkstemp`, `os.fsync`, `os.chmod`, and `os.replace`. Use `ipaddress.ip_address` and `ipaddress.ip_network("100.64.0.0/10")`. Accept unit tokens that match `^[A-Za-z0-9_.@-]+$` and the required suffix.
 
@@ -469,13 +469,13 @@ def clear_fault(state: dict, key: str) -> None:
 
 Reject identity files with group or world permission bits. Require a regular `known_hosts` file. Keep error strings free of file contents.
 
-- [ ] **Step 4: Run the state suite**
+- [x] **Step 4: Run the state suite**
 
 Run: `pytest -q tests/test_self_heal.py`
 
 Expected: PASS for state, permission, IP, user, path, and unit validation.
 
-- [ ] **Step 5: Commit the safety core**
+- [x] **Step 5: Commit the safety core**
 
 ```bash
 git add watchdog/self_heal.py tests/test_self_heal.py
@@ -496,7 +496,7 @@ git commit -m "feat(watchdog): add healer state and target validation"
 - Produces: `repair_health_timer(cfg: dict, run_cmd, dry_run: bool) -> tuple[bool, str]`
 - Produces: `repair_gateway(cfg: dict, auth: dict, run_cmd, dry_run: bool) -> tuple[bool, str]`
 
-- [ ] **Step 1: Write failing timer repair tests**
+- [x] **Step 1: Write failing timer repair tests**
 
 Use a deterministic fake command runner that records each argv list.
 
@@ -524,13 +524,13 @@ def test_masked_timer_is_respected_without_mutation():
     assert len(runner.calls) == 1
 ```
 
-- [ ] **Step 2: Run the timer tests and verify RED**
+- [x] **Step 2: Run the timer tests and verify RED**
 
 Run: `pytest -q tests/test_self_heal.py -k 'disabled_timer or masked_timer'`
 
 Expected: FAIL because `repair_health_timer` does not exist.
 
-- [ ] **Step 3: Implement one-attempt timer repair**
+- [x] **Step 3: Implement one-attempt timer repair**
 
 Inspect `is-enabled`, then repair. Verify `is-enabled`, `is-active`, and `NextElapseUSecRealtime` after mutation. If an enabled timer has no next elapse, restart it and start the configured check service once.
 
@@ -541,7 +541,7 @@ def systemctl(run_cmd, *args: str) -> CommandResult:
 
 Dry-run must return the planned argv without calling the runner.
 
-- [ ] **Step 4: Write failing gateway tests**
+- [x] **Step 4: Write failing gateway tests**
 
 ```python
 def test_inactive_gateway_restarts_when_a_credential_can_recover():
@@ -569,23 +569,23 @@ def test_terminal_credential_blocks_gateway_restart():
     assert len(runner.calls) == 1
 ```
 
-- [ ] **Step 5: Run the gateway tests and verify RED**
+- [x] **Step 5: Run the gateway tests and verify RED**
 
 Run: `pytest -q tests/test_self_heal.py -k gateway`
 
 Expected: FAIL because `repair_gateway` does not exist.
 
-- [ ] **Step 6: Implement bounded gateway restart**
+- [x] **Step 6: Implement bounded gateway restart**
 
 Permit restart when `selected_codex_credential` returns an entry or when `quota_blocked` reports a valid but exhausted pool. Poll `is-active` up to ten times with a one-second injected sleeper. Perform no credential mutation in this function.
 
-- [ ] **Step 7: Run local repair tests**
+- [x] **Step 7: Run local repair tests**
 
 Run: `pytest -q tests/test_self_heal.py -k 'timer or gateway or maintenance'`
 
 Expected: PASS with exact command ordering.
 
-- [ ] **Step 8: Commit local repair**
+- [x] **Step 8: Commit local repair**
 
 ```bash
 git add watchdog/self_heal.py tests/test_self_heal.py
@@ -608,7 +608,7 @@ git commit -m "feat(watchdog): repair local timers and gateways"
 - Produces: `run_live_probe(cfg_path: pathlib.Path, run_cmd) -> CommandResult`
 - Produces: `repair_credential(cfg: dict, cfg_path: pathlib.Path, auth_path: pathlib.Path, state: dict, run_cmd, now: int, dry_run: bool) -> tuple[bool, str]`
 
-- [ ] **Step 1: Write failing deterministic decision tests**
+- [x] **Step 1: Write failing deterministic decision tests**
 
 Add literal auth constructors to `tests/test_self_heal.py`:
 
@@ -675,17 +675,17 @@ def test_credential_action(auth, now, expected):
     assert healer.credential_action(auth, now) == expected
 ```
 
-- [ ] **Step 2: Run decision tests and verify RED**
+- [x] **Step 2: Run decision tests and verify RED**
 
 Run: `pytest -q tests/test_self_heal.py -k credential_action`
 
 Expected: FAIL because `credential_action` does not exist.
 
-- [ ] **Step 3: Implement the pure decision function**
+- [x] **Step 3: Implement the pure decision function**
 
 Use JWT `exp`, terminal status and error codes, renewable entries, and the full-pool reset. Treat `refresh_token_reused`, `invalid_grant`, `token_revoked`, `token_invalidated`, `invalid_token`, and `dead` as terminal for the selected entry. Allow a healthy manual entry to outrank a stale singleton.
 
-- [ ] **Step 4: Write failing backup and one-shot tests**
+- [x] **Step 4: Write failing backup and one-shot tests**
 
 ```python
 def test_backup_is_private_and_retains_five_newest(tmp_path):
@@ -709,13 +709,13 @@ def test_warmup_is_pinned_safe_and_bounded():
     assert runner.timeouts == [120]
 ```
 
-- [ ] **Step 5: Run backup and warmup tests and verify RED**
+- [x] **Step 5: Run backup and warmup tests and verify RED**
 
 Run: `pytest -q tests/test_self_heal.py -k 'backup or warmup'`
 
 Expected: FAIL because the functions do not exist.
 
-- [ ] **Step 6: Implement backup, warmup, and probe commands**
+- [x] **Step 6: Implement backup, warmup, and probe commands**
 
 Copy with `shutil.copyfile`, set mode `0600`, `fsync` the backup, and prune oldest names after sorting. Run Hermes with `start_new_session=True`; on timeout, kill the process group before returning failure. Run the probe with:
 
@@ -725,7 +725,7 @@ Copy with `shutil.copyfile`, set mode `0600`, `fsync` the backup, and prune olde
 
 Map probe exit codes without parsing human text.
 
-- [ ] **Step 7: Write failing end-to-end credential repair tests**
+- [x] **Step 7: Write failing end-to-end credential repair tests**
 
 Test these command sequences with temp auth files and a scripted runner:
 
@@ -736,17 +736,17 @@ Test these command sequences with temp auth files and a scripted runner:
 5. probe code three: store the new reset and stop without a second request;
 6. probe code two: mark verification failure and preserve the backup.
 
-- [ ] **Step 8: Implement credential orchestration**
+- [x] **Step 8: Implement credential orchestration**
 
 Read `auth.json` again after warmup before restarting the gateway. Never restore the snapshot. Redact captured output with token patterns before logging. Set the quota attempt marker to the observed reset timestamp so the healer cannot retry the same window.
 
-- [ ] **Step 9: Run credential tests**
+- [x] **Step 9: Run credential tests**
 
 Run: `pytest -q tests/test_self_heal.py -k 'credential or quota or warmup or backup or probe'`
 
 Expected: PASS with one warmup and one probe for each eligible incident.
 
-- [ ] **Step 10: Commit credential recovery**
+- [x] **Step 10: Commit credential recovery**
 
 ```bash
 git add watchdog/self_heal.py tests/test_self_heal.py
@@ -770,7 +770,7 @@ git commit -m "feat(watchdog): recover pooled Codex credentials once"
 - Produces: `peer_heartbeat(peer: dict, previous_misses: int) -> tuple[str, str, int]`
 - Produces: `repair_peer(peer: dict, run_cmd, fetch_heartbeat, dry_run: bool) -> tuple[bool, str]`
 
-- [ ] **Step 1: Write failing SSH argv tests**
+- [x] **Step 1: Write failing SSH argv tests**
 
 Add concrete peer helpers:
 
@@ -834,13 +834,13 @@ def test_peer_repair_uses_pinned_host_and_fixed_systemd_commands(tmp_path):
                    peer["check_service"]] in runner.calls
 ```
 
-- [ ] **Step 2: Run peer argv tests and verify RED**
+- [x] **Step 2: Run peer argv tests and verify RED**
 
 Run: `pytest -q tests/test_self_heal.py -k peer_repair`
 
 Expected: FAIL because peer repair functions do not exist.
 
-- [ ] **Step 3: Implement fixed peer operations**
+- [x] **Step 3: Implement fixed peer operations**
 
 Use the validated fields to build OpenSSH argv. Test the remote maintenance lock with `test -e <path>`. Skip masked timers. Permit these remote commands:
 
@@ -854,7 +854,7 @@ systemctl --user is-active <heartbeat-service>
 
 No other remote executable or argument shape may pass the builder.
 
-- [ ] **Step 4: Add failing heartbeat threshold and re-arm tests**
+- [x] **Step 4: Add failing heartbeat threshold and re-arm tests**
 
 ```python
 def test_peer_repair_waits_for_two_misses_and_rearms_after_recovery(tmp_path):
@@ -869,11 +869,11 @@ def test_peer_repair_waits_for_two_misses_and_rearms_after_recovery(tmp_path):
     assert "peer.src" not in state["faults"]
 ```
 
-- [ ] **Step 5: Implement peer threshold and edge state**
+- [x] **Step 5: Implement peer threshold and edge state**
 
 Use the same two-miss rule as the scheduled peer watch. Attempt one repair for the active outage, then honor `retry_s` without another notification. A fresh heartbeat clears misses, fault state, and attempt state.
 
-- [ ] **Step 6: Add committed peer config**
+- [x] **Step 6: Add committed peer config**
 
 Add `self_heal.peers` to `tmn.json` for `src` and the observer. Add entries to observer config for `src` and `neb-ops-gcp`. Use the approved Tailscale IPs:
 
@@ -916,7 +916,7 @@ Use `~/.ssh/watchdog-repair` and `~/.ssh/watchdog-repair-known_hosts` on both TM
 }
 ```
 
-- [ ] **Step 7: Run peer tests and config tests**
+- [x] **Step 7: Run peer tests and config tests**
 
 Run: `pytest -q tests/test_self_heal.py -k peer`
 
@@ -924,7 +924,7 @@ Run: `pytest -q tests/test_codex_health_check.py -k topology`
 
 Expected: PASS with fixed IPs and no arbitrary command surface.
 
-- [ ] **Step 8: Commit peer repair**
+- [x] **Step 8: Commit peer repair**
 
 ```bash
 git add watchdog/self_heal.py tests/test_self_heal.py watchdog/hosts/tmn.json watchdog/hosts/hermes-tmn-observer.json
@@ -954,7 +954,7 @@ git commit -m "feat(watchdog): repair allowlisted peers over Tailscale"
 - Produces CLI: `python3 self_heal.py --config PATH [--state-file PATH] [--dry-run]`.
 - Produces healer exit contract: `0=healthy, repaired, paused, or continuing known fault`; `1=new failed repair or disarmed healer`.
 
-- [ ] **Step 1: Write failing notifier and wiring tests**
+- [x] **Step 1: Write failing notifier and wiring tests**
 
 ```python
 def test_healer_failure_message_names_repair_not_reporting(tmp_path):
@@ -979,13 +979,13 @@ def test_every_codex_role_wires_a_healer_timer_and_notifier():
         assert "Persistent=true" in timer
 ```
 
-- [ ] **Step 2: Run notifier and wiring tests and verify RED**
+- [x] **Step 2: Run notifier and wiring tests and verify RED**
 
 Run: `pytest -q tests/test_notify_failure.py -k healer tests/test_self_heal.py -k cli`
 
 Expected: FAIL because no healer units or notifier branch exist.
 
-- [ ] **Step 3: Add the CLI orchestration**
+- [x] **Step 3: Add the CLI orchestration**
 
 The CLI must:
 
@@ -999,11 +999,11 @@ The CLI must:
 
 Catch `Disarmed` in `main()` and redact errors before stderr.
 
-- [ ] **Step 4: Add healer-aware notifier text**
+- [x] **Step 4: Add healer-aware notifier text**
 
 Branch on `"self-heal" in unit` in `build_message`. Keep the same bounded journal tail and Telegram limit.
 
-- [ ] **Step 5: Add role-specific systemd files**
+- [x] **Step 5: Add role-specific systemd files**
 
 Use this service shape with role paths and notifier names changed per host:
 
@@ -1037,17 +1037,17 @@ Persistent=true
 WantedBy=timers.target
 ```
 
-- [ ] **Step 6: Extend the installer**
+- [x] **Step 6: Extend the installer**
 
 Add role variables `HEAL_SERVICE` and `HEAL_TIMER` for the three Codex roles. Leave both empty for `nebos-claude`. Install `auth_state.py` for Codex hosts, `self_heal.py` for all three healer roles, and the probe for `src` and `tmn`.
 
 Enable and start the healer timer. Assert enabled, active, next elapse, `OnFailure`, and a healer dry-run with a temporary state path. Do not remove `self-heal-state.json` or the backup directory.
 
-- [ ] **Step 7: Add full shipped config**
+- [x] **Step 7: Add full shipped config**
 
 Add exact `self_heal` objects from the spec. Add `maintenance_lock`, `retry_s=21600`, timer, service, model, and peer allowlists. Keep credentials and key contents out of JSON.
 
-- [ ] **Step 8: Run wiring and installer tests**
+- [x] **Step 8: Run wiring and installer tests**
 
 Run: `pytest -q tests/test_notify_failure.py tests/test_self_heal.py`
 
@@ -1055,7 +1055,7 @@ Run: `bash -n watchdog/install.sh`
 
 Expected: PASS, with no healer units for the NEBOS Claude role.
 
-- [ ] **Step 9: Commit system integration**
+- [x] **Step 9: Commit system integration**
 
 ```bash
 git add watchdog/self_heal.py watchdog/notify_failure.py watchdog/install.sh watchdog/hosts watchdog/systemd tests/test_notify_failure.py tests/test_self_heal.py
@@ -1076,7 +1076,7 @@ git commit -m "feat(watchdog): schedule bounded self-healing"
 - Consumes all prior task interfaces.
 - Produces operator commands, maintenance procedure, rollback steps, and verification evidence.
 
-- [ ] **Step 1: Update README behavior and operations**
+- [x] **Step 1: Update README behavior and operations**
 
 Document:
 
@@ -1092,11 +1092,11 @@ Document:
 
 Replace prose that says the watchdog never repairs. Keep the device-code 2FA runbook explicit.
 
-- [ ] **Step 2: Update repository rules**
+- [x] **Step 2: Update repository rules**
 
 In `CLAUDE.md`, replace `Detect only; never repairs` with the bounded rules from the spec. Keep the bans on scheduled healthy probes, direct token edits, broad SSH, automated 2FA, and `hermes auth reset`.
 
-- [ ] **Step 3: Run focused tests**
+- [x] **Step 3: Run focused tests**
 
 Run:
 
@@ -1106,7 +1106,7 @@ pytest -q tests/test_auth_state.py tests/test_codex_auth_probe.py tests/test_sel
 
 Expected: all focused tests pass with no warnings.
 
-- [ ] **Step 4: Run the complete repository gates**
+- [x] **Step 4: Run the complete repository gates**
 
 Run:
 
@@ -1119,7 +1119,7 @@ git diff --check
 
 Expected: each command exits zero.
 
-- [ ] **Step 5: Run local-first fusion on the pure decision unit**
+- [x] **Step 5: Run local-first fusion on the pure decision unit**
 
 Extract `credential_action` and its table-driven cases to task files under the projectless `work/` directory. Run:
 
@@ -1129,7 +1129,7 @@ llmjury solve --task "$task_file" --cases "$cases_file" --entry-point credential
 
 Accept the result only when exit code is zero and JSON contains `"verified": true`. Record any OpenRouter escalation and winning model in the PR body.
 
-- [ ] **Step 6: Review the final diff against the spec**
+- [x] **Step 6: Review the final diff against the spec**
 
 Check each Goals, Exclusions, Repair Flows, Peer Repair, State, Failure Handling, Tests, Deployment, and Rollback requirement. Fix gaps before commit. Verify that no secret value, private key, auth snapshot, healer state, or generated `known_hosts` file is tracked.
 

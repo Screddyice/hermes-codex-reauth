@@ -5,10 +5,9 @@
 Monitoring for OpenAI Codex (ChatGPT-plan) OAuth on `src` and `neb-ops-gcp`,
 with the legacy `hermes-tmn` VM serving as a credential-free observer.
 
-Despite the repo name, **it no longer re-authenticates anything.** 2FA made
-unattended device-code reauth impossible, so every mutating path was removed on
-2026-08-11 and what remains is a detect-and-alert watchdog. The name is kept for
-URL stability. See the README.
+The scheduled checks inspect passive state. A separate 15-minute healer performs
+bounded timer, gateway, credential, quota-reset, and allowlisted peer repairs.
+OpenAI device-code login and 2FA remain human work. See the README.
 
 ## Tech Stack
 - Python 3, stdlib only (no runtime dependencies)
@@ -28,8 +27,10 @@ pytest                                   # the whole suite
 |---|---|
 | `watchdog/codex_health_check.py` | The watchdog. Canonical, shared by both hosts. |
 | `watchdog/hosts/*.json` | Everything host-specific: auth store, gateway unit, channels, runbook. |
-| `watchdog/codex_auth_probe.py` | Live probe. **Operator tool, deliberately on no timer.** |
-| `watchdog/systemd/` | The four unit files, byte-identical to what is deployed. |
+| `watchdog/auth_state.py` | Shared passive Codex credential and quota classification. |
+| `watchdog/self_heal.py` | Bounded local and allowlisted peer repair. |
+| `watchdog/codex_auth_probe.py` | Pool-aware probe for operators and one eligible repair attempt. |
+| `watchdog/systemd/` | Role-specific check, heartbeat, notifier, and healer units. |
 | `watchdog/hosts-deployed/` | Pre-consolidation scripts as they ran on each VM. Archaeology; do not edit. |
 | `docs/SELF-HEAL-codex-reauth.md` | Describes the removed self-heal. Historical. |
 
@@ -70,9 +71,31 @@ because it inspects no credential; any config without `mode: observer` must stil
 hard-fail with no auth store. There is a test asserting both halves.
 
 
-**Do not put the live probe back on a timer.** It ran every 30 minutes under the
-old design and produced 3 real detections against 209 quota-exhaustion errors,
-consuming the plan quota it existed to protect. The README has the numbers.
+**Keep healer mutation bounded.** One cycle may attempt one local timer repair,
+one gateway restart, one backed-up Hermes credential warmup plus one probe, and
+one repair per allowlisted peer. The healer must verify each postcondition.
+
+**Let Hermes write OAuth state.** The healer may make a mode-`0600` copy of
+`auth.json`, retain five snapshots, and invoke one pinned Hermes warmup. It must
+not edit token fields, restore an old snapshot, call `hermes auth reset`, redeem
+usage-reset credits, or automate device-code login and 2FA.
+
+**Keep peer SSH fixed and narrow.** Accept Tailscale IPs and committed users,
+paths, and unit names only. Require a private identity and pinned host-key file.
+Pass argv without shell fragments. Do not use `sudo` or accept an arbitrary
+remote command.
+
+**Keep healthy scheduled cycles passive.** The 15-minute healer may run the live
+probe only after an eligible credential repair or recorded quota reset. The old
+30-minute probe produced 3 detections and 209 quota errors. Keep the probe off
+healthy schedules.
+
+**Honor maintenance locks and systemd masks.** A role's `SELF_HEAL_PAUSED` file
+blocks mutation and exits zero. A masked timer stays unchanged.
+
+**Preserve first-failure alerting.** A repair fault sends one `OnFailure=` alert.
+Repeated cycles stay quiet until recovery clears the fault and re-arms a later
+incident.
 
 **Quota detection stays passive.** The scheduled check reads exhaustion from the
 `credential_pool` records Hermes already writes to `auth.json` (`last_status:

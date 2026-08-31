@@ -1,42 +1,39 @@
 # hermes-codex-reauth
 
-Monitoring for OpenAI Codex (ChatGPT-plan) OAuth on the Hermes hosts.
+Monitoring and bounded repair for OpenAI Codex OAuth on the Hermes hosts.
 
-> **2026-08-11 — this repo no longer re-authenticates anything.**
-> OpenAI now mandates 2FA on sign-in, which makes unattended device-code reauth
-> impossible by construction: completing a login requires a person at a browser.
-> The headless self-heal that gave this repo its name has been removed. What
-> remains is a **watchdog** — it detects a broken credential quickly and tells a
-> human clearly, and it never mutates anything.
->
-> The repo name is now a slight misnomer, kept for URL stability.
+The watchdog reads local Hermes state without spending Codex quota. A separate
+healer runs every 15 minutes and repairs a fixed set of faults: disabled or
+unscheduled health timers, inactive gateways with recoverable auth, renewable
+credential-pool failures, reset quota windows, and allowlisted peer units.
+OpenAI device-code login and 2FA remain human work.
 
-## Why a watchdog and not a fixer
+## Repair boundary
 
 The codex refresh token is single-use and rotates on every refresh, so two
 processes refreshing the same credential trip `refresh_token_reused` and
 invalidate the whole token family. That is what took both boxes down in July.
-The old design answered this with automation: probe, refresh, and — if the
-refresh chain was dead — drive a headless Chrome through the device-code flow.
+The retired design drove a browser through device-code login. OpenAI added 2FA,
+so the repository removed Chrome, Xvfb, Gmail OTP handling, residential proxy
+support, and scheduled live probes on 2026-08-11.
 
-2FA ended that. A login now needs a human, so the only useful thing software can
-do is notice fast and say so. Everything mutating was removed on 2026-08-11:
+The current healer lets Hermes own OAuth writes. It never edits tokens or calls
+`hermes auth reset`. Before one eligible credential repair, it copies
+`auth.json` into the role directory's `backups/` directory, sets the snapshot to
+mode `0600`, and retains the newest five snapshots. It runs one pinned Hermes
+warmup, restarts the gateway, and runs one pool-aware live probe. Operators keep
+the backup as evidence. The healer never restores it because a failed refresh
+may have consumed a single-use refresh token.
 
-| Removed | Why |
-|---|---|
-| Headless device-code reauth (Chrome/Xvfb/Gmail-OTP/residential proxy) | 2FA makes it impossible; it could only fail slowly |
-| The `hermes -z` refresh rung | Mutating. Pure-watchdog by decision — all recovery is manual |
-| `codex-keepalive` (30-min loop) | With both rungs gone, its remainder duplicated the watchdog |
-
-**Consequence, stated plainly:** nothing refreshes these tokens on a schedule any
-more. A running gateway refreshes on use, so a *live* bot stays healthy. A bot
-that is down long enough for its access token to age out will not recover on its
-own — it will page you instead. That is the intended trade, and it is exactly the
-2026-08-05 scenario, which previously ran six days unnoticed.
+Terminal OAuth failures stop at the device-code runbook in the alert. A person
+must run `hermes auth add openai-codex --type oauth --no-browser`, enter the code
+in a browser, finish 2FA, restart the gateway, and verify a real turn. The healer
+does not redeem usage-reset credits or automate any part of that login.
 
 ## What runs
 
-One watchdog per host, 4 runs a day, silent unless something is wrong.
+Each role runs its scheduled check four times a day. The three Codex roles also
+run a healer every 15 minutes.
 
 | Target | Credential watched | Runs on | Alerts to |
 |---|---|---|---|
@@ -45,18 +42,20 @@ One watchdog per host, 4 runs a day, silent unless something is wrong.
 | **NEBOS v2 Claude** | `CLAUDE_CODE_OAUTH_TOKEN` in `nebos-dev` Secret Manager | hermes-tmn (`screddy`) | Slack `#tmn-ops` + email |
 | **both Codex watchdogs** | the two heartbeats, over the tailnet | hermes-tmn (observer) | Telegram DM |
 
-The two hosts are **interleaved on the half-cycle** — TMN on 00/06/12/18:35, src on
-03/09/15/21:35 — so each box is checked every 6h while the fleet as a whole is
-checked every 3h, and the two can never alert in the same minute.
+The two hosts use an interleaved half-cycle: TMN runs at 00/06/12/18:35, and src
+runs at 03/09/15/21:35. Each box gets a passive check every six hours. The
+15-minute healer uses `OnBootSec=2m`, `OnUnitActiveSec=15m`, and `Persistent=true`.
 
 ```
 watchdog/
   codex_health_check.py   canonical, shared by both hosts
+  auth_state.py           shared passive credential and quota classification
+  self_heal.py            bounded local and peer repair
   notify_failure.py       last-resort escalator, fired by OnFailure=
   heartbeat_server.py     serves this box's heartbeat to its peer, tailnet only
-  codex_auth_probe.py     live probe — OPERATOR TOOL, not on any timer
+  codex_auth_probe.py     pool-aware probe used by operators and eligible repairs
   hosts/{src,tmn,hermes-tmn-observer}.json   everything host-specific
-  systemd/                12 units, byte-identical to what is deployed
+  systemd/                role-specific check, heartbeat, notifier, and healer units
   install.sh              --host {src|tmn|nebos-claude|observer}
 ```
 
@@ -354,34 +353,75 @@ and a monitoring tool that quietly opens a public port is the failure this repo
 exists to prevent. The payload carries no secrets — host label, unit, timestamp,
 last verdict.
 
-### Known limitation: nothing watches the watcher, alone
+## Healer behavior
 
-**By explicit decision (2026-08-12), there is no external deadman.** The only
-notifications this system produces are "something is actually broken". Nothing
-pings you to say it is still alive; the peer box is what notices silence now.
+The healer takes a nonblocking lock and processes faults in this order:
 
-The cost is real and worth stating plainly, because it has already happened
-once: no in-process check can detect its own absence, so if a timer gets
-disabled — as `hermes-codex-health.timer` was on 2026-08-04 — the silence is
-indistinguishable from health. That outage ran six days. A deadman was built,
-tested, and then removed rather than left switched off, because disabled code
-rots and an installer that nags about an unwanted feature is noise.
+1. Stop when the role's `SELF_HEAL_PAUSED` file exists.
+2. Repair the local health timer once, unless systemd reports a mask.
+3. Restart an inactive gateway once when passive auth state permits recovery.
+4. Run one backed-up credential repair or one post-reset quota retry.
+5. Repair fixed peer timer, check, and heartbeat units after two missed heartbeats.
 
-`OnFailure=` was ruled out here on the same reasoning, on the grounds that it
-would only retry the channels already known to be dead. **That was reversed on
-2026-08-17**, because the objection holds only for a retry. Escalating over a
-transport with a different secret and a different vendor is not a retry: when the
-Composio key is what broke, a Telegram DM is unaffected. See "When the watchdog
-cannot report" above.
+An enabled timer with no next elapse gets one timer restart and one health-check
+start. A disabled timer gets one `enable --now`. The healer verifies enabled,
+active, and next-elapse state after either action. It skips masked units.
 
-What remains true is the part this does not solve. `OnFailure=` needs a run to
-hook, so it cannot fire for a check that never runs. The 2026-08-04 disabled-timer
-case would still go six days unnoticed, and only a deadman closes that.
+A pool whose renewable entries all report quota blocks causes no Codex request
+before the latest stored reset. The first healer cycle at or after that reset
+runs one warmup and one live probe. The state file records that reset attempt,
+so later 15-minute cycles do
+not repeat it. A fresh 429 stores the next reset and returns to passive waiting.
 
-If that trade is ever revisited, the mechanism is small — a single HTTP GET at
-the end of a successful run — and `git log` has the removed implementation.
-Note the check would need a **6h** period to match the per-host cadence; 3h
-would page every interval.
+Each failed repair raises one `OnFailure=` notification. Later cycles retry at
+the configured six-hour cooldown but exit without another notification while
+the fault remains active. A successful repair removes the fault record and
+re-arms notification for a new incident.
+
+## Peer repair topology
+
+Peer repair uses Tailscale IPs in `100.64.0.0/10`, a mode-`0600`
+`~/.ssh/watchdog-repair` identity, and a pinned
+`~/.ssh/watchdog-repair-known_hosts` file. The runtime validates the SSH user,
+maintenance-lock path, unit names, key permissions, and host-key file before it
+opens SSH. It passes an argv array and permits these remote actions only:
+
+- test the configured `SELF_HEAL_PAUSED` file;
+- read fixed timer and service state;
+- enable the fixed health timer;
+- restart the fixed heartbeat service;
+- start the fixed health check;
+- read the same postconditions.
+
+The one-device Tailscale share grants Team Nebula hosts access to `src`.
+`neb-ops-gcp` and the observer may repair `src`; `src` has no peer list and gets
+no access to Team Nebula hosts. The observer and `neb-ops-gcp` may repair each
+other inside the Team Nebula tailnet. The healer rejects `sudo`, shell fragments,
+unlisted units, and non-tailnet targets.
+
+## Maintenance and state
+
+Create the maintenance lock before planned work and remove it after the work:
+
+```bash
+# src or neb-ops-gcp
+touch ~/.hermes/codex-health/SELF_HEAL_PAUSED
+rm ~/.hermes/codex-health/SELF_HEAL_PAUSED
+
+# observer
+touch ~/.watchdog-observer/SELF_HEAL_PAUSED
+rm ~/.watchdog-observer/SELF_HEAL_PAUSED
+```
+
+The health checks keep observing during the pause. The healer logs the pause,
+makes no mutation, and exits zero.
+
+The Codex roles store detection state at `~/.hermes/codex-health/state.json` and
+healer state at `~/.hermes/codex-health/self-heal-state.json`. The observer uses
+`~/.watchdog-observer/state.json` and
+`~/.watchdog-observer/self-heal-state.json`. The healer writes private state by
+atomic replace with mode `0600`. Credential backups live in the adjacent
+`backups/` directory. `install.sh` preserves both state files and all backups.
 
 ## Install
 
@@ -390,17 +430,26 @@ would page every interval.
 ./watchdog/install.sh --host observer      # legacy hermes-tmn VM
 ```
 
-Idempotent. Never touches `state.json` — a reinstall must not reset an
-in-progress outage and re-arm the edge detector. It **ends in assertions** and
-refuses to report success unless the timer is enabled, actually scheduled,
-lingering is on, and the installed script runs clean.
+Copy the repository to the target and run the installer as that role's user.
+Targets do not run `git pull`. Install peer key material and pinned host keys
+before installing a role whose config names peers.
+
+The installer preserves `state.json`, `self-heal-state.json`, and `backups/`. It
+checks check and healer timer enablement, active state, next elapses,
+`OnFailure=`, linger, heartbeat reachability, notifier credentials, and isolated
+dry-runs before it reports success.
 
 ## Verify
 
 ```bash
 python3 check.py --dry-run                          # detection, no side effects
+python3 self_heal.py --dry-run                      # repair plan, no mutation or network
 python3 check.py --force-down --dry-run             # alert rendering
 python3 check.py --force-down --state-file /tmp/d.json   # real delivery drill
+systemctl --user list-timers '*codex*' '*self-heal*'
+journalctl --user -u hermes-codex-self-heal.service --since today
+journalctl --user -u hermes-codex-self-heal-tmn.service --since today
+journalctl --user -u codex-observer-self-heal.service --since today
 ```
 
 Always pass `--state-file` for drills. Without it a `--force-down` writes `down`
@@ -409,13 +458,27 @@ genuine outage pages nobody.
 
 Note `--force-down` bypasses `detect()` entirely, so it proves *delivery* only.
 To prove *detection*, point `hermes_home` at a scratch directory holding a
-crafted `auth.json` and a copied `config.yaml` — without the latter the
-applicability guard exits quietly and you get a false pass.
+crafted `auth.json` and a copied `config.yaml`. Without the latter, the
+applicability guard exits without running the canary.
+
+The healer caps command output and redacts bearer tokens, JWTs, and token-shaped
+fields before it writes journal detail. Check recent journal entries after each
+deploy and fail the canary if any credential-shaped value appears.
+
+### Disposable repair canary
+
+Use disposable user units to test repair paths. Do not stop a production gateway
+or edit a production credential. Create a temporary oneshot service and timer in
+`~/.config/systemd/user`, point a temporary copied config at those unit names,
+and pass a temporary `--state-file`. For a peer canary, use the same disposable
+unit names and the committed SSH target. Remove the temporary units and run
+`systemctl --user daemon-reload` after the test.
 
 ## The probe
 
-`codex_auth_probe.py` makes a real call to OpenAI. It is an **operator tool for
-triage**, run by hand, and is deliberately on no timer.
+`codex_auth_probe.py` makes a real call to OpenAI. Operators may run it for
+triage. The healer may run it once after an eligible credential repair or quota
+reset. No healthy scheduled cycle invokes it.
 
 It used to run every 30 minutes as part of the self-heal, and the keepalive log
 shows the cost: over ~7 weeks, **3 genuine `BROKEN` results against 209
@@ -451,8 +514,20 @@ x-codex-primary-reset-at: 1787587961
 x-codex-credits-unlimited: False
 ```
 
-Reading those on a timer would mean a scheduled probe, so they stay a triage tool.
-Run the probe by hand when you want to know how much room is left.
+Run the probe by hand when you need live headroom. Keep it off healthy schedules.
+
+## Rollback
+
+1. Create the role's `SELF_HEAL_PAUSED` file.
+2. Disable the role's healer timer with `systemctl --user disable --now <timer>`.
+3. Restore the prior scripts and unit files from the install backup.
+4. Run `systemctl --user daemon-reload`.
+5. Restart the original health timer and heartbeat service.
+6. Verify their active state and next elapse before removing the maintenance lock.
+
+Keep `state.json`, `self-heal-state.json`, the Hermes auth store, and credential
+backups in place. Operators must inspect a credential backup; they must not copy
+it over live `auth.json`.
 
 ## Tests
 
@@ -462,7 +537,7 @@ pytest
 
 ## History
 
-The reauth machinery is **deleted from the working tree**, not merely unused —
+The browser-based reauth machinery is deleted from the working tree. The removal covered
 17 modules plus the whole `deploy/` directory, and the 6 tests that covered them.
 That includes the Chrome/CDP driver, the Xvfb launcher, the Webshare proxy
 forwarder, the Gmail-OTP reader, and the legacy Mac-trigger flow. Playwright is
@@ -472,8 +547,8 @@ Recovering any of it:
 
 | Want | Where |
 |---|---|
-| The self-heal design | `docs/SELF-HEAL-codex-reauth.md` (kept) |
-| The scripts as they ran on each VM | `watchdog/hosts-deployed/` (kept — they had never been in git) |
+| The retired browser reauth design | `docs/SELF-HEAL-codex-reauth.md` (kept) |
+| The scripts as they ran on each VM | `watchdog/hosts-deployed/` (kept; they had never been in git) |
 | The deleted reauth code | tag `pre-watchdog-consolidation` |
 
 Two on-box cleanups are deliberately **not** done by this repo and must be done
