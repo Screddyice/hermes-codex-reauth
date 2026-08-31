@@ -2,8 +2,8 @@
 
 ## Project Overview
 
-Monitoring for OpenAI Codex (ChatGPT-plan) OAuth on the two Hermes hosts
-(`src` and the GCP VM `hermes-tmn`).
+Monitoring for OpenAI Codex (ChatGPT-plan) OAuth on `src` and `neb-ops-gcp`,
+with the legacy `hermes-tmn` VM serving as a credential-free observer.
 
 Despite the repo name, **it no longer re-authenticates anything.** 2FA made
 unattended device-code reauth impossible, so every mutating path was removed on
@@ -35,10 +35,9 @@ pytest                                   # the whole suite
 
 ## Rules specific to this repo
 
-**Never add a default for `hermes_home`.** The two hosts disagree (`~/.hermes` vs
-`~/.hermes/profiles/tmn`), and a shared default silently points the TMN box at a
-stale auth store and reports a confident, wrong `ok`. A missing value must stay a
-hard failure. There is a test for this — do not relax it.
+**Never add a default for `hermes_home`.** Each host config must name the store
+its live gateway reads. A default can turn a future migration into a confident
+check of an unused credential. A missing value must stay a hard failure.
 
 **Never make a failure path quiet.** Every `except` that returns a benign value
 and exits 0 is a way for the watchdog to go blind while systemd stays green,
@@ -63,9 +62,8 @@ is precisely the class of mistake this repo exists to catch. There is a test.
 box's own verdict is `ok`. Reporting a dark peer while this box's credential is
 broken buries the more urgent problem.
 **The observer alerts only when EVERY peer is dark.** While one Hermes box is up
-it already reports its dark partner, so alerting from `neb-ops-gcp` as well would
-page twice for one event. Widening it to "any peer dark" would look like more
-coverage and deliver only noise.
+it reports its dark partner, so an alert from `hermes-tmn-observer` would page
+twice for one event. Widening it to "any peer dark" adds noise.
 
 **Observer mode is not a loophole in the `hermes_home` rule.** It is exempt purely
 because it inspects no credential; any config without `mode: observer` must still

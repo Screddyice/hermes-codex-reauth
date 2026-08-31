@@ -239,9 +239,10 @@ def test_every_check_unit_wires_onfailure_to_its_notifier():
 
 
 def test_notifier_units_read_the_env_that_holds_the_bot_token():
-    """tmn must load the profile .env first; without it the token never resolves."""
+    """The live TMN host stores its notifier token in the root Hermes env."""
     tmn = (WATCHDOG / "systemd" / "hermes-codex-health-tmn-notify.service").read_text()
-    assert tmn.index("profiles/tmn/.env") < tmn.index("%h/.hermes/.env")
+    assert "EnvironmentFile=-%h/.hermes/.env" in tmn
+    assert "profiles/tmn" not in tmn
 
     host = (WATCHDOG / "systemd" / "hermes-codex-health-notify.service").read_text()
     assert "%h/.hermes/.env" in host

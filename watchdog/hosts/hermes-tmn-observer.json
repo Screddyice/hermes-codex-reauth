@@ -1,10 +1,10 @@
 {
-  "host_label": "neb-ops-gcp",
+  "host_label": "hermes-tmn-observer",
   "bot_label": "both Hermes bots",
   "mode": "observer",
   "renotify_s": 86400,
   "subject": "Action needed: BOTH Hermes watchdogs are dark",
-  "ticket_title": "Both Hermes watchdogs dark — reported by neb-ops-gcp",
+  "ticket_title": "Both Hermes watchdogs dark — reported by hermes-tmn-observer",
   "peers": [
     {
       "label": "src",
@@ -13,9 +13,9 @@
       "stale_after_s": 46800
     },
     {
-      "label": "hermes-tmn",
+      "label": "neb-ops-gcp",
       "bot_label": "@Teamnebula_bot",
-      "url": "http://100.126.215.66:8299/heartbeat",
+      "url": "http://100.74.25.61:8299/heartbeat",
       "stale_after_s": 46800
     }
   ],
@@ -33,17 +33,15 @@
     "",
     "Check, per box:",
     "  ssh screddy-hermes 'systemctl --user list-timers | grep codex-health'",
-    "  gcloud compute ssh hermes-tmn --project teamnebula-os --zone us-central1-a \\",
-    "      --tunnel-through-iap --command 'systemctl --user list-timers | grep codex-health'",
+    "  ssh neb-ops-gcp 'systemctl --user list-timers | grep codex-health'",
     "",
     "Likely causes, in order: both boxes are genuinely off or unreachable; Tailscale",
     "is down on this host so neither heartbeat resolves; or the heartbeat servers were",
     "stopped without the checks being stopped."
   ],
   "context_note": [
-    "neb-ops-gcp is a backstop and nothing watches it in turn. If this host dies, the",
-    "coverage silently degrades to the two boxes watching each other, which is where",
-    "things stood before 2026-08-17 — still good for a single box going dark.",
+    "The retired hermes-tmn VM now runs this observer instead of checking an unused",
+    "credential. neb-ops-gcp watches its heartbeat in turn.",
     "",
     "It holds no Hermes credential and checks none. It reads two heartbeats over the",
     "tailnet and alerts by Telegram, the narrowest secret that reaches Shawn from a",

@@ -147,21 +147,14 @@ def test_config_with_no_channels_is_fatal(tmp_path):
 
 
 def test_shipped_host_configs_resolve_to_the_right_auth_store():
-    """Regression guard for the exact defect fixed on 2026-07-29.
-
-    TMN's gateway runs with HERMES_HOME=~/.hermes/profiles/tmn. Its root
-    ~/.hermes/auth.json is stale and unused; watching it reports a healthy
-    credential that nothing runs on.
-    """
+    """Each post-migration config names the auth store its gateway uses."""
     tmn = chk.load_config(WATCHDOG / "hosts" / "tmn.json")
-    assert tmn["hermes_home"] == "~/.hermes/profiles/tmn"
-    assert not tmn["hermes_home"].rstrip("/").endswith(".hermes")
+    assert tmn["hermes_home"] == "~/.hermes"
+    assert tmn["gateway_unit"] == "hermes-gateway.service"
 
     host = chk.load_config(WATCHDOG / "hosts" / "src.json")
     assert host["hermes_home"] == "~/.hermes"
-
-    assert tmn["hermes_home"] != host["hermes_home"]
-    assert tmn["gateway_unit"] != host["gateway_unit"]
+    assert host["gateway_unit"] == "hermes-gateway.service"
 
 
 def test_alert_surfaces_the_reauth_link_with_its_caveat():
@@ -196,9 +189,8 @@ def test_shipped_codex_hosts_route_alerts_per_host():
     team channel: it DMs him over Telegram and emails him. Telegram was added on
     2026-08-24 so the primary path shares no failure mode with Composio, after a
     key rotation left email 401ing with only the OnFailure backstop delivering.
-    hermes-tmn (@Teamnebula_bot) is company infrastructure with no fallback
-    provider, so it posts to the team channel and emails. Linear ticketing was
-    dropped from src on 2026-08-17.
+    neb-ops-gcp (@Teamnebula_bot) is company infrastructure, so it posts to the
+    team channel and emails. Linear ticketing was dropped from src on 2026-08-17.
     """
     host = chk.load_config(WATCHDOG / "hosts" / "src.json")
     assert sorted(host["channels"]) == ["email", "telegram"]
@@ -236,7 +228,8 @@ def test_shipped_configs_carry_their_own_runbook_only():
     host = chk.load_config(WATCHDOG / "hosts" / "src.json")
     tmn_rb, host_rb = "\n".join(tmn["runbook"]), "\n".join(host["runbook"])
 
-    assert "--profile tmn" in tmn_rb and "hermes-gateway-tmn.service" in tmn_rb
+    assert "ssh neb-ops-gcp" in tmn_rb and "hermes-gateway.service" in tmn_rb
+    assert "--profile tmn" not in tmn_rb
     assert "ssh screddy-hermes" not in tmn_rb
 
     assert "ssh screddy-hermes" in host_rb
@@ -571,17 +564,21 @@ def test_heartbeat_is_written_on_every_completed_run(host):
 def test_shipped_configs_match_the_post_migration_tailnet_topology():
     src = chk.load_config(WATCHDOG / "hosts" / "src.json")
     tmn = chk.load_config(WATCHDOG / "hosts" / "tmn.json")
-    observer = chk.load_config(WATCHDOG / "hosts" / "neb-ops.json")
+    observer = chk.load_config(WATCHDOG / "hosts" / "hermes-tmn-observer.json")
 
     assert src["host_label"] == "src"
     assert not src.get("peer") and not src.get("peers")
+    assert tmn["host_label"] == "neb-ops-gcp"
+    assert tmn["hermes_home"] == "~/.hermes"
+    assert tmn["gateway_unit"] == "hermes-gateway.service"
+    assert observer["host_label"] == "hermes-tmn-observer"
 
     # src lives on the consulting tailnet. Sharing that one device into the TMN
-    # tailnet lets both TMN monitors read it without exposing a public endpoint
-    # or giving src access to the rest of the company tailnet.
-    assert [p["label"] for p in tmn["peers"]] == ["src", "neb-ops-gcp"]
+    # tailnet lets the live TMN host and the old VM's observer read it without a
+    # public endpoint or reverse access into company nodes.
+    assert [p["label"] for p in tmn["peers"]] == ["src", "hermes-tmn-observer"]
     assert "peer" not in tmn
-    assert sorted(p["label"] for p in observer["peers"]) == ["hermes-tmn", "src"]
+    assert sorted(p["label"] for p in observer["peers"]) == ["neb-ops-gcp", "src"]
 
     # Tailnet addresses only. A public URL recreates the retired Hostinger route
     # that triggered the false alert after the August migration.
@@ -594,17 +591,13 @@ def test_shipped_configs_match_the_post_migration_tailnet_topology():
     assert src_urls == {"http://100.79.251.126:8299/heartbeat"}
 
 
-def test_only_the_box_with_two_watchdogs_asserts_a_sibling_timer():
-    """hermes-tmn runs a second check (NEBOS Claude) whose timer nothing shadows.
-
-    The codex timer needs no assertion: if it stops, its heartbeat goes stale and
-    the peer reports it. The Claude timer has no such shadow, which is the gap.
-    """
+def test_live_tmn_config_does_not_assert_timers_on_the_retired_vm():
+    """The TMN watchdog moved to neb-ops-gcp; its sibling timers did not."""
     tmn = chk.load_config(WATCHDOG / "hosts" / "tmn.json")
-    assert tmn["sibling_timers"] == ["nebos-claude-health.timer"]
+    assert not tmn.get("sibling_timers")
 
     host = chk.load_config(WATCHDOG / "hosts" / "src.json")
-    assert not host.get("sibling_timers")   # one watchdog on that box, nothing to pair
+    assert not host.get("sibling_timers")
 
 
 # --------------------------------------------------------------------------
@@ -796,12 +789,12 @@ def test_non_codex_gateway_is_quiet_but_unreadable_config_is_loud(tmp_path):
 # --------------------------------------------------------------------------
 
 def obs_cfg(**over):
-    cfg = {"host_label": "neb-ops-gcp", "mode": "observer",
+    cfg = {"host_label": "hermes-tmn-observer", "mode": "observer",
            "peers": [
                {"label": "src", "bot_label": "@Screddy_bot",
                 "url": "http://100.79.251.126:8299/heartbeat", "stale_after_s": 46800},
-               {"label": "hermes-tmn", "bot_label": "@Teamnebula_bot",
-                "url": "http://100.126.215.66:8299/heartbeat", "stale_after_s": 46800},
+               {"label": "neb-ops-gcp", "bot_label": "@Teamnebula_bot",
+                "url": "http://100.74.25.61:8299/heartbeat", "stale_after_s": 46800},
            ],
            "channels": {"telegram": {"chat_id": "1", "token_env": "TELEGRAM_BOT_TOKEN"}}}
     cfg.update(over)
@@ -812,7 +805,7 @@ def peers_aged(monkeypatch, ages):
     """ages maps peer label -> heartbeat age in seconds (None = unreachable)."""
     import contextlib, io, json as _json
     by_url = {"http://100.79.251.126:8299/heartbeat": "src",
-              "http://100.126.215.66:8299/heartbeat": "hermes-tmn"}
+              "http://100.74.25.61:8299/heartbeat": "neb-ops-gcp"}
 
     def opener(url, timeout=0):
         age = ages[by_url[url]]
@@ -829,29 +822,29 @@ def test_observer_stays_silent_while_one_box_is_alive(monkeypatch):
     Alerting here too would page twice for one event, which is the noise this
     repo keeps refusing to add.
     """
-    peers_aged(monkeypatch, {"src": 60, "hermes-tmn": 99 * 3600})
+    peers_aged(monkeypatch, {"src": 60, "neb-ops-gcp": 99 * 3600})
     status, _, _ = chk.observe_peers(obs_cfg(), {})
     assert status == "ok"
 
 
 def test_observer_alerts_when_every_box_is_dark(monkeypatch):
-    peers_aged(monkeypatch, {"src": 99 * 3600, "hermes-tmn": 99 * 3600})
+    peers_aged(monkeypatch, {"src": 99 * 3600, "neb-ops-gcp": 99 * 3600})
     status, detail, _ = chk.observe_peers(obs_cfg(), {})
     assert status == "peer"
     assert "every watched box is dark" in detail
-    assert "src" in detail and "hermes-tmn" in detail
+    assert "src" in detail and "neb-ops-gcp" in detail
 
 
 def test_observer_unreachable_peers_still_need_two_misses(monkeypatch):
-    peers_aged(monkeypatch, {"src": None, "hermes-tmn": None})
+    peers_aged(monkeypatch, {"src": None, "neb-ops-gcp": None})
 
     status, _, fails = chk.observe_peers(obs_cfg(), {})
     assert status == "ok"                      # first miss on each, not evidence
-    assert fails == {"src": 1, "hermes-tmn": 1}
+    assert fails == {"src": 1, "neb-ops-gcp": 1}
 
     status, _, fails = chk.observe_peers(obs_cfg(), fails)
     assert status == "peer"
-    assert fails == {"src": 2, "hermes-tmn": 2}
+    assert fails == {"src": 2, "neb-ops-gcp": 2}
 
 
 def test_observer_config_needs_no_auth_store_but_others_still_do(tmp_path):
@@ -871,9 +864,9 @@ def test_observer_config_needs_no_auth_store_but_others_still_do(tmp_path):
 
 
 def test_shipped_observer_config_watches_both_boxes_over_the_tailnet():
-    cfg = chk.load_config(WATCHDOG / "hosts" / "neb-ops.json")
+    cfg = chk.load_config(WATCHDOG / "hosts" / "hermes-tmn-observer.json")
     assert cfg["mode"] == "observer"
-    assert sorted(p["label"] for p in cfg["peers"]) == ["hermes-tmn", "src"]
+    assert sorted(p["label"] for p in cfg["peers"]) == ["neb-ops-gcp", "src"]
     for peer in cfg["peers"]:
         assert "://100." in peer["url"]
     # telegram only: this box holds no Composio or Slack credential, and giving it
@@ -889,7 +882,7 @@ def test_observer_run_does_not_require_an_auth_store(tmp_path, monkeypatch):
     cfg["hermes_home"]. Caught by install.sh's dry-run assertion on 2026-08-17,
     which is the only reason it did not ship.
     """
-    peers_aged(monkeypatch, {"src": 60, "hermes-tmn": 60})
+    peers_aged(monkeypatch, {"src": 60, "neb-ops-gcp": 60})
     cfg_path = tmp_path / "obs.json"
     cfg_path.write_text(json.dumps(obs_cfg()))
     sent = []
@@ -901,7 +894,7 @@ def test_observer_run_does_not_require_an_auth_store(tmp_path, monkeypatch):
 
 
 def test_observer_alert_reaches_telegram(tmp_path, monkeypatch):
-    peers_aged(monkeypatch, {"src": 99 * 3600, "hermes-tmn": 99 * 3600})
+    peers_aged(monkeypatch, {"src": 99 * 3600, "neb-ops-gcp": 99 * 3600})
     cfg_path = tmp_path / "obs.json"
     cfg_path.write_text(json.dumps(obs_cfg()))
     sent = []
@@ -1001,7 +994,7 @@ def test_any_dark_peer_is_reported_not_just_all(monkeypatch):
     """A normal watchdog reports any dark peer; the observer waits for all peers."""
     import contextlib, io, json as _json
     def opener(url, timeout=0):
-        if "100.74" in url:                      # the observer is dark
+        if "100.126" in url:                     # the observer is dark
             raise OSError("unreachable")
         body = _json.dumps({"at": int(time.time()) - 60}).encode()
         return contextlib.closing(io.BytesIO(body))
@@ -1009,11 +1002,11 @@ def test_any_dark_peer_is_reported_not_just_all(monkeypatch):
 
     cfg = chk.load_config(WATCHDOG / "hosts" / "tmn.json")
     status, _, fails = chk.read_peers(cfg, {})
-    assert status == "ok" and fails["neb-ops-gcp"] == 1      # one miss, no page
+    assert status == "ok" and fails["hermes-tmn-observer"] == 1  # one miss, no page
 
     status, detail, fails = chk.read_peers(cfg, fails)
     assert status == "peer"
-    assert "neb-ops-gcp" in detail
+    assert "hermes-tmn-observer" in detail
     assert fails["src"] == 0                          # healthy peer stays reset
 
 

@@ -1,12 +1,12 @@
 {
-  "host_label": "hermes-tmn",
+  "host_label": "neb-ops-gcp",
   "bot_label": "@Teamnebula_bot",
-  "hermes_home": "~/.hermes/profiles/tmn",
-  "gateway_unit": "hermes-gateway-tmn.service",
+  "hermes_home": "~/.hermes",
+  "gateway_unit": "hermes-gateway.service",
   "reauth_url": "https://auth.openai.com/codex/device",
   "renotify_s": 86400,
-  "subject": "Action needed: Team Nebula Hermes lost its Codex sign-in (hermes-tmn)",
-  "ticket_title": "Codex sign-in lost — Team Nebula Hermes (hermes-tmn)",
+  "subject": "Action needed: Team Nebula Hermes lost its Codex sign-in (neb-ops-gcp)",
+  "ticket_title": "Codex sign-in lost — Team Nebula Hermes (neb-ops-gcp)",
   "channels": {
     "slack": {
       "channel": "C09FLJDCAJD",
@@ -27,11 +27,10 @@
     "by a person at a browser. Until someone runs these steps the bot stays down.",
     "",
     "1. SSH to the VM:",
-    "   gcloud compute ssh hermes-tmn --project teamnebula-os --zone us-central1-a --tunnel-through-iap",
+    "   ssh neb-ops-gcp",
     "",
-    "2. Start the device-code login. BOTH the env var and the flag matter — without",
-    "   them the credential lands in the default profile, which the gateway never reads:",
-    "   HERMES_HOME=$HOME/.hermes/profiles/tmn hermes --profile tmn auth add openai-codex --type oauth --no-browser",
+    "2. Start the device-code login in the default Hermes home:",
+    "   hermes auth add openai-codex --type oauth --no-browser",
     "",
     "3. It prints https://auth.openai.com/codex/device plus a short code. Open the URL",
     "   in any browser, enter the code, sign in, and complete the 2FA challenge.",
@@ -41,33 +40,31 @@
     "",
     "4. Confirm it landed (do NOT trust `auth status`, it reports \"logged in\" even when",
     "   no usable credential exists):",
-    "   hermes --profile tmn auth list          # want: openai-codex (1 credentials)",
+    "   hermes auth list          # want: openai-codex credentials in the active pool",
     "",
     "5. Restart the gateway:",
-    "   systemctl --user restart hermes-gateway-tmn.service",
+    "   systemctl --user restart hermes-gateway.service",
     "",
     "6. Verify a real turn:",
-    "   hermes --profile tmn -z \"Reply with exactly one word: PONG\""
+    "   hermes -z \"Reply with exactly one word: PONG\""
   ],
   "context_note": [
     "Why this needs a person: the only repair is a full re-login, which OpenAI now gates",
     "behind 2FA. There is no unattended path back. Do not wait for it to recover by itself.",
     "",
-    "This box has NO fallback provider (fallback_providers is empty and ollama is not",
-    "running), so codex being down means @Teamnebula_bot is fully dead rather than degraded.",
-    "Treat it as higher urgency than the personal box.",
+    "This box has fallback providers. A broken Codex credential can route work onto a paid",
+    "provider, so treat the alert as a reliability and cost issue even if Nebby still answers.",
     "",
     "Use a FRESH authorization, not a copy of the one src holds. Both boxes previously",
     "shared one OAuth lineage, and whichever refreshes last silently invalidates the other —",
     "that is what caused the July outage. The credential `label` field is cosmetic and reads",
     "the same on both boxes; compare the refresh-token fingerprint printed in this alert."
   ],
-  "quota_subject": "Action needed: Team Nebula Hermes is out of Codex quota (hermes-tmn)",
-  "quota_ticket_title": "Codex quota exhausted — Team Nebula Hermes (hermes-tmn)",
+  "quota_subject": "Action needed: Team Nebula Hermes is out of Codex quota (neb-ops-gcp)",
+  "quota_ticket_title": "Codex quota exhausted — Team Nebula Hermes (neb-ops-gcp)",
   "quota_note": [
-    "This box has NO fallback provider (fallback_providers is empty), so an exhausted plan",
-    "means @Teamnebula_bot answers nothing at all — every message gets the canned",
-    "\"model provider is rate-limiting\" reply.",
+    "This box has fallback providers. Codex quota exhaustion can move work to a paid route,",
+    "so confirm the active provider before treating a successful reply as recovery.",
     "",
     "@Teamnebula_bot and @Screddy_bot are on SEPARATE ChatGPT accounts. Check which one this",
     "credential is attached to before upgrading anything: on 2026-08-15 the tmn credential was",
@@ -85,13 +82,10 @@
       "stale_after_s": 46800
     },
     {
-      "label": "neb-ops-gcp",
+      "label": "hermes-tmn-observer",
       "bot_label": "the backstop observer",
-      "url": "http://100.74.25.61:8299/heartbeat",
+      "url": "http://100.126.215.66:8299/heartbeat",
       "stale_after_s": 46800
     }
-  ],
-  "sibling_timers": [
-    "nebos-claude-health.timer"
   ]
 }

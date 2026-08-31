@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 %h/.hermes/profiles/tmn/codex-health/heartbeat_server.py --file %h/.hermes/profiles/tmn/codex-health/heartbeat.json --port 8299
+ExecStart=/usr/bin/python3 %h/.hermes/codex-health/heartbeat_server.py --file %h/.hermes/codex-health/heartbeat.json --port 8299
 Restart=always
 RestartSec=30
 

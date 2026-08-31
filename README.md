@@ -41,9 +41,9 @@ One watchdog per host, 4 runs a day, silent unless something is wrong.
 | Target | Credential watched | Runs on | Alerts to |
 |---|---|---|---|
 | `@Screddy_bot` codex | `~/.hermes/auth.json` | src (`hermes`) | Telegram + email |
-| `@Teamnebula_bot` codex | `~/.hermes/profiles/tmn/auth.json` | hermes-tmn (`screddy`) | Slack `#tmn-ops` + email |
+| `@Teamnebula_bot` codex | `~/.hermes/auth.json` | neb-ops-gcp (`shawn_teamnebula_ai`) | Slack `#tmn-ops` + email |
 | **NEBOS v2 Claude** | `CLAUDE_CODE_OAUTH_TOKEN` in `nebos-dev` Secret Manager | hermes-tmn (`screddy`) | Slack `#tmn-ops` + email |
-| **both watchdogs** | the two heartbeats, over the tailnet | neb-ops-gcp (observer) | Telegram DM |
+| **both Codex watchdogs** | the two heartbeats, over the tailnet | hermes-tmn (observer) | Telegram DM |
 
 The two hosts are **interleaved on the half-cycle** — TMN on 00/06/12/18:35, src on
 03/09/15/21:35 — so each box is checked every 6h while the fleet as a whole is
@@ -55,9 +55,9 @@ watchdog/
   notify_failure.py       last-resort escalator, fired by OnFailure=
   heartbeat_server.py     serves this box's heartbeat to its peer, tailnet only
   codex_auth_probe.py     live probe — OPERATOR TOOL, not on any timer
-  hosts/{src,tmn,neb-ops}.json         everything host-specific
+  hosts/{src,tmn,hermes-tmn-observer}.json   everything host-specific
   systemd/                12 units, byte-identical to what is deployed
-  install.sh              --host {src|tmn|nebos-claude|neb-ops}
+  install.sh              --host {src|tmn|nebos-claude|observer}
 ```
 
 **Everything host-specific lives in `hosts/*.json`** — auth store, gateway unit,
@@ -65,14 +65,9 @@ channels, and the runbook prose. The script carries no host defaults.
 
 ### `hermes_home` has no default, on purpose
 
-The two scripts this replaced disagreed: `~/.hermes` on one host,
-`~/.hermes/profiles/tmn` on the other. TMN's gateway runs with
-`HERMES_HOME=~/.hermes/profiles/tmn` and its root `~/.hermes/auth.json` is stale
-and unused — so a shared default would silently watch a credential nothing runs
-on and report a confident, wrong `ok`. That was a real defect, fixed 2026-07-29.
-
-A missing `hermes_home` is therefore a hard failure, not a guess, and a test
-asserts each shipped config resolves to the intended store.
+Both live gateways now use `~/.hermes`, but each host config still names that
+path. A default would hide the next host or profile migration and could report
+against an unused credential. A missing `hermes_home` remains a hard failure.
 
 ## The Claude watchdog is a different script, on purpose
 
@@ -175,13 +170,10 @@ The active auth source determines precedence. A singleton sign-in failure outran
 quota only when no pool exists. With a populated pool, the watchdog evaluates that
 pool for renewable credentials and quota state.
 
-## A watchdog watching the watchdog next door
+## The NEBOS Claude timer on the legacy VM
 
-A box can run more than one check. hermes-tmn runs the codex check and the NEBOS
-v2 Claude check. If the **codex** timer stops, its heartbeat goes stale and the
-peer reports it — but the **Claude** timer has no such shadow, so switching it off
-was invisible while the box stayed healthy. That is the 2026-08-04 failure mode (a
-timer disabled, six days unnoticed) surviving in a corner.
+The August migration moved the TMN Codex gateway to neb-ops-gcp. The NEBOS v2
+Claude check remains on hermes-tmn, so the two timers no longer share a host.
 
 So each host config may name `sibling_timers`, and the codex check asserts them
 locally through systemd: enabled, scheduled, and triggered within
@@ -189,8 +181,9 @@ locally through systemd: enabled, scheduled, and triggered within
 to rot. A never-triggered timer reads as a fresh install rather than a fault, and
 a systemctl error reads as uncheckable rather than broken.
 
-Only hermes-tmn carries one (`nebos-claude-health.timer`). src runs a single
-watchdog, so it has no sibling to pair with.
+No shipped Codex config names a sibling timer after the migration. The NEBOS
+Claude service retains its own `OnFailure=` escalation, but another node does not
+detect a timer that never fires.
 
 The `sibling` verdict is its own kind, with prose that says plainly that the box's
 own credential is fine and points at the timer. It outranks the peer watch, being
@@ -200,8 +193,8 @@ local and certain where the peer watch is remote and inferential.
 
 Routing differs per box, set on 2026-08-17. `@Screddy_bot` on src is Shawn's
 own assistant, so it DMs and emails him and stays out of the team channel. `@Teamnebula_bot`
-on hermes-tmn is company infrastructure with no fallback provider, so it posts to
-Slack `#tmn-ops` **and** emails. src does not create Linear tickets.
+on neb-ops-gcp is company infrastructure, so it posts to Slack `#tmn-ops` and
+emails. src does not create Linear tickets.
 
 The personal box carries two channels since 2026-08-24: Telegram, then email.
 Telegram reuses `TELEGRAM_BOT_TOKEN`, the same secret `notify_failure.py`
@@ -287,15 +280,15 @@ instead of waiting to disappoint you.
 
 `OnFailure=` needs a run to hook, so it cannot fire for a check that never runs.
 The peer watch covers that gap. Each check writes a heartbeat and serves it on
-its Tailscale address. hermes-tmn and neb-ops-gcp read src through a one-device
+its Tailscale address. hermes-tmn-observer and neb-ops-gcp read src through a one-device
 share from the consulting tailnet into the Team Nebula tailnet. The share grants
 Team Nebula access to src without giving src access to company nodes.
 
 ```
-hermes-tmn  ──reads──▶ http://100.79.251.126:8299/heartbeat  (src)
-hermes-tmn  ──reads──▶ http://100.74.25.61:8299/heartbeat    (neb-ops-gcp)
-neb-ops-gcp ──reads──▶ http://100.79.251.126:8299/heartbeat  (src)
-neb-ops-gcp ──reads──▶ http://100.126.215.66:8299/heartbeat  (hermes-tmn)
+hermes-tmn-observer ──reads──▶ http://100.79.251.126:8299/heartbeat  (src)
+hermes-tmn-observer ──reads──▶ http://100.74.25.61:8299/heartbeat   (neb-ops-gcp)
+neb-ops-gcp         ──reads──▶ http://100.79.251.126:8299/heartbeat  (src)
+neb-ops-gcp         ──reads──▶ http://100.126.215.66:8299/heartbeat (observer)
 ```
 
 Two failure shapes, handled differently on purpose:
@@ -320,10 +313,10 @@ different and unwanted signal. The peer watch answers that: it adds no vendor, n
 account, and no new signal type, because a dark peer is reported through the same
 "something is broken" channels as everything else.
 
-### The backstop: neb-ops-gcp
+### The backstop: hermes-tmn-observer
 
 Mutual watching leaves one hole — both boxes dark at once, with no one left to
-report it. `neb-ops-gcp` closes it. It is a third always-on host already on the
+report it. The legacy `hermes-tmn` VM closes it. It is a third always-on host on the
 tailnet, it holds no Hermes credential and checks none, and it reads both
 heartbeats four times a day on `01,07,13,19:35`, offset from both Hermes hosts so
 a fleet-wide outage surfaces within about 90 minutes.
@@ -344,7 +337,7 @@ Observer mode is not a loophole in the `hermes_home` rule. A config with no
 only because it inspects no credential. Both halves have tests.
 
 **The observer is watched too.** It serves a heartbeat like the others, and
-hermes-tmn reads it. The observer reads src and hermes-tmn, while hermes-tmn
+neb-ops-gcp reads it. The observer reads src and neb-ops-gcp, while neb-ops-gcp
 reads src and the observer. Every node has a watcher, and one dead node produces
 one alert path.
 
@@ -390,6 +383,7 @@ would page every interval.
 
 ```bash
 ./watchdog/install.sh --host src           # or --host tmn
+./watchdog/install.sh --host observer      # legacy hermes-tmn VM
 ```
 
 Idempotent. Never touches `state.json` — a reinstall must not reset an
