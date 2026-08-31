@@ -35,11 +35,12 @@ NOT used here and must not be put on a timer: under the old design it ran every
 30 minutes and consumed the very quota it existed to protect.
 
 Alerting:
-  ok    -> down/quota : one alert on every configured channel
-  same  -> same       : quiet for renotify_s, then a single reminder (no new ticket)
-  down  -> quota      : alerts again -- a different problem needing a different fix
-  fail  -> ok         : silent re-arm, no "recovered" message
-  unknown             : never pages, never changes state (parse/network trouble)
+  ok    -> failure            : one alert on every configured channel
+  down/quota/sibling -> same  : quiet for renotify_s, then one reminder (no new ticket)
+  peer  -> peer               : quiet until recovery; no scheduled reminders
+  down  -> quota              : alerts again -- a different problem needing a different fix
+  fail  -> ok                 : silent re-arm, no "recovered" message
+  unknown                     : never pages, never changes state (parse/network trouble)
 
 EXIT CODES -- a watchdog that fails silently is worse than no watchdog, so every
 way this can stop working is loud:
@@ -758,8 +759,8 @@ def peer_alert_text(cfg: dict, detail: str, ticket: str | None) -> str:
         f"What the check saw: {detail}\n\n"
         + (f"Linear ticket: {ticket}\n\n" if ticket else "")
         + "\n".join(PEER_REMEDY) + "\n\n"
-        "You will not get another message about this for 24 hours, and none at all "
-        "once it is reporting again.\n\n"
+        "You will not get another message for this outage. A new alert can fire "
+        "only after the peer reports again and later goes quiet.\n\n"
         f"-- Automated check on {cfg['host_label']} (codex-health, peer watch)."
     )
 
@@ -1005,6 +1006,8 @@ def _decide_and_deliver(args, cfg, hermes_home, st, state_path, prev, status,
             alert, why = True, f"ok->{status} (first failure)"
         elif prev != status:
             alert, why = True, f"{prev}->{status} (failure kind changed)"
+        elif status == "peer":
+            why = "still peer, quiet until recovery"
         elif now - int(st.get("last_alert", 0)) >= renotify_s:
             alert, why = True, f"still {status}, reminder"
         else:

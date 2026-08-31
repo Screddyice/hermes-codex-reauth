@@ -217,17 +217,21 @@ rotation, update `~/.hermes/.env` on each box, not only the fleet store:
 exactly the 401 above.
 
 ```
-ok    -> down/quota   alert once on every configured channel
-same  -> same         quiet for renotify_s (24h), then one reminder, no second ticket
-down  -> quota        alerts again, even inside the quiet window
-fail  -> ok           silent re-arm, no "recovered" message
-unknown               never pages, never changes state
+ok    -> failure            alert once on every configured channel
+down/quota/sibling -> same  quiet for renotify_s (24h), then one reminder, no second ticket
+peer  -> peer               quiet until recovery, with no scheduled reminders
+down  -> quota              alerts again, even inside the quiet window
+fail  -> ok                 silent re-arm, no "recovered" message
+unknown                     never pages, never changes state
 ```
 
 A change of failure kind breaks the quiet window on purpose. Inheriting the earlier
 alert's silence would leave "go re-login" standing as the last instruction given,
 for a problem no login fixes. That transition also files its own Linear ticket
 rather than reusing the one whose body says to sign in again.
+
+Peer alerts use edge-triggering because another 24-hour message carries no new
+information. Recovery returns the state to `ok`, so a later peer outage still alerts.
 
 Every alert leads with what broke, then the **sign-in link** (`reauth_url` in each
 host config), then that host's own runbook. The link sits near the top because

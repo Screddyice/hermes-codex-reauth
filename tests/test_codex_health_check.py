@@ -674,6 +674,30 @@ def test_reminder_fires_after_renotify_window(host):
     assert len(host["sent"]) == 2
 
 
+def test_peer_failure_does_not_remind_after_renotify_window(host):
+    chk.run(Args(host["cfg"], host["state"], force_peer=True))
+    assert len(host["sent"]) == 1
+
+    st = json.loads(host["state"].read_text())
+    st["last_alert"] = int(time.time()) - (24 * 3600 + 60)
+    host["state"].write_text(json.dumps(st))
+
+    chk.run(Args(host["cfg"], host["state"], force_peer=True))
+    assert len(host["sent"]) == 1
+
+
+def test_peer_recovery_rearms_the_first_failure_alert(host):
+    chk.run(Args(host["cfg"], host["state"], force_peer=True))
+    assert len(host["sent"]) == 1
+
+    chk.run(Args(host["cfg"], host["state"]))
+    assert len(host["sent"]) == 1
+    assert json.loads(host["state"].read_text())["status"] == "ok"
+
+    chk.run(Args(host["cfg"], host["state"], force_peer=True))
+    assert len(host["sent"]) == 2
+
+
 def test_recovery_is_silent_and_rearms(host):
     (host["home"] / "auth.json").write_text(json.dumps(auth_doc(refresh=None)))
     chk.run(Args(host["cfg"], host["state"]))
@@ -712,6 +736,19 @@ def test_quota_outage_alerts_once_then_goes_quiet(host):
 
     assert chk.run(Args(host["cfg"], host["state"])) == 0
     assert len(host["sent"]) == 1                     # quiet window holds
+
+
+def test_quota_reminder_still_fires_after_renotify_window(host):
+    (host["home"] / "auth.json").write_text(json.dumps(auth_doc(pool=[pool_entry()])))
+    chk.run(Args(host["cfg"], host["state"]))
+    assert len(host["sent"]) == 1
+
+    st = json.loads(host["state"].read_text())
+    st["last_alert"] = int(time.time()) - (24 * 3600 + 60)
+    host["state"].write_text(json.dumps(st))
+
+    chk.run(Args(host["cfg"], host["state"]))
+    assert len(host["sent"]) == 2
 
 
 def test_failure_kind_change_re_alerts_inside_the_quiet_window(host):
