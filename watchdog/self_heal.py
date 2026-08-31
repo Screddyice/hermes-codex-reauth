@@ -45,6 +45,16 @@ TERMINAL_CREDENTIAL_CODES = frozenset({
 })
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+PEER_HEARTBEAT_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}), _NoRedirectHandler()
+)
+
+
 class Disarmed(Exception):
     """The healer cannot safely continue."""
 
@@ -535,9 +545,9 @@ def peer_heartbeat(peer: dict, previous_misses: int) -> tuple[str, str, int]:
         raise Disarmed("peer miss count is invalid")
     label = validated["label"]
     stale_after = _validate_stale_after(validated)
-    url = f"http://{validated['ip']}:8299/heartbeat"
+    url = _peer_heartbeat_url(validated)
     try:
-        with urllib.request.urlopen(url, timeout=20) as response:
+        with PEER_HEARTBEAT_OPENER.open(url, timeout=20) as response:
             heartbeat = json.loads(response.read())
         if not isinstance(heartbeat, dict):
             raise ValueError("heartbeat is malformed")
@@ -553,6 +563,10 @@ def peer_heartbeat(peer: dict, previous_misses: int) -> tuple[str, str, int]:
     if age > stale_after:
         return "peer", f"{label} heartbeat is stale by {age} seconds", 0
     return "ok", f"{label} heartbeat is {max(age, 0)} seconds old", 0
+
+
+def _peer_heartbeat_url(peer: dict) -> str:
+    return f"http://{peer['ip']}:8299/heartbeat"
 
 
 def repair_peer(
@@ -905,6 +919,8 @@ def _validate_private_regular_file(value: object, label: str) -> None:
         raise Disarmed(f"{label} file is unavailable") from exc
     if not stat.S_ISREG(file_stat.st_mode):
         raise Disarmed(f"{label} file is not regular")
+    if file_stat.st_size == 0:
+        raise Disarmed(f"{label} file is empty")
     if file_stat.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
         raise Disarmed(f"{label} file permissions are unsafe")
 

@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import base64
 import dataclasses
+import http.server
 import importlib.util
 import json
 import pathlib
 import stat
 import subprocess
 import sys
+import threading
 import time
 import traceback
+import urllib.request
 
 import pytest
 
@@ -929,6 +932,19 @@ def test_peer_validation_rejects_group_or_world_readable_identity(tmp_path, mode
         healer.validate_peer(peer)
 
 
+def test_peer_repair_rejects_empty_identity_before_ssh(tmp_path):
+    peer = valid_peer(tmp_path)
+    pathlib.Path(peer["identity_file"]).write_bytes(b"")
+    runner = ScriptedRunner([])
+
+    with pytest.raises(healer.Disarmed):
+        healer.ssh_base(peer)
+    with pytest.raises(healer.Disarmed):
+        healer.repair_peer(peer, runner, fresh_heartbeat, dry_run=False)
+
+    assert runner.calls == []
+
+
 def test_peer_validation_rejects_group_or_world_writable_known_hosts(tmp_path):
     peer = valid_peer(tmp_path)
     pathlib.Path(peer["known_hosts"]).chmod(0o666)
@@ -1123,7 +1139,7 @@ def test_peer_handler_calls_passive_heartbeat_helper_with_prior_misses(
         calls.append((url, timeout))
         raise OSError("unreachable")
 
-    monkeypatch.setattr(healer.urllib.request, "urlopen", unavailable)
+    monkeypatch.setattr(healer.PEER_HEARTBEAT_OPENER, "open", unavailable)
     state = {"peer_misses": {}, "peer_attempts": {}, "faults": {}}
     peer = valid_peer(tmp_path, label="src")
 
@@ -1133,6 +1149,66 @@ def test_peer_handler_calls_passive_heartbeat_helper_with_prior_misses(
 
     assert outcome.action == "wait"
     assert calls == [("http://100.74.25.61:8299/heartbeat", 20)]
+
+
+def test_peer_heartbeat_refuses_redirect_to_second_address(tmp_path, monkeypatch):
+    source_hits = []
+    target_hits = []
+
+    class QuietHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, _format, *args):
+            pass
+
+    class TargetHandler(QuietHandler):
+        def do_GET(self):
+            target_hits.append(self.path)
+            body = json.dumps({"at": int(time.time()), "status": "ok"}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    target = http.server.ThreadingHTTPServer(("127.0.0.1", 0), TargetHandler)
+    target_url = f"http://127.0.0.1:{target.server_port}/redirect-target"
+
+    class RedirectHandler(QuietHandler):
+        def do_GET(self):
+            source_hits.append(self.path)
+            self.send_response(302)
+            self.send_header("Location", target_url)
+            self.end_headers()
+
+    redirect = http.server.ThreadingHTTPServer(("127.0.0.1", 0), RedirectHandler)
+    source_url = f"http://127.0.0.1:{redirect.server_port}/heartbeat"
+    target_thread = threading.Thread(target=target.serve_forever, daemon=True)
+    redirect_thread = threading.Thread(target=redirect.serve_forever, daemon=True)
+    target_thread.start()
+    redirect_thread.start()
+    real_urlopen = urllib.request.urlopen
+    monkeypatch.setattr(
+        healer, "_peer_heartbeat_url", lambda _peer: source_url, raising=False
+    )
+    monkeypatch.setattr(
+        healer.urllib.request,
+        "urlopen",
+        lambda _url, timeout: real_urlopen(source_url, timeout=timeout),
+    )
+
+    try:
+        verdict, _, misses = healer.peer_heartbeat(valid_peer(tmp_path), 0)
+    finally:
+        redirect.shutdown()
+        target.shutdown()
+        redirect.server_close()
+        target.server_close()
+        redirect_thread.join(timeout=2)
+        target_thread.join(timeout=2)
+
+    assert verdict == "unknown"
+    assert misses == 1
+    assert source_hits == ["/heartbeat"]
+    assert target_hits == []
 
 
 def test_peer_handler_rejects_bad_stale_threshold_without_mutating_state(tmp_path):
