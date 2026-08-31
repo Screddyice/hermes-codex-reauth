@@ -89,6 +89,9 @@ and 2FA.
 **Honor local repair cooldowns.** The healer must check timer, gateway, and
 credential recovery on each cycle. An active fault blocks another mutation until
 `retry_s` elapses. Passive recovery clears the fault and re-arms notification.
+After OAuth persistence, pending gateway and probe work stays owned by
+`local.credential`. The ordinary gateway path must defer, and a cooldown retry
+must resume the pending phase without another OAuth refresh.
 
 **Keep peer SSH fixed and narrow.** Accept Tailscale IPs and committed users,
 paths, and unit names only. Require a private identity and pinned host-key file.

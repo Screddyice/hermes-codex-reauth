@@ -383,6 +383,13 @@ probe reset separately. It makes no request before the reset, then runs one
 direct no-tool probe at the boundary without another OAuth refresh. A repeated
 429 stores the next reset and ends the cycle.
 
+After OAuth persistence, the state file records `gateway_restart` and then
+`probe` as non-secret pending phases. Both phases belong to the
+`local.credential` incident. The ordinary gateway step defers while either phase
+exists. A failed restart waits for the credential cooldown, then resumes one
+restart and one probe. A failed probe resumes one probe. Neither path repeats the
+OAuth refresh. Success clears the pending phase and credential fault.
+
 Credential roles pin the Hermes Python runtime, version, `auth.py`, and
 `credential_pool.py`, including a SHA-256 for each source module. `src` uses
 `/opt/hermes-agent`; Team Nebula uses the Hermes checkout under

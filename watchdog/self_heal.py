@@ -47,6 +47,7 @@ TERMINAL_CREDENTIAL_CODES = frozenset({
     "invalid_token",
     "dead",
 })
+CREDENTIAL_PENDING_PHASES = frozenset({"gateway_restart", "probe"})
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -266,6 +267,112 @@ def run_live_probe(cfg_path: pathlib.Path, run_cmd) -> CommandResult:
     ], 40)
 
 
+def _pending_command_failure(
+    prefix: str,
+    outcome: CommandResult,
+    backup_path: pathlib.Path | None,
+) -> str:
+    if backup_path is not None:
+        return _command_failure(prefix, outcome, backup_path)
+    captured = "\n".join(
+        part for part in (outcome.stdout, outcome.stderr) if part
+    )
+    detail = prefix
+    if captured:
+        detail += f"; output: {captured}"
+    return _bounded_detail(detail)
+
+
+def _resume_credential_pending(
+    cfg: dict,
+    cfg_path: pathlib.Path,
+    auth_path: pathlib.Path,
+    state: dict,
+    run_cmd,
+    now: int,
+    dry_run: bool,
+    persist_state,
+    allow_mutation: bool,
+    backup_path: pathlib.Path | None = None,
+) -> tuple[bool, str]:
+    phase = state.get("credential_pending_phase")
+    if phase not in CREDENTIAL_PENDING_PHASES:
+        raise Disarmed("state file is malformed")
+    if dry_run:
+        if phase == "gateway_restart":
+            return True, "dry-run: resume one gateway restart and one direct probe"
+        return True, "dry-run: resume one direct probe"
+    if not allow_mutation:
+        return False, "credential verification waits for the local repair cooldown"
+
+    if phase == "gateway_restart":
+        auth = _read_auth(auth_path)
+        gateway_ok, gateway_detail = repair_gateway(
+            cfg,
+            auth,
+            run_cmd,
+            dry_run=False,
+            force_restart=True,
+        )
+        if not gateway_ok:
+            detail = gateway_detail
+            if backup_path is not None:
+                detail += f"; backup retained at {backup_path}"
+            return False, _bounded_detail(detail)
+        state["credential_pending_phase"] = "probe"
+        persist_state()
+
+    probe = run_live_probe(cfg_path, run_cmd)
+    if probe.returncode == 0:
+        state.pop("credential_pending_phase", None)
+        state.pop("quota_reset_at", None)
+        state.pop("quota_retry_action", None)
+        persist_state()
+        detail = "credential repair verified"
+        if backup_path is not None:
+            detail += f"; backup retained at {backup_path}"
+        return True, _bounded_detail(detail)
+    if probe.returncode == 1:
+        return False, _pending_command_failure(
+            "credential requires human 2FA after repair",
+            probe,
+            backup_path,
+        )
+    if probe.returncode == 2:
+        return False, _pending_command_failure(
+            "credential verification failed",
+            probe,
+            backup_path,
+        )
+    if probe.returncode == 3:
+        auth = _read_auth(auth_path)
+        next_reset = full_pool_reset_at(auth, 0.0)
+        if next_reset is None:
+            next_reset = _reset_at_from_text(probe.stdout + "\n" + probe.stderr)
+        if next_reset is None:
+            return False, _pending_command_failure(
+                "quota probe returned no recorded reset",
+                probe,
+                backup_path,
+            )
+        state.pop("credential_pending_phase", None)
+        state["quota_reset_at"] = next_reset
+        state["quota_retry_action"] = "probe"
+        persist_state()
+        detail = (
+            "quota remains blocked until recorded reset "
+            f"{_format_reset(next_reset)}"
+        )
+        if backup_path is not None:
+            detail += f"; backup retained at {backup_path}"
+        return True, _bounded_detail(detail)
+    return False, _pending_command_failure(
+        f"credential probe returned unsupported code {probe.returncode}",
+        probe,
+        backup_path,
+    )
+
+
 def repair_credential(
     cfg: dict,
     cfg_path: pathlib.Path,
@@ -282,6 +389,18 @@ def repair_credential(
     persist_state = persist_state or (lambda: None)
     auth_path = pathlib.Path(auth_path)
     cfg_path = pathlib.Path(cfg_path)
+    if state.get("credential_pending_phase") is not None:
+        return _resume_credential_pending(
+            cfg,
+            cfg_path,
+            auth_path,
+            state,
+            run_cmd,
+            now,
+            dry_run,
+            persist_state,
+            allow_mutation,
+        )
     auth = _read_auth(auth_path)
     action = credential_action(auth, now)
     reset_at = full_pool_reset_at(auth, 0.0)
@@ -483,57 +602,25 @@ def repair_credential(
             backup_path,
         )
     attempt["status"] = "persisted"
-    persist_state()
-
     refreshed_auth = _read_auth(auth_path)
     if credential_action(refreshed_auth, now) == "human_2fa":
+        persist_state()
         return False, _bounded_detail(
             f"no recoverable credential after refresh; backup retained at {backup_path}"
         )
-    gateway_ok, gateway_detail = repair_gateway(
+    state["credential_pending_phase"] = "gateway_restart"
+    persist_state()
+    return _resume_credential_pending(
         cfg,
-        refreshed_auth,
+        cfg_path,
+        auth_path,
+        state,
         run_cmd,
+        now,
         dry_run=False,
-        force_restart=True,
-    )
-    if not gateway_ok:
-        return False, _bounded_detail(f"{gateway_detail}; backup retained at {backup_path}")
-
-    probe = run_live_probe(cfg_path, run_cmd)
-    if probe.returncode == 0:
-        if "quota_reset_at" in state or "quota_retry_action" in state:
-            state.pop("quota_reset_at", None)
-            state.pop("quota_retry_action", None)
-            persist_state()
-        return True, _bounded_detail(f"credential repair verified; backup retained at {backup_path}")
-    if probe.returncode == 1:
-        return False, _command_failure(
-            "credential requires human 2FA after repair", probe, backup_path
-        )
-    if probe.returncode == 2:
-        return False, _command_failure(
-            "credential verification failed", probe, backup_path
-        )
-    if probe.returncode == 3:
-        next_reset = full_pool_reset_at(refreshed_auth, 0.0)
-        if next_reset is None:
-            next_reset = _reset_at_from_text(probe.stdout + "\n" + probe.stderr)
-        if next_reset is None:
-            return False, _command_failure(
-                "quota probe returned no recorded reset", probe, backup_path
-            )
-        state["quota_reset_at"] = next_reset
-        state["quota_retry_action"] = "probe"
-        persist_state()
-        return True, _bounded_detail(
-            f"quota remains blocked until recorded reset {_format_reset(next_reset)}; "
-            f"backup retained at {backup_path}"
-        )
-    return False, _command_failure(
-        f"credential probe returned unsupported code {probe.returncode}",
-        probe,
-        backup_path,
+        persist_state=persist_state,
+        allow_mutation=True,
+        backup_path=backup_path,
     )
 
 
@@ -1164,6 +1251,12 @@ def _validate_state(state: object) -> None:
         "probe", "refresh"
     }:
         raise Disarmed("state file is malformed")
+    credential_pending_phase = state.get("credential_pending_phase")
+    if (
+        credential_pending_phase is not None
+        and credential_pending_phase not in CREDENTIAL_PENDING_PHASES
+    ):
+        raise Disarmed("state file is malformed")
     refresh_attempt = state.get("credential_refresh_attempt")
     if refresh_attempt is not None:
         if not isinstance(refresh_attempt, dict):
@@ -1190,6 +1283,11 @@ def _validate_state(state: object) -> None:
             or not isinstance(attempt_reset, (int, float))
         ):
             raise Disarmed("state file is malformed")
+    if credential_pending_phase is not None and (
+        not isinstance(refresh_attempt, dict)
+        or refresh_attempt.get("status") != "persisted"
+    ):
+        raise Disarmed("state file is malformed")
     _validate_peer_state_map(state.get("peer_misses"), "misses")
     _validate_peer_state_map(state.get("peer_attempts"), "attempts")
 
@@ -1409,6 +1507,8 @@ def _credential_refresh_owns_gateway(
     now: int,
     allow_mutation: bool,
 ) -> bool:
+    if state.get("credential_pending_phase") in CREDENTIAL_PENDING_PHASES:
+        return True
     if not allow_mutation:
         return False
     if state.get("quota_retry_action") == "probe":

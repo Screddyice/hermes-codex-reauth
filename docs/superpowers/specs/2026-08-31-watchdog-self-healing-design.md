@@ -196,6 +196,14 @@ live probe. Probe results control the outcome:
 - `BROKEN`: alert with the human device-code runbook.
 - `UNKNOWN`: preserve the prior state and alert that verification failed.
 
+After verified OAuth persistence, the healer will persist a non-secret
+`gateway_restart` phase before restarting the gateway. A successful restart
+advances the phase to `probe` before the request. A failed gateway restart or
+probe remains one `local.credential` incident and waits for its cooldown. The
+ordinary gateway handler will defer while either phase exists. At the cooldown
+boundary, the healer resumes the recorded phase without another OAuth refresh.
+Success clears the phase and credential fault.
+
 The healer will not run a refresh when the selected entry has a terminal error
 and no viable alternate pool entry exists. It will also stop when the pool has
 no renewable entry or refresh token. A stale terminal singleton does not block a
