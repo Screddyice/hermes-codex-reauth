@@ -317,3 +317,16 @@ def test_the_observer_serves_a_heartbeat_so_nothing_is_unwatched():
 
     sh = (WATCHDOG / "install.sh").read_text()
     assert 'BEAT="codex-observer-heartbeat.service"' in sh
+
+
+def test_every_shipped_config_names_itself_for_escalation():
+    """An escalation DM must say what broke.
+
+    nebos-claude.json used `label` where notify_failure.py reads `host_label`, so
+    its Telegram alert would have read "unknown host … a Hermes bot" — anonymous
+    at the one moment the name matters. Caught when install.sh printed host=None.
+    """
+    for name in ("hostinger", "tmn", "neb-ops", "nebos-claude"):
+        cfg = json.loads((WATCHDOG / "hosts" / f"{name}.json").read_text())
+        assert cfg.get("host_label"), f"{name}.json has no host_label"
+        assert cfg.get("bot_label"), f"{name}.json has no bot_label"
