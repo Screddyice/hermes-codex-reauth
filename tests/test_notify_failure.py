@@ -309,6 +309,16 @@ def test_env_beside_the_script_is_used_when_there_is_no_hermes_home(tmp_path, se
     assert sent[0]["token"] == "obs-token" and sent[0]["chat"] == "42"
 
 
+def test_the_observer_serves_a_heartbeat_so_nothing_is_unwatched():
+    """Closing the last hole: the backstop used to be watched by nobody."""
+    unit = (WATCHDOG / "systemd" / "codex-observer-heartbeat.service").read_text()
+    assert "heartbeat_server.py" in unit and "--port 8299" in unit
+    assert "Restart=always" in unit
+
+    sh = (WATCHDOG / "install.sh").read_text()
+    assert 'BEAT="codex-observer-heartbeat.service"' in sh
+
+
 def test_every_shipped_config_names_itself_for_escalation():
     """An escalation DM must say what broke.
 
