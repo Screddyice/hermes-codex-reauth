@@ -196,6 +196,27 @@ The `sibling` verdict is its own kind, with prose that says plainly that the box
 own credential is fine and points at the timer. It outranks the peer watch, being
 local and certain where the peer watch is remote and inferential.
 
+## A watchdog watching the watchdog next door
+
+A box can run more than one check. hermes-tmn runs the codex check and the NEBOS
+v2 Claude check. If the **codex** timer stops, its heartbeat goes stale and the
+peer reports it — but the **Claude** timer has no such shadow, so switching it off
+was invisible while the box stayed healthy. That is the 2026-08-04 failure mode (a
+timer disabled, six days unnoticed) surviving in a corner.
+
+So each host config may name `sibling_timers`, and the codex check asserts them
+locally through systemd: enabled, scheduled, and triggered within
+`sibling_stale_s` (26h — 4x/day plus slack). No network, no heartbeat, nothing new
+to rot. A never-triggered timer reads as a fresh install rather than a fault, and
+a systemctl error reads as uncheckable rather than broken.
+
+Only hermes-tmn carries one (`nebos-claude-health.timer`). hostinger runs a single
+watchdog, so it has no sibling to pair with.
+
+The `sibling` verdict is its own kind, with prose that says plainly that the box's
+own credential is fine and points at the timer. It outranks the peer watch, being
+local and certain where the peer watch is remote and inferential.
+
 ## Alerting
 
 Routing differs per box, set on 2026-08-17. `@Screddy_bot` on hostinger is Shawn's
