@@ -14,7 +14,9 @@
     },
     "email": {
       "to": [
-        "shawn@teamnebula.ai"
+        "shawn@teamnebula.ai",
+        "ian@teamnebula.ai",
+        "abraham@teamnebula.ai"
       ],
       "key_env": "TMN_COMPOSIO_API_KEY",
       "composio_user_id": "tmn-shawn",
