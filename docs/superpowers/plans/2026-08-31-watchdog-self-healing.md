@@ -1125,7 +1125,7 @@ git diff --check
 
 Expected: each command exits zero.
 
-- [ ] **Step 5: Run local-first fusion on the pure decision unit**
+- [x] **Step 5: Run local-first fusion on the pure decision unit**
 
 Extract `credential_action` and its table-driven cases to task files under the projectless `work/` directory. Run:
 
@@ -1135,9 +1135,14 @@ llmjury solve --task "$task_file" --cases "$cases_file" --entry-point credential
 
 Accept the result only when exit code is zero and JSON contains `"verified": true`. Record any OpenRouter escalation and winning model in the PR body.
 
-The urgent Fusion run was interrupted and remains unverified. It produced no
-accepted candidate and no winning model. Run this step again before claiming
-Fusion passed or marking the PR ready.
+Fusion passed on 2026-09-03 against ten current `credential_action` cases. The
+local council escalated to OpenRouter, where `deepseek/deepseek-v4-flash`
+produced the accepted candidate after 16 attempts. The command exited zero and
+returned `"verified": true`. The verifier task SHA-256 was
+`fc8b991bf80332694a153c77d685a9e721033295040e7cbc06a78a45a4d731e7`; the
+case-file SHA-256 was
+`e061dd72de34d81399c722a7515a8ee72056e2c93380f1c372ae43e2cb9b076c`. The
+production implementation passed the same cases, so no model code replaced it.
 
 - [x] **Step 6: Review the final diff against the spec**
 
