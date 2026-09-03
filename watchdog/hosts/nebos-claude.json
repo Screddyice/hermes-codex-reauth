@@ -19,7 +19,8 @@
     "email": {
       "to": ["shawn@teamnebula.ai"],
       "key_env": "TMN_COMPOSIO_API_KEY",
-      "composio_user_id": "user_uwgmr"
+      "composio_user_id": "tmn-shawn",
+      "connected_account_id": "ca_SemC_xtQG4-B"
     }
   },
 

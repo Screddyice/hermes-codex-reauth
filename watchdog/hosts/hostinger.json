@@ -8,12 +8,17 @@
   "subject": "Action needed: personal Hermes lost its Codex sign-in (hostinger)",
   "ticket_title": "Codex sign-in lost — personal Hermes (hostinger)",
   "channels": {
+    "telegram": {
+      "chat_id": "6056863584",
+      "token_env": "TELEGRAM_BOT_TOKEN"
+    },
     "email": {
       "to": [
         "shawn@teamnebula.ai"
       ],
       "key_env": "TMN_COMPOSIO_API_KEY",
-      "composio_user_id": "user_uwgmr"
+      "composio_user_id": "src",
+      "connected_account_id": "ca_XEr9u-vsL9Am"
     }
   },
   "runbook": [

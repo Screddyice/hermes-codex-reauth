@@ -54,14 +54,17 @@ def jwt_with_exp(exp: int | None, plan: str | None = None) -> str:
 
 
 def pool_entry(*, label="cred-1", exhausted=True, reset_offset=+3600,
-               status_age_s=60, code=429, in_message=True) -> dict:
+               status_age_s=60, code=429, in_message=True, refresh="rt-pool",
+               exp_offset=+86400) -> dict:
     """A credential_pool entry shaped like the ones Hermes actually writes.
 
     Mirrors the real record from the 2026-08-17 incident: last_status
     "exhausted", last_error_code 429, and the 429 body stored as a Python repr
     (not JSON) with resets_at inside it.
     """
+    exp = int(time.time()) + exp_offset if exp_offset is not None else None
     e = {"id": label, "label": label, "auth_type": "oauth",
+         "access_token": jwt_with_exp(exp), "refresh_token": refresh,
          "last_status_at": time.time() - status_age_s}
     if not exhausted:
         e["last_status"] = "ok"
@@ -187,16 +190,20 @@ def test_alert_omits_the_reauth_line_when_no_url_configured(tmp_path):
 
 
 def test_shipped_codex_hosts_route_alerts_per_host():
-    """Routing set by instruction on 2026-08-17, and different per box.
+    """Routing set by instruction on 2026-08-17, amended 2026-08-24.
 
-    hostinger (@Screddy_bot) is Shawn's own assistant, so it emails him and does
-    not post to the team channel. hermes-tmn (@Teamnebula_bot) is company
-    infrastructure with no fallback provider, so it does both. Linear ticketing
-    was dropped from hostinger in the same pass.
+    hostinger (@Screddy_bot) is Shawn's own assistant, so it stays out of the
+    team channel: it DMs him over Telegram and emails him. Telegram was added on
+    2026-08-24 so the primary path shares no failure mode with Composio, after a
+    key rotation left email 401ing with only the OnFailure backstop delivering.
+    hermes-tmn (@Teamnebula_bot) is company infrastructure with no fallback
+    provider, so it posts to the team channel and emails. Linear ticketing was
+    dropped from hostinger on 2026-08-17.
     """
     host = chk.load_config(WATCHDOG / "hosts" / "hostinger.json")
-    assert list(host["channels"]) == ["email"]
+    assert sorted(host["channels"]) == ["email", "telegram"]
     assert host["channels"]["email"]["to"] == ["shawn@teamnebula.ai"]
+    assert host["channels"]["telegram"]["token_env"] == "TELEGRAM_BOT_TOKEN"
 
     tmn = chk.load_config(WATCHDOG / "hosts" / "tmn.json")
     assert sorted(tmn["channels"]) == ["email", "slack"]
@@ -206,6 +213,21 @@ def test_shipped_codex_hosts_route_alerts_per_host():
 
     # The personal box must not page the team channel.
     assert "slack" not in host["channels"]
+
+
+def test_shipped_email_channels_pin_entity_and_account():
+    """The 2026-08-21 Composio migration retired the shared entity user_uwgmr.
+
+    Every shipped email channel must pin a per-mailbox user_id AND an explicit
+    connected_account_id: the retired entity fails even with a live key, which
+    is how the 2026-08-24 outage looked like a credential problem from the
+    outside. Default-resolution is also how mail has been sent from the wrong
+    mailbox before, so the account id is not optional politeness.
+    """
+    for name in ("hostinger", "tmn"):
+        ch = chk.load_config(WATCHDOG / "hosts" / f"{name}.json")["channels"]["email"]
+        assert ch["composio_user_id"] != "user_uwgmr"
+        assert ch.get("connected_account_id", "").startswith("ca_")
 
 
 def test_shipped_configs_carry_their_own_runbook_only():
@@ -267,6 +289,39 @@ def test_stale_auth_error_older_than_last_refresh_is_ignored(tmp_path):
         auth_doc(last_error=err, last_refresh="2026-08-01T00:00:00Z")))
     status, _ = chk.detect(tmp_path / "auth.json", "u.service")
     assert status == "ok"
+
+
+def test_healthy_pool_outranks_broken_legacy_singleton(tmp_path):
+    """Hermes routes through the pool, so a stale singleton must not page.
+
+    This mirrors Screddy's live auth store: the singleton recorded
+    refresh_token_reused while a manual pooled credential served real Codex
+    requests. The watchdog reported the working gateway as signed out.
+    """
+    err = {"code": "refresh_token_reused", "relogin_required": True,
+           "at": "2026-08-27T10:19:44Z"}
+    doc = auth_doc(refresh=None, last_error=err,
+                   last_refresh="2026-08-21T09:06:21Z",
+                   pool=[pool_entry(label="chatgpt-teamnebula", exhausted=False)])
+    (tmp_path / "auth.json").write_text(json.dumps(doc))
+
+    status, detail = chk.detect(tmp_path / "auth.json", "u.service")
+
+    assert status == "ok"
+    assert "chatgpt-teamnebula" in detail
+    assert "pooled credential" in detail
+
+
+def test_unusable_pool_is_down_even_when_legacy_singleton_is_healthy(tmp_path):
+    """A populated pool is Hermes' runtime source of truth, not the singleton."""
+    doc = auth_doc(pool=[pool_entry(label="broken-pool", exhausted=False,
+                                    refresh=None)])
+    (tmp_path / "auth.json").write_text(json.dumps(doc))
+
+    status, detail = chk.detect(tmp_path / "auth.json", "u.service")
+
+    assert status == "down"
+    assert "no renewable pooled credential" in detail
 
 
 def test_unreadable_auth_is_disarmed_not_silently_ok(tmp_path):
@@ -349,12 +404,13 @@ def test_exhausted_with_no_reset_time_falls_back_to_recency(tmp_path):
     assert chk.detect(tmp_path / "auth.json", "u.service")[0] == "ok"
 
 
-def test_broken_signin_outranks_quota(tmp_path):
-    """With both broken, report the sign-in: quota is moot until it can call at all."""
+def test_pooled_quota_outranks_broken_legacy_singleton(tmp_path):
+    """The singleton cannot turn a live pool's quota problem into a reauth alert."""
     (tmp_path / "auth.json").write_text(json.dumps(
         auth_doc(refresh=None, pool=[pool_entry()])))
     status, detail = chk.detect(tmp_path / "auth.json", "u.service")
-    assert status == "down" and "NO refresh token" in detail
+    assert status == "quota"
+    assert "out of quota" in detail
 
 
 def test_plan_is_context_only_and_never_the_trigger(tmp_path):
@@ -900,6 +956,21 @@ def test_uncheckable_sibling_never_pages(monkeypatch):
     monkeypatch.setattr(chk.subprocess, "run", boom)
     status, detail = chk.sibling_timers_ok({"sibling_timers": ["t.timer"]})
     assert status == "ok" and "uncheckable" in detail
+
+
+def test_nonzero_systemctl_result_never_pages_for_sibling(monkeypatch):
+    """A lost user-systemd session returns nonzero rather than raising."""
+    class R:
+        returncode = 1
+        stdout = ""
+        stderr = "Failed to connect to bus: No medium found\n"
+
+    monkeypatch.setattr(chk.subprocess, "run", lambda *a, **k: R())
+
+    status, detail = chk.sibling_timers_ok({"sibling_timers": ["t.timer"]})
+
+    assert status == "ok"
+    assert "uncheckable" in detail
 
 
 def test_no_sibling_timers_configured_is_silent():
