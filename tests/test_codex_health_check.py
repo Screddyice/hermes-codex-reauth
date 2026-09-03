@@ -54,14 +54,17 @@ def jwt_with_exp(exp: int | None, plan: str | None = None) -> str:
 
 
 def pool_entry(*, label="cred-1", exhausted=True, reset_offset=+3600,
-               status_age_s=60, code=429, in_message=True) -> dict:
+               status_age_s=60, code=429, in_message=True, refresh="rt-pool",
+               exp_offset=+86400) -> dict:
     """A credential_pool entry shaped like the ones Hermes actually writes.
 
     Mirrors the real record from the 2026-08-17 incident: last_status
     "exhausted", last_error_code 429, and the 429 body stored as a Python repr
     (not JSON) with resets_at inside it.
     """
+    exp = int(time.time()) + exp_offset if exp_offset is not None else None
     e = {"id": label, "label": label, "auth_type": "oauth",
+         "access_token": jwt_with_exp(exp), "refresh_token": refresh,
          "last_status_at": time.time() - status_age_s}
     if not exhausted:
         e["last_status"] = "ok"
@@ -211,16 +214,20 @@ def test_company_alerts_reach_the_team_and_personal_ones_do_not():
 
 
 def test_shipped_codex_hosts_route_alerts_per_host():
-    """Routing set by instruction on 2026-08-17, and different per box.
+    """Routing set by instruction on 2026-08-17, amended 2026-08-24.
 
-    hostinger (@Screddy_bot) is Shawn's own assistant, so it emails him and does
-    not post to the team channel. hermes-tmn (@Teamnebula_bot) is company
-    infrastructure with no fallback provider, so it does both. Linear ticketing
-    was dropped from hostinger in the same pass.
+    hostinger (@Screddy_bot) is Shawn's own assistant, so it stays out of the
+    team channel: it DMs him over Telegram and emails him. Telegram was added on
+    2026-08-24 so the primary path shares no failure mode with Composio, after a
+    key rotation left email 401ing with only the OnFailure backstop delivering.
+    hermes-tmn (@Teamnebula_bot) is company infrastructure with no fallback
+    provider, so it posts to the team channel and emails. Linear ticketing was
+    dropped from hostinger on 2026-08-17.
     """
     host = chk.load_config(WATCHDOG / "hosts" / "hostinger.json")
-    assert list(host["channels"]) == ["email"]
+    assert sorted(host["channels"]) == ["email", "telegram"]
     assert host["channels"]["email"]["to"] == ["shawn@teamnebula.ai"]
+    assert host["channels"]["telegram"]["token_env"] == "TELEGRAM_BOT_TOKEN"
 
     tmn = chk.load_config(WATCHDOG / "hosts" / "tmn.json")
     assert sorted(tmn["channels"]) == ["email", "slack"]
@@ -230,6 +237,21 @@ def test_shipped_codex_hosts_route_alerts_per_host():
 
     # The personal box must not page the team channel.
     assert "slack" not in host["channels"]
+
+
+def test_shipped_email_channels_pin_entity_and_account():
+    """The 2026-08-21 Composio migration retired the shared entity user_uwgmr.
+
+    Every shipped email channel must pin a per-mailbox user_id AND an explicit
+    connected_account_id: the retired entity fails even with a live key, which
+    is how the 2026-08-24 outage looked like a credential problem from the
+    outside. Default-resolution is also how mail has been sent from the wrong
+    mailbox before, so the account id is not optional politeness.
+    """
+    for name in ("hostinger", "tmn"):
+        ch = chk.load_config(WATCHDOG / "hosts" / f"{name}.json")["channels"]["email"]
+        assert ch["composio_user_id"] != "user_uwgmr"
+        assert ch.get("connected_account_id", "").startswith("ca_")
 
 
 def test_shipped_configs_carry_their_own_runbook_only():
@@ -291,6 +313,39 @@ def test_stale_auth_error_older_than_last_refresh_is_ignored(tmp_path):
         auth_doc(last_error=err, last_refresh="2026-08-01T00:00:00Z")))
     status, _ = chk.detect(tmp_path / "auth.json", "u.service")
     assert status == "ok"
+
+
+def test_healthy_pool_outranks_broken_legacy_singleton(tmp_path):
+    """Hermes routes through the pool, so a stale singleton must not page.
+
+    This mirrors Screddy's live auth store: the singleton recorded
+    refresh_token_reused while a manual pooled credential served real Codex
+    requests. The watchdog reported the working gateway as signed out.
+    """
+    err = {"code": "refresh_token_reused", "relogin_required": True,
+           "at": "2026-08-27T10:19:44Z"}
+    doc = auth_doc(refresh=None, last_error=err,
+                   last_refresh="2026-08-21T09:06:21Z",
+                   pool=[pool_entry(label="chatgpt-teamnebula", exhausted=False)])
+    (tmp_path / "auth.json").write_text(json.dumps(doc))
+
+    status, detail = chk.detect(tmp_path / "auth.json", "u.service")
+
+    assert status == "ok"
+    assert "chatgpt-teamnebula" in detail
+    assert "pooled credential" in detail
+
+
+def test_unusable_pool_is_down_even_when_legacy_singleton_is_healthy(tmp_path):
+    """A populated pool is Hermes' runtime source of truth, not the singleton."""
+    doc = auth_doc(pool=[pool_entry(label="broken-pool", exhausted=False,
+                                    refresh=None)])
+    (tmp_path / "auth.json").write_text(json.dumps(doc))
+
+    status, detail = chk.detect(tmp_path / "auth.json", "u.service")
+
+    assert status == "down"
+    assert "no renewable pooled credential" in detail
 
 
 def test_unreadable_auth_is_disarmed_not_silently_ok(tmp_path):
@@ -373,12 +428,13 @@ def test_exhausted_with_no_reset_time_falls_back_to_recency(tmp_path):
     assert chk.detect(tmp_path / "auth.json", "u.service")[0] == "ok"
 
 
-def test_broken_signin_outranks_quota(tmp_path):
-    """With both broken, report the sign-in: quota is moot until it can call at all."""
+def test_pooled_quota_outranks_broken_legacy_singleton(tmp_path):
+    """The singleton cannot turn a live pool's quota problem into a reauth alert."""
     (tmp_path / "auth.json").write_text(json.dumps(
         auth_doc(refresh=None, pool=[pool_entry()])))
     status, detail = chk.detect(tmp_path / "auth.json", "u.service")
-    assert status == "down" and "NO refresh token" in detail
+    assert status == "quota"
+    assert "out of quota" in detail
 
 
 def test_plan_is_context_only_and_never_the_trigger(tmp_path):
@@ -541,12 +597,31 @@ def test_shipped_configs_point_at_each_other_over_the_tailnet():
     tmn = chk.load_config(WATCHDOG / "hosts" / "tmn.json")
 
     assert host["peer"]["label"] == "hermes-tmn"
-    assert tmn["peer"]["label"] == "hostinger"
+    # hermes-tmn watches hostinger AND the backstop, so nothing in the ring is
+    # unwatched. Only this box watches the observer — if both Hermes boxes did,
+    # one dead observer would page twice for a single event.
+    assert [p["label"] for p in tmn["peers"]] == ["hostinger", "neb-ops-gcp"]
+    assert "peer" not in tmn
+
     # tailnet addresses only — a public IP here would route monitoring over the
     # internet and would keep working if Tailscale died, hiding a real fault.
-    for cfg in (host, tmn):
-        assert "://100." in cfg["peer"]["url"], cfg["peer"]["url"]
-        assert cfg["peer"]["stale_after_s"] >= 2 * 6 * 3600
+    everything = [host["peer"]] + list(tmn["peers"])
+    for peer in everything:
+        assert "://100." in peer["url"], peer["url"]
+        assert peer["stale_after_s"] >= 2 * 6 * 3600
+
+
+def test_only_the_box_with_two_watchdogs_asserts_a_sibling_timer():
+    """hermes-tmn runs a second check (NEBOS Claude) whose timer nothing shadows.
+
+    The codex timer needs no assertion: if it stops, its heartbeat goes stale and
+    the peer reports it. The Claude timer has no such shadow, which is the gap.
+    """
+    tmn = chk.load_config(WATCHDOG / "hosts" / "tmn.json")
+    assert tmn["sibling_timers"] == ["nebos-claude-health.timer"]
+
+    host = chk.load_config(WATCHDOG / "hosts" / "hostinger.json")
+    assert not host.get("sibling_timers")   # one watchdog on that box, nothing to pair
 
 
 # --------------------------------------------------------------------------
@@ -854,3 +929,118 @@ def test_observer_alert_reaches_telegram(tmp_path, monkeypatch):
     assert chk.run(Args(cfg_path, tmp_path / "state.json")) == 0
     assert len(sent) == 1
     assert "every watched box is dark" in sent[0]
+
+
+# --------------------------------------------------------------------------
+# sibling timers — the watchdog next door
+# --------------------------------------------------------------------------
+
+def fake_systemctl(monkeypatch, *, enabled="enabled", next_elapse="Tue 2026-08-18 03:00:00 UTC",
+                   last="Mon 2026-08-17 21:00:00 UTC"):
+    class R:
+        def __init__(self, out): self.stdout = out
+    def run(cmd, **kw):
+        if "is-enabled" in cmd: return R(enabled + "\n")
+        if "NextElapseUSecRealtime" in cmd: return R(next_elapse + "\n")
+        if "LastTriggerUSec" in cmd: return R(last + "\n")
+        return R("")
+    monkeypatch.setattr(chk.subprocess, "run", run)
+
+
+def test_armed_sibling_timer_is_quiet(monkeypatch):
+    fake_systemctl(monkeypatch)
+    status, detail = chk.sibling_timers_ok({"sibling_timers": ["nebos-claude-health.timer"]})
+    assert status == "ok" and "armed" in detail
+
+
+def test_disabled_sibling_timer_alerts(monkeypatch):
+    """The 2026-08-04 failure mode: a timer switched off, nothing noticing."""
+    fake_systemctl(monkeypatch, enabled="disabled")
+    status, detail = chk.sibling_timers_ok({"sibling_timers": ["nebos-claude-health.timer"]})
+    assert status == "sibling"
+    assert "nebos-claude-health.timer is disabled" in detail
+    assert "unmonitored" in detail
+
+
+def test_enabled_but_unscheduled_sibling_alerts(monkeypatch):
+    """Enabled with no next elapse is the silent-never-fires case."""
+    fake_systemctl(monkeypatch, next_elapse="")
+    status, detail = chk.sibling_timers_ok({"sibling_timers": ["t.timer"]})
+    assert status == "sibling" and "no next run scheduled" in detail
+
+
+def test_never_triggered_sibling_is_a_fresh_install_not_a_fault(monkeypatch):
+    fake_systemctl(monkeypatch, last="n/a")
+    status, _ = chk.sibling_timers_ok({"sibling_timers": ["t.timer"]})
+    assert status == "ok"
+
+
+def test_uncheckable_sibling_never_pages(monkeypatch):
+    """A systemctl hiccup is not evidence a timer stopped."""
+    def boom(*a, **k): raise OSError("systemctl gone")
+    monkeypatch.setattr(chk.subprocess, "run", boom)
+    status, detail = chk.sibling_timers_ok({"sibling_timers": ["t.timer"]})
+    assert status == "ok" and "uncheckable" in detail
+
+
+def test_nonzero_systemctl_result_never_pages_for_sibling(monkeypatch):
+    """A lost user-systemd session returns nonzero rather than raising."""
+    class R:
+        returncode = 1
+        stdout = ""
+        stderr = "Failed to connect to bus: No medium found\n"
+
+    monkeypatch.setattr(chk.subprocess, "run", lambda *a, **k: R())
+
+    status, detail = chk.sibling_timers_ok({"sibling_timers": ["t.timer"]})
+
+    assert status == "ok"
+    assert "uncheckable" in detail
+
+
+def test_no_sibling_timers_configured_is_silent():
+    assert chk.sibling_timers_ok({}) == ("ok", "")
+
+
+def test_sibling_alert_points_at_the_timer_not_the_credential():
+    cfg = chk.load_config(WATCHDOG / "hosts" / "tmn.json")
+    body = chk.alert_text(cfg, "nebos-claude-health.timer is disabled", None, "sibling")
+    assert "auth.openai.com/codex/device" not in body
+    assert "Nothing is wrong with this box's own credential" in body
+    assert "systemctl --user enable --now" in body
+    assert "stopped running" in chk.subject(cfg, "sibling")
+
+
+# --------------------------------------------------------------------------
+# multi-peer ring
+# --------------------------------------------------------------------------
+
+def test_any_dark_peer_is_reported_not_just_all(monkeypatch):
+    """Opposite rule to the observer: each peer here is watched by nobody else."""
+    import contextlib, io, json as _json
+    def opener(url, timeout=0):
+        if "100.74" in url:                      # the observer is dark
+            raise OSError("unreachable")
+        body = _json.dumps({"at": int(time.time()) - 60}).encode()
+        return contextlib.closing(io.BytesIO(body))
+    monkeypatch.setattr(chk.urllib.request, "urlopen", opener)
+
+    cfg = chk.load_config(WATCHDOG / "hosts" / "tmn.json")
+    status, _, fails = chk.read_peers(cfg, {})
+    assert status == "ok" and fails["neb-ops-gcp"] == 1      # one miss, no page
+
+    status, detail, fails = chk.read_peers(cfg, fails)
+    assert status == "peer"
+    assert "neb-ops-gcp" in detail
+    assert fails["hostinger"] == 0                          # healthy peer stays reset
+
+
+def test_single_peer_config_still_works(monkeypatch):
+    """hostinger predates the list and must keep working unchanged."""
+    import contextlib, io, json as _json
+    monkeypatch.setattr(chk.urllib.request, "urlopen",
+                        lambda url, timeout=0: contextlib.closing(
+                            io.BytesIO(_json.dumps({"at": int(time.time()) - 60}).encode())))
+    cfg = chk.load_config(WATCHDOG / "hosts" / "hostinger.json")
+    status, _, _ = chk.read_peers(cfg, {})
+    assert status == "ok"

@@ -293,6 +293,24 @@ def quota_blocked(auth: dict, now: float | None = None,
                   f"window resets {when}")
 
 
+def renewable_pool_entries(auth: dict) -> list[dict]:
+    """Pooled credentials Hermes can still refresh and route through.
+
+    A populated credential pool is Hermes' runtime source of truth. The legacy
+    providers block can retain a terminal refresh error after a manual pooled
+    credential has taken over, so mixing the two sources produces false pages.
+    """
+    pool = (auth.get("credential_pool") or {}).get(PROVIDER) or []
+    renewable = []
+    for entry in pool:
+        tokens = entry.get("tokens") or entry
+        if str(entry.get("last_status") or "").lower() == "dead":
+            continue
+        if tokens.get("refresh_token"):
+            renewable.append(entry)
+    return sorted(renewable, key=lambda entry: int(entry.get("priority") or 0))
+
+
 def write_heartbeat(path: pathlib.Path, cfg: dict, status: str) -> None:
     """Record that this check ran, for the peer box to read.
 
@@ -356,6 +374,100 @@ def read_peer(cfg: dict, prev_fails: int) -> tuple[str, str, int]:
     return "ok", f"{label} heartbeat {age // 60}m old", 0
 
 
+def sibling_timers_ok(cfg: dict) -> tuple[str, str]:
+    """Are this box's OTHER health timers still armed?
+
+    A box runs more than one check. hermes-tmn runs the codex check and the NEBOS
+    v2 Claude check. If the codex timer is disabled the heartbeat goes stale and
+    the peer reports it -- but the Claude timer has no such shadow, so disabling
+    it is invisible while the box stays healthy. That is the 2026-08-04 failure
+    mode (a timer switched off, six days unnoticed) surviving in a corner.
+
+    Local and cheap: systemd already knows. No network, no heartbeat, no extra
+    moving part to rot.
+    """
+    timers = cfg.get("sibling_timers") or []
+    if not timers:
+        return "ok", ""
+
+    stale_s = int(cfg.get("sibling_stale_s", 26 * 3600))   # 4x/day + generous slack
+    now = time.time()
+    broken, seen = [], []
+
+    for timer in timers:
+        try:
+            enabled_r = subprocess.run(["systemctl", "--user", "is-enabled", timer],
+                                       capture_output=True, text=True, timeout=20)
+            next_r = subprocess.run(["systemctl", "--user", "show", timer,
+                                     "-p", "NextElapseUSecRealtime", "--value"],
+                                    capture_output=True, text=True, timeout=20)
+            last_r = subprocess.run(["systemctl", "--user", "show", timer,
+                                     "-p", "LastTriggerUSec", "--value"],
+                                    capture_output=True, text=True, timeout=20)
+            if any(getattr(r, "returncode", 0) != 0 for r in (enabled_r, next_r, last_r)):
+                raise OSError("systemctl returned nonzero")
+            enabled = enabled_r.stdout.strip()
+            nxt = next_r.stdout.strip()
+            last = last_r.stdout.strip()
+        except Exception as e:
+            # Cannot tell is not the same as broken; stay quiet rather than page
+            # on a systemctl hiccup.
+            seen.append(f"{timer}: uncheckable ({type(e).__name__})")
+            continue
+
+        if enabled != "enabled":
+            broken.append(f"{timer} is {enabled or 'missing'}")
+        elif not nxt:
+            broken.append(f"{timer} is enabled but has no next run scheduled")
+        else:
+            # A never-triggered timer is a fresh install, not a fault.
+            if last and last not in ("n/a", "0"):
+                try:
+                    age = now - time.mktime(time.strptime(last[:24], "%a %Y-%m-%d %H:%M:%S"))
+                    if age > stale_s:
+                        broken.append(f"{timer} last ran {age / 3600:.1f}h ago")
+                        continue
+                except Exception:
+                    pass
+            seen.append(f"{timer}: armed")
+
+    if broken:
+        return "sibling", ("another watchdog on this box has stopped: " + "; ".join(broken) +
+                           ". Its target is unmonitored — this box is otherwise fine.")
+    return "ok", "; ".join(seen)
+
+
+def read_peers(cfg: dict, fails: dict) -> tuple[str, str, dict]:
+    """Watch one or more peers. ANY dark peer is reported.
+
+    The observer's rule is the opposite (see observe_peers): it stays quiet until
+    EVERY box is dark, because a live box already reports its own dark partner.
+    Here each peer is something nothing else watches, so each one counts.
+
+    Accepts the older single ``peer`` object as well, so a host config that
+    predates the list keeps working.
+    """
+    peers = cfg.get("peers")
+    if not peers:
+        single = cfg.get("peer")
+        peers = [single] if single else []
+    if not peers:
+        return "ok", "", {}
+
+    out, dark, details = {}, [], []
+    for peer in peers:
+        label = peer.get("label") or peer.get("url", "peer")
+        status, detail, n = read_peer({"peer": peer}, int(fails.get(label, 0)))
+        out[label] = n
+        details.append(detail or status)
+        if status == "peer":
+            dark.append(detail)
+
+    if dark:
+        return "peer", "; ".join(dark), out
+    return "ok", "; ".join(d for d in details if d), out
+
+
 def observe_peers(cfg: dict, fails: dict) -> tuple[str, str, dict]:
     """Backstop for the one case the mutual watch cannot cover: BOTH boxes dark.
 
@@ -406,33 +518,47 @@ def detect(auth_path: pathlib.Path, gateway_unit: str) -> tuple[str, str]:
     if not prov and not pool:
         return "down", "no Codex credential at all (providers block empty, pool empty)"
 
-    toks = prov.get("tokens") or {}
+    pooled = bool(pool)
+    if pooled:
+        renewable = renewable_pool_entries(d)
+        if not renewable:
+            return "down", (f"credential pool has {len(pool)} entr"
+                            f"{'y' if len(pool) == 1 else 'ies'} but no renewable "
+                            "pooled credential")
+        now = time.time()
+        active = next((entry for entry in renewable
+                       if not _entry_quota_blocked(entry, now, QUOTA_STALE_S)[0]),
+                      renewable[0])
+        prov = active
+
+    toks = prov.get("tokens") or prov
     refresh = toks.get("refresh_token") or ""
     access = toks.get("access_token") or ""
     exp = _exp_of(access)
     now = time.time()
     fp = lineage(refresh)
 
-    err = prov.get("last_auth_error") or {}
-    if err:
-        code = str(err.get("code") or "")
-        relogin = bool(err.get("relogin_required"))
-        at = str(err.get("at") or "")
-        last_refresh = str(prov.get("last_refresh") or "")
-        # Only trust an error newer than the last successful refresh; a stale
-        # record from a since-repaired outage must not page forever.
-        if at and last_refresh and at > last_refresh:
-            if relogin or code == "refresh_token_reused":
-                return "down", (f"{code or 'auth error'} at {at} "
-                                f"(relogin_required={relogin}, lineage={fp})")
+    if not pooled:
+        err = prov.get("last_auth_error") or {}
+        if err:
+            code = str(err.get("code") or "")
+            relogin = bool(err.get("relogin_required"))
+            at = str(err.get("at") or "")
+            last_refresh = str(prov.get("last_refresh") or "")
+            # Only trust an error newer than the last successful refresh; a stale
+            # record from a since-repaired outage must not page forever.
+            if at and last_refresh and at > last_refresh:
+                if relogin or code == "refresh_token_reused":
+                    return "down", (f"{code or 'auth error'} at {at} "
+                                    f"(relogin_required={relogin}, lineage={fp})")
 
-    if not refresh:
-        return "down", "credential has NO refresh token — it cannot renew and will not recover on its own"
+        if not refresh:
+            return "down", "credential has NO refresh token — it cannot renew and will not recover on its own"
 
-    if exp and exp <= now:
-        return "down", (f"access token expired "
-                        f"{time.strftime('%Y-%m-%dT%H:%MZ', time.gmtime(exp))} "
-                        f"and nothing refreshed it (lineage={fp})")
+        if exp and exp <= now:
+            return "down", (f"access token expired "
+                            f"{time.strftime('%Y-%m-%dT%H:%MZ', time.gmtime(exp))} "
+                            f"and nothing refreshed it (lineage={fp})")
 
     up, raw = gateway_active(gateway_unit)
     if not up:
@@ -450,6 +576,11 @@ def detect(auth_path: pathlib.Path, gateway_unit: str) -> tuple[str, str]:
                          f"(lineage={fp}{plan_note}) — signing in again will not help.")
 
     when = time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(exp)) if exp else "unknown"
+    if pooled:
+        label = str(prov.get("label") or prov.get("id") or "unnamed")
+        return "ok", (f"pooled credential {label} renewable "
+                      f"(lineage={fp}{plan_note}), access token valid to {when}, "
+                      f"gateway {raw}")
     return "ok", (f"refresh token present (lineage={fp}{plan_note}), "
                   f"access token valid to {when}, gateway {raw}")
 
@@ -463,9 +594,14 @@ def send_email(cfg_ch: dict, subject: str, body: str, api_key: str) -> None:
     args = {"recipient_email": to[0], "subject": subject, "body": body, "is_html": False}
     if len(to) > 1:
         args["extra_recipients"] = to[1:]
+    payload = {"user_id": cfg_ch["composio_user_id"], "arguments": args}
+    # Composio resolves the sending mailbox from connected_account_id; user_id
+    # alone lets it default-resolve, which has picked the wrong mailbox before.
+    if cfg_ch.get("connected_account_id"):
+        payload["connected_account_id"] = cfg_ch["connected_account_id"]
     req = urllib.request.Request(
         COMPOSIO_EXEC,
-        data=json.dumps({"user_id": cfg_ch["composio_user_id"], "arguments": args}).encode(),
+        data=json.dumps(payload).encode(),
         headers={"x-api-key": api_key, "Content-Type": "application/json"},
     )
     with urllib.request.urlopen(req, timeout=45) as r:
@@ -559,9 +695,9 @@ def subject(cfg: dict, status: str) -> str:
             f"Action needed: {cfg['bot_label']} is out of Codex quota "
             f"({cfg['host_label']})")
     if status == "peer":
-        peer = cfg.get("peer") or {}
-        return (f"Action needed: the watchdog on {peer.get('label', 'the peer box')} "
-                f"has gone quiet")
+        return "Action needed: a peer watchdog has gone quiet"
+    if status == "sibling":
+        return f"Action needed: a watchdog on {cfg['host_label']} has stopped running"
     return cfg["subject"]
 
 
@@ -570,8 +706,9 @@ def ticket_title(cfg: dict, status: str) -> str:
         return cfg.get("quota_ticket_title") or (
             f"Codex quota exhausted — {cfg['bot_label']} ({cfg['host_label']})")
     if status == "peer":
-        peer = cfg.get("peer") or {}
-        return f"Watchdog silent on {peer.get('label', 'peer box')} — reported by {cfg['host_label']}"
+        return f"Peer watchdog silent — reported by {cfg['host_label']}"
+    if status == "sibling":
+        return f"Watchdog timer stopped on {cfg['host_label']}"
     return cfg["ticket_title"]
 
 
@@ -662,7 +799,34 @@ def quota_alert_text(cfg: dict, detail: str, ticket: str | None) -> str:
     )
 
 
+SIBLING_REMEDY = [
+    "Nothing is wrong with this box's own credential or gateway. A DIFFERENT",
+    "watchdog running here has stopped, so whatever it guards is now unmonitored.",
+    "",
+    "  systemctl --user status <the timer named above>",
+    "  systemctl --user enable --now <that timer>",
+    "",
+    "A timer switched off during maintenance and never re-enabled is exactly how",
+    "the 2026-08-04 outage ran six days before anyone noticed.",
+]
+
+
+def sibling_alert_text(cfg: dict, detail: str, ticket: str | None) -> str:
+    return (
+        f"A watchdog on {cfg['host_label']} has stopped running. Reported by the "
+        f"codex check on the same box, which is itself fine.\n\n"
+        f"What the check saw: {detail}\n\n"
+        + (f"Linear ticket: {ticket}\n\n" if ticket else "")
+        + "\n".join(SIBLING_REMEDY) + "\n\n"
+        "You will not get another message about this for 24 hours, and none at all "
+        "once it is armed again.\n\n"
+        f"-- Automated check on {cfg['host_label']} (codex-health, sibling watch)."
+    )
+
+
 def alert_text(cfg: dict, detail: str, ticket: str | None, status: str = "down") -> str:
+    if status == "sibling":
+        return sibling_alert_text(cfg, detail, ticket)
     if status == "quota":
         return quota_alert_text(cfg, detail, ticket)
     if status == "peer":
@@ -682,6 +846,14 @@ def alert_text(cfg: dict, detail: str, ticket: str | None, status: str = "down")
 
 
 def ticket_body(cfg: dict, detail: str, status: str = "down") -> str:
+    if status == "sibling":
+        return (
+            f"A watchdog on `{cfg['host_label']}` has stopped running; its target is "
+            f"unmonitored. Filed by the codex check on the same box.\n\n"
+            f"**What the check saw:** {detail}\n\n"
+            f"### Fix\n\n```\n" + "\n".join(SIBLING_REMEDY) + "\n```\n\n"
+            f"_Auto-filed by the {cfg['host_label']} codex-health check._"
+        )
     if status == "peer":
         peer = cfg.get("peer") or {}
         return (
@@ -787,13 +959,21 @@ def run(args) -> int:
 
     # The peer watch runs only when this box is healthy. With a local failure in
     # hand, the peer is the less urgent of two problems and would bury it.
-    peer_fails = int(st.get("peer_fails", 0))
+    # A sibling timer that has stopped is local, certain, and nothing else can
+    # see it — so it outranks the peer watch, which is remote and inferential.
     if status == "ok" and not args.force_peer:
-        pstatus, pdetail, peer_fails = read_peer(cfg, peer_fails)
+        sstatus, sdetail = sibling_timers_ok(cfg)
+        if sstatus == "sibling":
+            status, detail = "sibling", sdetail
+        elif sdetail:
+            print(f"siblings: {sdetail}")
+
+    raw_fails = st.get("peer_fails")
+    peer_fails = raw_fails if isinstance(raw_fails, dict) else {}
+    if status == "ok" and not args.force_peer:
+        pstatus, pdetail, peer_fails = read_peers(cfg, peer_fails)
         if pstatus == "peer":
             status, detail = "peer", pdetail
-        elif pstatus == "unknown":
-            print(f"peer: {pdetail} — not paging on one miss")
         elif pdetail:
             print(f"peer: {pdetail}")
     elif args.force_peer:

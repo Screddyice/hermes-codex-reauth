@@ -19,7 +19,8 @@
         "abraham@teamnebula.ai"
       ],
       "key_env": "TMN_COMPOSIO_API_KEY",
-      "composio_user_id": "user_uwgmr"
+      "composio_user_id": "tmn-shawn",
+      "connected_account_id": "ca_SemC_xtQG4-B"
     }
   },
   "runbook": [
@@ -78,10 +79,21 @@
     "",
     "Plus caps are a 7-day rolling window, so a reset can be days out, not hours."
   ],
-  "peer": {
-    "label": "hostinger",
-    "bot_label": "@Screddy_bot",
-    "url": "http://100.98.215.63:8299/heartbeat",
-    "stale_after_s": 46800
-  }
+  "peers": [
+    {
+      "label": "hostinger",
+      "bot_label": "@Screddy_bot",
+      "url": "http://100.98.215.63:8299/heartbeat",
+      "stale_after_s": 46800
+    },
+    {
+      "label": "neb-ops-gcp",
+      "bot_label": "the backstop observer",
+      "url": "http://100.74.25.61:8299/heartbeat",
+      "stale_after_s": 46800
+    }
+  ],
+  "sibling_timers": [
+    "nebos-claude-health.timer"
+  ]
 }

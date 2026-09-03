@@ -35,7 +35,7 @@ case "$HOST" in
   tmn)          DEST="$HOME/.hermes/profiles/tmn/codex-health";  TIMER="hermes-codex-health-tmn.timer"; SERVICE="hermes-codex-health-tmn.service"; NOTIFY="hermes-codex-health-tmn-notify.service"; BEAT="hermes-codex-heartbeat-tmn.service" ;;
   nebos-claude) DEST="$HOME/.hermes/profiles/tmn/claude-health"; TIMER="nebos-claude-health.timer";     SERVICE="nebos-claude-health.service";     NOTIFY="nebos-claude-health-notify.service"
                 CHECK_SRC="$HERE/claude_health_check.py" ;;
-  neb-ops)      DEST="$HOME/.watchdog-observer";                 TIMER="codex-observer.timer";          SERVICE="codex-observer.service";          NOTIFY="codex-observer-notify.service" ;;
+  neb-ops)      DEST="$HOME/.watchdog-observer";                 TIMER="codex-observer.timer";          SERVICE="codex-observer.service";          NOTIFY="codex-observer-notify.service";     BEAT="codex-observer-heartbeat.service" ;;
   *) echo "usage: $0 --host {hostinger|tmn|nebos-claude|neb-ops}" >&2; exit 2 ;;
 esac
 
