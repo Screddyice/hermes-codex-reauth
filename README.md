@@ -410,6 +410,9 @@ Credential roles pin the Hermes Python runtime, version, `auth.py`, and
 `/opt/hermes-agent`; Team Nebula uses the Hermes checkout under
 `~/.hermes/hermes-agent`. The healer checks absolute paths, file type, hashes,
 and the refresh, lock, selection, and persistence signatures before mutation.
+The contract accepts the original single-store helpers and Hermes' reviewed
+`target_path` lock/persistence parameters. Any other signature change still
+disarms the healer until an operator reviews it.
 `install.sh` runs the helper's readiness check before it enables or starts the
 timer. Each normal credential-host cycle repeats the same full readiness check
 before any mutation. A Hermes upgrade stops the healer until an operator reviews
