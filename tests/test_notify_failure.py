@@ -135,6 +135,46 @@ def test_quoted_env_values_are_unwrapped(tmp_path, sent, monkeypatch):
     assert sent[0]["chat"] == "42"
 
 
+def test_existing_private_failback_store_supplies_telegram_token(
+    tmp_path, sent, monkeypatch
+):
+    """The migrated TMN host must reuse its token without copying the secret."""
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("TELEGRAM_HOME_CHANNEL", raising=False)
+    cfg = write_cfg(tmp_path)
+    write_env(tmp_path, TELEGRAM_HOME_CHANNEL="555")
+    store = tmp_path / "home" / "llm-failback.json"
+    store.write_text(json.dumps({"telegram": {"bot_token": "existing-token"}}))
+    store.chmod(0o600)
+    monkeypatch.setattr(nf, "HOME", tmp_path / "nowhere")
+
+    assert nf.run(Args(cfg)) == 0
+    assert sent[0]["token"] == "existing-token"
+
+
+@pytest.mark.parametrize("mode", [0o644, 0o660])
+def test_failback_store_must_be_owner_only(tmp_path, monkeypatch, mode):
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    store = tmp_path / "llm-failback.json"
+    store.write_text(json.dumps({"telegram": {"bot_token": "unsafe-token"}}))
+    store.chmod(mode)
+    monkeypatch.setattr(nf, "HOME", tmp_path / "nowhere")
+
+    assert nf.telegram_token_from_existing_store(tmp_path) == ""
+
+
+def test_failback_store_symlink_is_rejected(tmp_path, monkeypatch):
+    target = tmp_path / "token.json"
+    target.write_text(json.dumps({"telegram": {"bot_token": "linked-token"}}))
+    target.chmod(0o600)
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "llm-failback.json").symlink_to(target)
+    monkeypatch.setattr(nf, "HOME", tmp_path / "nowhere")
+
+    assert nf.telegram_token_from_existing_store(home) == ""
+
+
 def test_thread_id_is_forwarded_when_set(tmp_path, sent, monkeypatch):
     """Both boxes set TELEGRAM_HOME_CHANNEL_THREAD_ID; a forum topic needs it."""
     monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
@@ -373,7 +413,7 @@ def test_every_shipped_config_names_itself_for_escalation():
     its Telegram alert would have read "unknown host … a Hermes bot" — anonymous
     at the one moment the name matters. Caught when install.sh printed host=None.
     """
-    for name in ("hostinger", "tmn", "neb-ops", "nebos-claude"):
+    for name in ("src", "tmn", "hermes-tmn-observer", "nebos-claude"):
         cfg = json.loads((WATCHDOG / "hosts" / f"{name}.json").read_text())
         assert cfg.get("host_label"), f"{name}.json has no host_label"
         assert cfg.get("bot_label"), f"{name}.json has no bot_label"

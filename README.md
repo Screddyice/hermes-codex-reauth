@@ -275,6 +275,12 @@ Hermes Telegram bot token is a different secret from a different vendor, it is
 already on both boxes, and it fails visibly — if that token dies, the bot stops
 answering and you know within minutes.
 
+The notifier checks the process environment and Hermes `.env` files first. On a
+post-migration host that keeps the token in `llm-failback.json`, it reads that
+existing store instead of copying the secret into another file. It accepts only
+a regular, non-symlinked file owned by the current user with no group or world
+permissions.
+
 On src, Telegram still delivers when a Composio key rotation breaks email.
 `notify_failure.py` also sends a Telegram DM when the scheduled check exits 1.
 
