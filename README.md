@@ -116,7 +116,10 @@ Reported `down` when: there is no credential; `last_auth_error` is newer than
 `last_refresh` with `relogin_required` or `refresh_token_reused`; there is no
 refresh token; the access token has expired; **or the gateway unit is not
 active** — codex auth can be perfect while the bot is dead, and nothing used to
-notice.
+notice. The gateway check waits up to 12 seconds for systemd's transient
+`deactivating`, `activating`, or `reloading` states to settle. This keeps a
+routine restart from producing a false Codex re-auth alert while still reporting
+stable `inactive` or `failed` states immediately.
 
 Every alert carries a short `lineage=` fingerprint of the refresh token, so two
 hosts sharing one OAuth lineage — the July failure — is visible by inspection
