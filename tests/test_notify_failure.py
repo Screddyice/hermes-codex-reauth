@@ -218,6 +218,28 @@ def test_message_stays_inside_telegram_limit(tmp_path):
     assert text.rstrip().endswith("x")          # trimmed from the front, newest kept
 
 
+def test_healer_failure_message_names_repair_not_reporting(tmp_path):
+    cfg = json.loads(write_cfg(tmp_path).read_text())
+    text = nf.build_message(
+        cfg, "hermes-codex-self-heal.service", "timer repair failed"
+    )
+
+    assert "SELF-HEAL REPAIR FAILED" in text
+    assert "FAILED TO REPORT" not in text
+
+
+def test_onfailure_monitor_unit_selects_healer_message(
+    tmp_path, sent, monkeypatch
+):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
+    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "123")
+    monkeypatch.setenv("MONITOR_UNIT", "hermes-codex-self-heal.service")
+
+    assert nf.run(Args(write_cfg(tmp_path), unit="hermes-codex-health.service")) == 0
+    assert "SELF-HEAL REPAIR FAILED" in sent[0]["text"]
+    assert "hermes-codex-self-heal.service" in sent[0]["text"]
+
+
 # --------------------------------------------------------------------------
 # wiring — the directive that was claimed for months and never existed
 # --------------------------------------------------------------------------
@@ -238,10 +260,35 @@ def test_every_check_unit_wires_onfailure_to_its_notifier():
         assert f"--unit {unit}" in notify_body
 
 
+def test_every_healer_unit_wires_a_healer_specific_notifier():
+    pairs = {
+        "hermes-codex-self-heal.service": "hermes-codex-self-heal-notify.service",
+        "hermes-codex-self-heal-tmn.service": (
+            "hermes-codex-self-heal-tmn-notify.service"
+        ),
+        "codex-observer-self-heal.service": "codex-observer-self-heal-notify.service",
+    }
+    for unit, notify in pairs.items():
+        body = (WATCHDOG / "systemd" / unit).read_text()
+        assert f"OnFailure={notify}" in body
+
+        notify_body = (WATCHDOG / "systemd" / notify).read_text()
+        assert "notify_failure.py" in notify_body
+        assert f"--unit {unit}" in notify_body
+
+        trigger_sources = [
+            candidate.name
+            for candidate in (WATCHDOG / "systemd").glob("*.service")
+            if f"OnFailure={notify}" in candidate.read_text()
+        ]
+        assert trigger_sources == [unit]
+
+
 def test_notifier_units_read_the_env_that_holds_the_bot_token():
-    """tmn must load the profile .env first; without it the token never resolves."""
+    """The live TMN host stores its notifier token in the root Hermes env."""
     tmn = (WATCHDOG / "systemd" / "hermes-codex-health-tmn-notify.service").read_text()
-    assert tmn.index("profiles/tmn/.env") < tmn.index("%h/.hermes/.env")
+    assert "EnvironmentFile=-%h/.hermes/.env" in tmn
+    assert "profiles/tmn" not in tmn
 
     host = (WATCHDOG / "systemd" / "hermes-codex-health-notify.service").read_text()
     assert "%h/.hermes/.env" in host

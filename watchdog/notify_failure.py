@@ -104,18 +104,31 @@ def journal_tail(unit: str, lines: int = 15) -> str:
 def build_message(cfg: dict, unit: str, tail: str) -> str:
     host = cfg.get("host_label") or "unknown host"
     bot = cfg.get("bot_label") or "a Hermes bot"
-    head = (
-        f"🚨 The health check on {host} FAILED TO REPORT.\n\n"
-        f"Unit: {unit or 'unknown'}\n"
-        f"Watches: {bot}\n\n"
-        "It exited non-zero, which means one of: it could not reach any of its "
-        "alert channels, it was disarmed (unreadable auth store, corrupt state, "
-        "unresolvable secret), or it crashed. Whatever it found, it could not "
-        "tell you the normal way — so this arrived over Telegram instead.\n\n"
-        "Check it by hand:\n"
-        f"  systemctl --user status {unit or '<unit>'}\n"
-        f"  journalctl --user -u {unit or '<unit>'} -n 50\n"
-    )
+    if "self-heal" in unit:
+        head = (
+            f"🚨 The watchdog healer on {host}: SELF-HEAL REPAIR FAILED.\n\n"
+            f"Unit: {unit}\n"
+            f"Watches: {bot}\n\n"
+            "The healer exited non-zero after a bounded repair failed or a safety "
+            "check disarmed the cycle. The healer recorded the alert edge before "
+            "systemd sent this Telegram message.\n\n"
+            "Check it by hand:\n"
+            f"  systemctl --user status {unit}\n"
+            f"  journalctl --user -u {unit} -n 50\n"
+        )
+    else:
+        head = (
+            f"🚨 The health check on {host} FAILED TO REPORT.\n\n"
+            f"Unit: {unit or 'unknown'}\n"
+            f"Watches: {bot}\n\n"
+            "It exited non-zero, which means one of: it could not reach any of its "
+            "alert channels, it was disarmed (unreadable auth store, corrupt state, "
+            "unresolvable secret), or it crashed. Whatever it found, it could not "
+            "tell you the normal way — so this arrived over Telegram instead.\n\n"
+            "Check it by hand:\n"
+            f"  systemctl --user status {unit or '<unit>'}\n"
+            f"  journalctl --user -u {unit or '<unit>'} -n 50\n"
+        )
     if tail:
         # Telegram rejects messages over 4096 chars; keep the tail bounded and
         # trim from the front so the most recent lines survive.
@@ -155,7 +168,8 @@ def run(args) -> int:
     token = env_val("TELEGRAM_BOT_TOKEN", hermes_home)
     chat = env_val("TELEGRAM_HOME_CHANNEL", hermes_home)
     thread = env_val("TELEGRAM_HOME_CHANNEL_THREAD_ID", hermes_home)
-    text = build_message(cfg, args.unit, journal_tail(args.unit, args.lines))
+    unit = (os.environ.get("MONITOR_UNIT") or args.unit or "").strip()
+    text = build_message(cfg, unit, journal_tail(unit, args.lines))
 
     if args.dry_run:
         print(f"config={cfg_path} host={cfg.get('host_label')} "
@@ -178,7 +192,7 @@ def run(args) -> int:
               "The health check failed and nobody has been told.", file=sys.stderr)
         return 1
 
-    print(f"escalated to telegram chat {chat} for unit {args.unit}")
+    print(f"escalated to telegram chat {chat} for unit {unit}")
     return 0
 
 

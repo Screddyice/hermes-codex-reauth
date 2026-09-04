@@ -18,6 +18,7 @@ import base64
 import importlib.util
 import json
 import pathlib
+import sys
 import time
 
 import pytest
@@ -28,6 +29,7 @@ WATCHDOG = REPO / "watchdog"
 
 
 def _load(name: str):
+    sys.path.insert(0, str(WATCHDOG))
     spec = importlib.util.spec_from_file_location(name, WATCHDOG / f"{name}.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -35,6 +37,7 @@ def _load(name: str):
 
 
 chk = _load("codex_health_check")
+ORIGINAL_GATEWAY_ACTIVE = chk.gateway_active
 
 
 # --------------------------------------------------------------------------
@@ -147,21 +150,14 @@ def test_config_with_no_channels_is_fatal(tmp_path):
 
 
 def test_shipped_host_configs_resolve_to_the_right_auth_store():
-    """Regression guard for the exact defect fixed on 2026-07-29.
-
-    TMN's gateway runs with HERMES_HOME=~/.hermes/profiles/tmn. Its root
-    ~/.hermes/auth.json is stale and unused; watching it reports a healthy
-    credential that nothing runs on.
-    """
+    """Each post-migration config names the auth store its gateway uses."""
     tmn = chk.load_config(WATCHDOG / "hosts" / "tmn.json")
-    assert tmn["hermes_home"] == "~/.hermes/profiles/tmn"
-    assert not tmn["hermes_home"].rstrip("/").endswith(".hermes")
+    assert tmn["hermes_home"] == "~/.hermes"
+    assert tmn["gateway_unit"] == "hermes-gateway.service"
 
-    host = chk.load_config(WATCHDOG / "hosts" / "hostinger.json")
+    host = chk.load_config(WATCHDOG / "hosts" / "src.json")
     assert host["hermes_home"] == "~/.hermes"
-
-    assert tmn["hermes_home"] != host["hermes_home"]
-    assert tmn["gateway_unit"] != host["gateway_unit"]
+    assert host["gateway_unit"] == "hermes-gateway.service"
 
 
 def test_alert_surfaces_the_reauth_link_with_its_caveat():
@@ -171,7 +167,7 @@ def test_alert_surfaces_the_reauth_link_with_its_caveat():
     moment you actually need it. But an unqualified link is worse than none: the
     device page cannot be completed without a code the CLI prints first.
     """
-    for host in ("hostinger", "tmn"):
+    for host in ("src", "tmn"):
         cfg = chk.load_config(WATCHDOG / "hosts" / f"{host}.json")
         body = chk.alert_text(cfg, "detail", None)
         assert "https://auth.openai.com/codex/device" in body
@@ -192,15 +188,14 @@ def test_alert_omits_the_reauth_line_when_no_url_configured(tmp_path):
 def test_shipped_codex_hosts_route_alerts_per_host():
     """Routing set by instruction on 2026-08-17, amended 2026-08-24.
 
-    hostinger (@Screddy_bot) is Shawn's own assistant, so it stays out of the
+    src (@Screddy_bot) is Shawn's own assistant, so it stays out of the
     team channel: it DMs him over Telegram and emails him. Telegram was added on
     2026-08-24 so the primary path shares no failure mode with Composio, after a
     key rotation left email 401ing with only the OnFailure backstop delivering.
-    hermes-tmn (@Teamnebula_bot) is company infrastructure with no fallback
-    provider, so it posts to the team channel and emails. Linear ticketing was
-    dropped from hostinger on 2026-08-17.
+    neb-ops-gcp (@Teamnebula_bot) is company infrastructure, so it posts to the
+    team channel and emails. Linear ticketing was dropped from src on 2026-08-17.
     """
-    host = chk.load_config(WATCHDOG / "hosts" / "hostinger.json")
+    host = chk.load_config(WATCHDOG / "hosts" / "src.json")
     assert sorted(host["channels"]) == ["email", "telegram"]
     assert host["channels"]["email"]["to"] == ["shawn@teamnebula.ai"]
     assert host["channels"]["telegram"]["token_env"] == "TELEGRAM_BOT_TOKEN"
@@ -224,7 +219,7 @@ def test_shipped_email_channels_pin_entity_and_account():
     outside. Default-resolution is also how mail has been sent from the wrong
     mailbox before, so the account id is not optional politeness.
     """
-    for name in ("hostinger", "tmn"):
+    for name in ("src", "tmn"):
         ch = chk.load_config(WATCHDOG / "hosts" / f"{name}.json")["channels"]["email"]
         assert ch["composio_user_id"] != "user_uwgmr"
         assert ch.get("connected_account_id", "").startswith("ca_")
@@ -233,14 +228,25 @@ def test_shipped_email_channels_pin_entity_and_account():
 def test_shipped_configs_carry_their_own_runbook_only():
     """Each host's runbook must not tell an operator to log into the other box."""
     tmn = chk.load_config(WATCHDOG / "hosts" / "tmn.json")
-    host = chk.load_config(WATCHDOG / "hosts" / "hostinger.json")
+    host = chk.load_config(WATCHDOG / "hosts" / "src.json")
     tmn_rb, host_rb = "\n".join(tmn["runbook"]), "\n".join(host["runbook"])
 
-    assert "--profile tmn" in tmn_rb and "hermes-gateway-tmn.service" in tmn_rb
-    assert "ssh hostinger" not in tmn_rb
+    assert "ssh neb-ops-gcp" in tmn_rb and "hermes-gateway.service" in tmn_rb
+    assert "--profile tmn" not in tmn_rb
+    assert "ssh screddy-hermes" not in tmn_rb
 
-    assert "ssh hostinger" in host_rb
+    assert "ssh screddy-hermes" in host_rb
     assert "--profile tmn" not in host_rb and "tunnel-through-iap" not in host_rb
+
+
+def test_src_runbook_describes_bounded_refresh_and_bans_ad_hoc_token_edits():
+    host = chk.load_config(WATCHDOG / "hosts" / "src.json")
+    note = "\n".join(host["context_note"])
+
+    assert "pinned direct-refresh helper" in note
+    assert "Do not edit token fields by hand" in note
+    assert "no longer any scheduled token refresh" not in note
+    assert "Nothing will retry it for you" not in note
 
 
 # --------------------------------------------------------------------------
@@ -344,6 +350,35 @@ def test_dead_gateway_is_down_even_with_valid_credential(tmp_path, monkeypatch):
     assert "hermes-gateway.service is failed" in detail
 
 
+def test_gateway_restart_transition_settles_without_false_down(monkeypatch):
+    """A scheduled check can overlap a normal systemd restart by a few seconds."""
+    states = iter(("deactivating", "activating", "active"))
+    sleeps = []
+
+    def run(*args, **kwargs):
+        return type("Result", (), {"stdout": next(states) + "\n"})()
+
+    monkeypatch.setattr(chk.subprocess, "run", run)
+    monkeypatch.setattr(chk.time, "sleep", sleeps.append)
+
+    assert ORIGINAL_GATEWAY_ACTIVE("hermes-gateway.service") == (True, "active")
+    assert sleeps == [chk.GATEWAY_SETTLE_INTERVAL_S] * 2
+
+
+def test_gateway_transition_that_never_settles_is_down(monkeypatch):
+    calls = []
+
+    def run(*args, **kwargs):
+        calls.append(args)
+        return type("Result", (), {"stdout": "deactivating\n"})()
+
+    monkeypatch.setattr(chk.subprocess, "run", run)
+    monkeypatch.setattr(chk.time, "sleep", lambda _: None)
+
+    assert ORIGINAL_GATEWAY_ACTIVE("hermes-gateway.service") == (False, "deactivating")
+    assert len(calls) == chk.GATEWAY_SETTLE_ATTEMPTS + 1
+
+
 def test_lineage_is_stable_and_distinguishes_credentials():
     assert chk.lineage("rt-aaa") == chk.lineage("rt-aaa")
     assert chk.lineage("rt-aaa") != chk.lineage("rt-bbb")
@@ -430,13 +465,14 @@ def test_quota_reset_parsed_from_the_python_repr_body():
     reset = int(time.time()) + 1234
     e = {"last_status": "exhausted", "last_error_code": 429,
          "last_error_message": "Error code: 429 - {'error': {'resets_at': %d}}" % reset}
-    assert chk._reset_at_of(e) == float(reset)
+    import auth_state
+    assert auth_state.reset_at_of(e) == float(reset)
 
 
 def test_quota_alert_never_offers_the_reauth_link():
     """The core lesson of 2026-08-17: two device-code logins were completed against
     an exhausted plan. Offering the link here is offering the wrong action."""
-    for host in ("hostinger", "tmn"):
+    for host in ("src", "tmn"):
         cfg = chk.load_config(WATCHDOG / "hosts" / f"{host}.json")
         body = chk.alert_text(cfg, "detail", None, "quota")
         assert "auth.openai.com/codex/device" not in body
@@ -451,7 +487,7 @@ def test_quota_alert_never_offers_the_reauth_link():
 
 
 def test_quota_subject_and_title_do_not_claim_a_lost_signin():
-    for host in ("hostinger", "tmn"):
+    for host in ("src", "tmn"):
         cfg = chk.load_config(WATCHDOG / "hosts" / f"{host}.json")
         assert "quota" in chk.subject(cfg, "quota").lower()
         assert "sign-in" not in chk.subject(cfg, "quota").lower()
@@ -544,11 +580,11 @@ def test_local_failure_outranks_the_peer_watch(host, monkeypatch):
 
 def test_peer_alert_points_at_the_other_box_not_a_relogin():
     """Sending the sign-in runbook here would aim an operator at the wrong machine."""
-    cfg = chk.load_config(WATCHDOG / "hosts" / "hostinger.json")
-    body = chk.alert_text(cfg, "detail", None, "peer")
+    cfg = chk.load_config(WATCHDOG / "hosts" / "tmn.json")
+    body = chk.alert_text(cfg, "src heartbeat stale", None, "peer")
     assert "auth.openai.com/codex/device" not in body
     assert "OTHER box" in body
-    assert cfg["peer"]["label"] in body
+    assert "src" in body
     assert "whose own check is fine" in body
 
     assert "auth.openai.com/codex/device" not in chk.ticket_body(cfg, "d", "peer")
@@ -568,36 +604,43 @@ def test_heartbeat_is_written_on_every_completed_run(host):
     assert json.loads(hb.read_text())["status"] == "down"
 
 
-def test_shipped_configs_point_at_each_other_over_the_tailnet():
-    host = chk.load_config(WATCHDOG / "hosts" / "hostinger.json")
+def test_shipped_configs_match_the_post_migration_tailnet_topology():
+    src = chk.load_config(WATCHDOG / "hosts" / "src.json")
     tmn = chk.load_config(WATCHDOG / "hosts" / "tmn.json")
+    observer = chk.load_config(WATCHDOG / "hosts" / "hermes-tmn-observer.json")
 
-    assert host["peer"]["label"] == "hermes-tmn"
-    # hermes-tmn watches hostinger AND the backstop, so nothing in the ring is
-    # unwatched. Only this box watches the observer — if both Hermes boxes did,
-    # one dead observer would page twice for a single event.
-    assert [p["label"] for p in tmn["peers"]] == ["hostinger", "neb-ops-gcp"]
+    assert src["host_label"] == "src"
+    assert not src.get("peer") and not src.get("peers")
+    assert tmn["host_label"] == "neb-ops-gcp"
+    assert tmn["hermes_home"] == "~/.hermes"
+    assert tmn["gateway_unit"] == "hermes-gateway.service"
+    assert observer["host_label"] == "hermes-tmn-observer"
+
+    # src lives on the consulting tailnet. Sharing that one device into the TMN
+    # tailnet lets the live TMN host and the old VM's observer read it without a
+    # public endpoint or reverse access into company nodes.
+    assert [p["label"] for p in tmn["peers"]] == ["src", "hermes-tmn-observer"]
     assert "peer" not in tmn
+    assert sorted(p["label"] for p in observer["peers"]) == ["neb-ops-gcp", "src"]
 
-    # tailnet addresses only — a public IP here would route monitoring over the
-    # internet and would keep working if Tailscale died, hiding a real fault.
-    everything = [host["peer"]] + list(tmn["peers"])
+    # Tailnet addresses only. A public URL recreates the retired Hostinger route
+    # that triggered the false alert after the August migration.
+    everything = list(tmn["peers"]) + list(observer["peers"])
     for peer in everything:
         assert "://100." in peer["url"], peer["url"]
         assert peer["stale_after_s"] >= 2 * 6 * 3600
 
+    src_urls = {p["url"] for p in everything if p["label"] == "src"}
+    assert src_urls == {"http://100.79.251.126:8299/heartbeat"}
 
-def test_only_the_box_with_two_watchdogs_asserts_a_sibling_timer():
-    """hermes-tmn runs a second check (NEBOS Claude) whose timer nothing shadows.
 
-    The codex timer needs no assertion: if it stops, its heartbeat goes stale and
-    the peer reports it. The Claude timer has no such shadow, which is the gap.
-    """
+def test_live_tmn_config_does_not_assert_timers_on_the_retired_vm():
+    """The TMN watchdog moved to neb-ops-gcp; its sibling timers did not."""
     tmn = chk.load_config(WATCHDOG / "hosts" / "tmn.json")
-    assert tmn["sibling_timers"] == ["nebos-claude-health.timer"]
+    assert not tmn.get("sibling_timers")
 
-    host = chk.load_config(WATCHDOG / "hosts" / "hostinger.json")
-    assert not host.get("sibling_timers")   # one watchdog on that box, nothing to pair
+    host = chk.load_config(WATCHDOG / "hosts" / "src.json")
+    assert not host.get("sibling_timers")
 
 
 # --------------------------------------------------------------------------
@@ -674,6 +717,30 @@ def test_reminder_fires_after_renotify_window(host):
     assert len(host["sent"]) == 2
 
 
+def test_peer_failure_does_not_remind_after_renotify_window(host):
+    chk.run(Args(host["cfg"], host["state"], force_peer=True))
+    assert len(host["sent"]) == 1
+
+    st = json.loads(host["state"].read_text())
+    st["last_alert"] = int(time.time()) - (24 * 3600 + 60)
+    host["state"].write_text(json.dumps(st))
+
+    chk.run(Args(host["cfg"], host["state"], force_peer=True))
+    assert len(host["sent"]) == 1
+
+
+def test_peer_recovery_rearms_the_first_failure_alert(host):
+    chk.run(Args(host["cfg"], host["state"], force_peer=True))
+    assert len(host["sent"]) == 1
+
+    chk.run(Args(host["cfg"], host["state"]))
+    assert len(host["sent"]) == 1
+    assert json.loads(host["state"].read_text())["status"] == "ok"
+
+    chk.run(Args(host["cfg"], host["state"], force_peer=True))
+    assert len(host["sent"]) == 2
+
+
 def test_recovery_is_silent_and_rearms(host):
     (host["home"] / "auth.json").write_text(json.dumps(auth_doc(refresh=None)))
     chk.run(Args(host["cfg"], host["state"]))
@@ -712,6 +779,19 @@ def test_quota_outage_alerts_once_then_goes_quiet(host):
 
     assert chk.run(Args(host["cfg"], host["state"])) == 0
     assert len(host["sent"]) == 1                     # quiet window holds
+
+
+def test_quota_reminder_still_fires_after_renotify_window(host):
+    (host["home"] / "auth.json").write_text(json.dumps(auth_doc(pool=[pool_entry()])))
+    chk.run(Args(host["cfg"], host["state"]))
+    assert len(host["sent"]) == 1
+
+    st = json.loads(host["state"].read_text())
+    st["last_alert"] = int(time.time()) - (24 * 3600 + 60)
+    host["state"].write_text(json.dumps(st))
+
+    chk.run(Args(host["cfg"], host["state"]))
+    assert len(host["sent"]) == 2
 
 
 def test_failure_kind_change_re_alerts_inside_the_quiet_window(host):
@@ -785,16 +865,16 @@ def test_non_codex_gateway_is_quiet_but_unreadable_config_is_loud(tmp_path):
 
 
 # --------------------------------------------------------------------------
-# observer host — the backstop for BOTH boxes dark
+# observer host: the backstop for peers without live coverage
 # --------------------------------------------------------------------------
 
 def obs_cfg(**over):
-    cfg = {"host_label": "neb-ops-gcp", "mode": "observer",
+    cfg = {"host_label": "hermes-tmn-observer", "mode": "observer",
            "peers": [
-               {"label": "hostinger", "bot_label": "@Screddy_bot",
-                "url": "http://100.98.215.63:8299/heartbeat", "stale_after_s": 46800},
-               {"label": "hermes-tmn", "bot_label": "@Teamnebula_bot",
-                "url": "http://100.126.215.66:8299/heartbeat", "stale_after_s": 46800},
+               {"label": "src", "bot_label": "@Screddy_bot",
+                "url": "http://100.79.251.126:8299/heartbeat", "stale_after_s": 46800},
+               {"label": "neb-ops-gcp", "bot_label": "@Teamnebula_bot",
+                "url": "http://100.74.25.61:8299/heartbeat", "stale_after_s": 46800},
            ],
            "channels": {"telegram": {"chat_id": "1", "token_env": "TELEGRAM_BOT_TOKEN"}}}
     cfg.update(over)
@@ -804,8 +884,8 @@ def obs_cfg(**over):
 def peers_aged(monkeypatch, ages):
     """ages maps peer label -> heartbeat age in seconds (None = unreachable)."""
     import contextlib, io, json as _json
-    by_url = {"http://100.98.215.63:8299/heartbeat": "hostinger",
-              "http://100.126.215.66:8299/heartbeat": "hermes-tmn"}
+    by_url = {"http://100.79.251.126:8299/heartbeat": "src",
+              "http://100.74.25.61:8299/heartbeat": "neb-ops-gcp"}
 
     def opener(url, timeout=0):
         age = ages[by_url[url]]
@@ -816,35 +896,47 @@ def peers_aged(monkeypatch, ages):
     monkeypatch.setattr(chk.urllib.request, "urlopen", opener)
 
 
-def test_observer_stays_silent_while_one_box_is_alive(monkeypatch):
-    """A single dark box is already reported by its live peer.
+@pytest.mark.parametrize(
+    ("ages", "expected_status", "expected_dark"),
+    [
+        ({"src": 60, "neb-ops-gcp": 60}, "ok", None),
+        ({"src": 99 * 3600, "neb-ops-gcp": 60}, "ok", None),
+        ({"src": 60, "neb-ops-gcp": 99 * 3600}, "peer", "neb-ops-gcp"),
+        ({"src": 99 * 3600, "neb-ops-gcp": 99 * 3600}, "peer", "src"),
+    ],
+)
+def test_observer_alerts_for_dark_peers_without_live_coverage(
+    monkeypatch, ages, expected_status, expected_dark
+):
+    """TMN covers src, but src cannot cover a dark TMN watchdog."""
+    peers_aged(monkeypatch, ages)
+    cfg = chk.load_config(WATCHDOG / "hosts" / "hermes-tmn-observer.json")
 
-    Alerting here too would page twice for one event, which is the noise this
-    repo keeps refusing to add.
-    """
-    peers_aged(monkeypatch, {"hostinger": 60, "hermes-tmn": 99 * 3600})
-    status, _, _ = chk.observe_peers(obs_cfg(), {})
-    assert status == "ok"
+    status, detail, _ = chk.observe_peers(cfg, {})
+
+    assert status == expected_status
+    if expected_dark:
+        assert expected_dark in detail
 
 
 def test_observer_alerts_when_every_box_is_dark(monkeypatch):
-    peers_aged(monkeypatch, {"hostinger": 99 * 3600, "hermes-tmn": 99 * 3600})
+    peers_aged(monkeypatch, {"src": 99 * 3600, "neb-ops-gcp": 99 * 3600})
     status, detail, _ = chk.observe_peers(obs_cfg(), {})
     assert status == "peer"
     assert "every watched box is dark" in detail
-    assert "hostinger" in detail and "hermes-tmn" in detail
+    assert "src" in detail and "neb-ops-gcp" in detail
 
 
 def test_observer_unreachable_peers_still_need_two_misses(monkeypatch):
-    peers_aged(monkeypatch, {"hostinger": None, "hermes-tmn": None})
+    peers_aged(monkeypatch, {"src": None, "neb-ops-gcp": None})
 
     status, _, fails = chk.observe_peers(obs_cfg(), {})
     assert status == "ok"                      # first miss on each, not evidence
-    assert fails == {"hostinger": 1, "hermes-tmn": 1}
+    assert fails == {"src": 1, "neb-ops-gcp": 1}
 
     status, _, fails = chk.observe_peers(obs_cfg(), fails)
     assert status == "peer"
-    assert fails == {"hostinger": 2, "hermes-tmn": 2}
+    assert fails == {"src": 2, "neb-ops-gcp": 2}
 
 
 def test_observer_config_needs_no_auth_store_but_others_still_do(tmp_path):
@@ -863,10 +955,24 @@ def test_observer_config_needs_no_auth_store_but_others_still_do(tmp_path):
         chk.load_config(p)
 
 
+@pytest.mark.parametrize(
+    "covered_by",
+    ["neb-ops-gcp", ["missing-peer"], ["src"]],
+)
+def test_observer_rejects_malformed_or_unknown_peer_coverage(tmp_path, covered_by):
+    cfg = obs_cfg()
+    cfg["peers"][0]["covered_by"] = covered_by
+    path = tmp_path / "observer.json"
+    path.write_text(json.dumps(cfg))
+
+    with pytest.raises(chk.Disarmed, match="covered_by"):
+        chk.load_config(path)
+
+
 def test_shipped_observer_config_watches_both_boxes_over_the_tailnet():
-    cfg = chk.load_config(WATCHDOG / "hosts" / "neb-ops.json")
+    cfg = chk.load_config(WATCHDOG / "hosts" / "hermes-tmn-observer.json")
     assert cfg["mode"] == "observer"
-    assert sorted(p["label"] for p in cfg["peers"]) == ["hermes-tmn", "hostinger"]
+    assert sorted(p["label"] for p in cfg["peers"]) == ["neb-ops-gcp", "src"]
     for peer in cfg["peers"]:
         assert "://100." in peer["url"]
     # telegram only: this box holds no Composio or Slack credential, and giving it
@@ -882,7 +988,7 @@ def test_observer_run_does_not_require_an_auth_store(tmp_path, monkeypatch):
     cfg["hermes_home"]. Caught by install.sh's dry-run assertion on 2026-08-17,
     which is the only reason it did not ship.
     """
-    peers_aged(monkeypatch, {"hostinger": 60, "hermes-tmn": 60})
+    peers_aged(monkeypatch, {"src": 60, "neb-ops-gcp": 60})
     cfg_path = tmp_path / "obs.json"
     cfg_path.write_text(json.dumps(obs_cfg()))
     sent = []
@@ -894,7 +1000,7 @@ def test_observer_run_does_not_require_an_auth_store(tmp_path, monkeypatch):
 
 
 def test_observer_alert_reaches_telegram(tmp_path, monkeypatch):
-    peers_aged(monkeypatch, {"hostinger": 99 * 3600, "hermes-tmn": 99 * 3600})
+    peers_aged(monkeypatch, {"src": 99 * 3600, "neb-ops-gcp": 99 * 3600})
     cfg_path = tmp_path / "obs.json"
     cfg_path.write_text(json.dumps(obs_cfg()))
     sent = []
@@ -991,10 +1097,10 @@ def test_sibling_alert_points_at_the_timer_not_the_credential():
 # --------------------------------------------------------------------------
 
 def test_any_dark_peer_is_reported_not_just_all(monkeypatch):
-    """Opposite rule to the observer: each peer here is watched by nobody else."""
+    """A normal watchdog reports any dark peer without applying observer coverage."""
     import contextlib, io, json as _json
     def opener(url, timeout=0):
-        if "100.74" in url:                      # the observer is dark
+        if "100.126" in url:                     # the observer is dark
             raise OSError("unreachable")
         body = _json.dumps({"at": int(time.time()) - 60}).encode()
         return contextlib.closing(io.BytesIO(body))
@@ -1002,20 +1108,22 @@ def test_any_dark_peer_is_reported_not_just_all(monkeypatch):
 
     cfg = chk.load_config(WATCHDOG / "hosts" / "tmn.json")
     status, _, fails = chk.read_peers(cfg, {})
-    assert status == "ok" and fails["neb-ops-gcp"] == 1      # one miss, no page
+    assert status == "ok" and fails["hermes-tmn-observer"] == 1  # one miss, no page
 
     status, detail, fails = chk.read_peers(cfg, fails)
     assert status == "peer"
-    assert "neb-ops-gcp" in detail
-    assert fails["hostinger"] == 0                          # healthy peer stays reset
+    assert "hermes-tmn-observer" in detail
+    assert fails["src"] == 0                          # healthy peer stays reset
 
 
 def test_single_peer_config_still_works(monkeypatch):
-    """hostinger predates the list and must keep working unchanged."""
+    """The legacy singular form remains supported for downstream configs."""
     import contextlib, io, json as _json
     monkeypatch.setattr(chk.urllib.request, "urlopen",
                         lambda url, timeout=0: contextlib.closing(
                             io.BytesIO(_json.dumps({"at": int(time.time()) - 60}).encode())))
-    cfg = chk.load_config(WATCHDOG / "hosts" / "hostinger.json")
+    cfg = chk.load_config(WATCHDOG / "hosts" / "src.json")
+    cfg["peer"] = {"label": "peer", "bot_label": "bot",
+                   "url": "http://100.64.0.1:8299/heartbeat", "stale_after_s": 46800}
     status, _, _ = chk.read_peers(cfg, {})
     assert status == "ok"
