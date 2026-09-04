@@ -616,9 +616,8 @@ def test_shipped_configs_match_the_post_migration_tailnet_topology():
     assert tmn["gateway_unit"] == "hermes-gateway.service"
     assert observer["host_label"] == "hermes-tmn-observer"
 
-    # src lives on the consulting tailnet. Sharing that one device into the TMN
-    # tailnet lets the live TMN host and the old VM's observer read it without a
-    # public endpoint or reverse access into company nodes.
+    # src now belongs to the Team Nebula tailnet. The live TMN host and the old
+    # VM's observer read it without a public endpoint.
     assert [p["label"] for p in tmn["peers"]] == ["src", "hermes-tmn-observer"]
     assert "peer" not in tmn
     assert sorted(p["label"] for p in observer["peers"]) == ["neb-ops-gcp", "src"]
@@ -631,7 +630,7 @@ def test_shipped_configs_match_the_post_migration_tailnet_topology():
         assert peer["stale_after_s"] >= 2 * 6 * 3600
 
     src_urls = {p["url"] for p in everything if p["label"] == "src"}
-    assert src_urls == {"http://100.79.251.126:8299/heartbeat"}
+    assert src_urls == {"http://100.70.49.54:8299/heartbeat"}
 
 
 def test_live_tmn_config_does_not_assert_timers_on_the_retired_vm():
@@ -872,7 +871,7 @@ def obs_cfg(**over):
     cfg = {"host_label": "hermes-tmn-observer", "mode": "observer",
            "peers": [
                {"label": "src", "bot_label": "@Screddy_bot",
-                "url": "http://100.79.251.126:8299/heartbeat", "stale_after_s": 46800},
+                "url": "http://100.70.49.54:8299/heartbeat", "stale_after_s": 46800},
                {"label": "neb-ops-gcp", "bot_label": "@Teamnebula_bot",
                 "url": "http://100.74.25.61:8299/heartbeat", "stale_after_s": 46800},
            ],
@@ -884,7 +883,7 @@ def obs_cfg(**over):
 def peers_aged(monkeypatch, ages):
     """ages maps peer label -> heartbeat age in seconds (None = unreachable)."""
     import contextlib, io, json as _json
-    by_url = {"http://100.79.251.126:8299/heartbeat": "src",
+    by_url = {"http://100.70.49.54:8299/heartbeat": "src",
               "http://100.74.25.61:8299/heartbeat": "neb-ops-gcp"}
 
     def opener(url, timeout=0):

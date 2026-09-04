@@ -295,14 +295,13 @@ instead of waiting to disappoint you.
 
 `OnFailure=` needs a run to hook, so it cannot fire for a check that never runs.
 The peer watch covers that gap. Each check writes a heartbeat and serves it on
-its Tailscale address. hermes-tmn-observer and neb-ops-gcp read src through a one-device
-share from the consulting tailnet into the Team Nebula tailnet. The share grants
-Team Nebula access to src without giving src access to company nodes.
+its Tailscale address. src, hermes-tmn-observer, and neb-ops-gcp now belong to the
+Team Nebula tailnet. The two observers read src over that private network.
 
 ```
-hermes-tmn-observer ──reads──▶ http://100.79.251.126:8299/heartbeat  (src)
+hermes-tmn-observer ──reads──▶ http://100.70.49.54:8299/heartbeat   (src)
 hermes-tmn-observer ──reads──▶ http://100.74.25.61:8299/heartbeat   (neb-ops-gcp)
-neb-ops-gcp         ──reads──▶ http://100.79.251.126:8299/heartbeat  (src)
+neb-ops-gcp         ──reads──▶ http://100.70.49.54:8299/heartbeat   (src)
 neb-ops-gcp         ──reads──▶ http://100.126.215.66:8299/heartbeat (observer)
 ```
 
@@ -330,17 +329,17 @@ account, and no new signal type, because a dark peer is reported through the sam
 
 ### The backstop: hermes-tmn-observer
 
-The post-migration topology is asymmetric: `neb-ops-gcp` can watch `src` and the
-observer, but `src` cannot reach Team Nebula hosts. The legacy `hermes-tmn` VM
-closes the uncovered paths. It is a third always-on host on the tailnet, holds no
-Hermes credential, and reads both heartbeats four times a day on
+The watchdog configuration remains asymmetric: `neb-ops-gcp` watches `src` and
+the observer, while `src` has no peer targets. The legacy `hermes-tmn` VM closes
+the uncovered paths. It is a third always-on host on the tailnet, holds no Hermes
+credential, and reads both heartbeats four times a day on
 `01,07,13,19:35`, offset from both Hermes hosts.
 
 Each observer peer declares `covered_by`, the other live peers that already own
 its lone outage. A dark `src` stays quiet while `neb-ops-gcp` has a fresh
 heartbeat because the TMN watchdog reports it. A dark `neb-ops-gcp` alerts from
-the observer even while `src` is fresh because `src` has no route back into the
-Team Nebula tailnet. If both are dark, the observer alerts for the combined
+the observer even while `src` is fresh because `src` has no configured peer
+target. If both are dark, the observer alerts for the combined
 outage. Malformed, self-referential, or unknown coverage declarations disarm the
 observer instead of guessing.
 
@@ -437,10 +436,9 @@ opens SSH. It passes an argv array and permits these remote actions only:
 - start the fixed health check;
 - read the same postconditions.
 
-The one-device Tailscale share grants Team Nebula hosts access to `src`.
-`neb-ops-gcp` and the observer may repair `src`; `src` has no peer list and gets
-no access to Team Nebula hosts. The observer and `neb-ops-gcp` may repair each
-other inside the Team Nebula tailnet. The healer rejects `sudo`, shell fragments,
+All three watchdog hosts belong to the Team Nebula tailnet. `neb-ops-gcp` and the
+observer may repair `src`; `src` keeps an empty peer list. The observer and
+`neb-ops-gcp` may repair each other. The healer rejects `sudo`, shell fragments,
 unlisted units, and non-tailnet targets.
 
 ## Maintenance and state

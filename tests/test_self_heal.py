@@ -1806,7 +1806,7 @@ def test_continuing_peer_outage_retries_after_cooldown_without_renotifying(tmp_p
     assert state["peer_attempts"]["src"] == 22700
 
 
-def test_committed_peer_repair_allowlists_match_one_way_tailnet_topology():
+def test_committed_peer_repair_allowlists_match_tailnet_topology():
     tmn = json.loads((WATCHDOG / "hosts" / "tmn.json").read_text())
     observer = json.loads(
         (WATCHDOG / "hosts" / "hermes-tmn-observer.json").read_text()
@@ -1816,7 +1816,7 @@ def test_committed_peer_repair_allowlists_match_one_way_tailnet_topology():
     assert tmn["self_heal"]["peers"] == [
         {
             "label": "src",
-            "ip": "100.79.251.126",
+            "ip": "100.70.49.54",
             "ssh_user": "hermes",
             "identity_file": "~/.ssh/watchdog-repair",
             "known_hosts": "~/.ssh/watchdog-repair-known_hosts",
@@ -1840,7 +1840,7 @@ def test_committed_peer_repair_allowlists_match_one_way_tailnet_topology():
     assert observer["self_heal"]["peers"] == [
         {
             "label": "src",
-            "ip": "100.79.251.126",
+            "ip": "100.70.49.54",
             "ssh_user": "hermes",
             "identity_file": "~/.ssh/watchdog-repair",
             "known_hosts": "~/.ssh/watchdog-repair-known_hosts",
