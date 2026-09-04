@@ -40,6 +40,7 @@ import argparse
 import json
 import os
 import pathlib
+import stat
 import subprocess
 import sys
 import urllib.request
@@ -47,6 +48,34 @@ import urllib.request
 HOME = pathlib.Path.home()
 HERE = pathlib.Path(__file__).resolve().parent
 TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
+
+
+def telegram_token_from_existing_store(hermes_home: pathlib.Path | None) -> str:
+    """Read the existing Hermes failback token without duplicating the secret.
+
+    The post-migration TMN host keeps its Telegram credential in
+    ``llm-failback.json`` instead of an environment file. Accept that store only
+    when the current user owns a regular, non-symlinked, mode-0600 file.
+    """
+    candidates = []
+    if hermes_home:
+        candidates.append(hermes_home / "llm-failback.json")
+    candidates.append(HOME / ".hermes" / "llm-failback.json")
+    for path in dict.fromkeys(candidates):
+        try:
+            info = path.lstat()
+            if (not stat.S_ISREG(info.st_mode)
+                    or info.st_uid != os.getuid()
+                    or info.st_mode & 0o077):
+                continue
+            token = str((json.loads(path.read_text()).get("telegram") or {}).get(
+                "bot_token"
+            ) or "").strip()
+            if token:
+                return token
+        except Exception:
+            pass
+    return ""
 
 
 def env_val(name: str, hermes_home: pathlib.Path | None) -> str:
@@ -75,6 +104,8 @@ def env_val(name: str, hermes_home: pathlib.Path | None) -> str:
                         return val.strip()
         except Exception:
             pass
+    if name == "TELEGRAM_BOT_TOKEN":
+        return telegram_token_from_existing_store(hermes_home)
     return ""
 
 
