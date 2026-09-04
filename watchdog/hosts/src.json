@@ -10,9 +10,9 @@
     "hermes_python": "/opt/hermes-agent/venv/bin/python",
     "hermes_version": "0.16.0",
     "hermes_auth_module": "/opt/hermes-agent/hermes_cli/auth.py",
-    "hermes_auth_sha256": "0e7be1c3e1e5c5c36e2b8f118ff51acb573d4a12207dc2fc6eb6b9f092af383f",
+    "hermes_auth_sha256": "45595eeec1ef4102db487dbaa9721e52d5cd862b8ecbaf2d03b54452629172bd",
     "hermes_credential_pool_module": "/opt/hermes-agent/agent/credential_pool.py",
-    "hermes_credential_pool_sha256": "be1a45cb8e2b34463b079941b0c9c18f76f8bc7d2c22282696783eca389a99fb",
+    "hermes_credential_pool_sha256": "ba693a2cc77c6e57d2d10b49c170274a318c756f609aa08d8c2f0497f1f52f45",
     "maintenance_lock": "~/.hermes/codex-health/SELF_HEAL_PAUSED",
     "retry_s": 21600,
     "peers": []
