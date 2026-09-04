@@ -35,6 +35,7 @@ def _load(name: str):
 
 
 chk = _load("codex_health_check")
+ORIGINAL_GATEWAY_ACTIVE = chk.gateway_active
 
 
 # --------------------------------------------------------------------------
@@ -342,6 +343,35 @@ def test_dead_gateway_is_down_even_with_valid_credential(tmp_path, monkeypatch):
     status, detail = chk.detect(tmp_path / "auth.json", "hermes-gateway.service")
     assert status == "down"
     assert "hermes-gateway.service is failed" in detail
+
+
+def test_gateway_restart_transition_settles_without_false_down(monkeypatch):
+    """A scheduled check can overlap a normal systemd restart by a few seconds."""
+    states = iter(("deactivating", "activating", "active"))
+    sleeps = []
+
+    def run(*args, **kwargs):
+        return type("Result", (), {"stdout": next(states) + "\n"})()
+
+    monkeypatch.setattr(chk.subprocess, "run", run)
+    monkeypatch.setattr(chk.time, "sleep", sleeps.append)
+
+    assert ORIGINAL_GATEWAY_ACTIVE("hermes-gateway.service") == (True, "active")
+    assert sleeps == [chk.GATEWAY_SETTLE_INTERVAL_S] * 2
+
+
+def test_gateway_transition_that_never_settles_is_down(monkeypatch):
+    calls = []
+
+    def run(*args, **kwargs):
+        calls.append(args)
+        return type("Result", (), {"stdout": "deactivating\n"})()
+
+    monkeypatch.setattr(chk.subprocess, "run", run)
+    monkeypatch.setattr(chk.time, "sleep", lambda _: None)
+
+    assert ORIGINAL_GATEWAY_ACTIVE("hermes-gateway.service") == (False, "deactivating")
+    assert len(calls) == chk.GATEWAY_SETTLE_ATTEMPTS + 1
 
 
 def test_lineage_is_stable_and_distinguishes_credentials():

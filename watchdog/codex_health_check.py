@@ -495,14 +495,34 @@ def observe_peers(cfg: dict, fails: dict) -> tuple[str, str, dict]:
     return "ok", "; ".join(details), verdicts
 
 
+GATEWAY_TRANSIENT_STATES = frozenset({"activating", "deactivating", "reloading"})
+GATEWAY_SETTLE_ATTEMPTS = 12
+GATEWAY_SETTLE_INTERVAL_S = 1
+
+
 def gateway_active(unit: str) -> tuple[bool, str]:
-    """Is the gateway actually running? Codex auth can be perfect while the bot is dead."""
+    """Is the gateway running after any in-flight systemd transition settles?
+
+    A gateway restart normally spends a few seconds in ``deactivating`` and
+    ``activating``. Paging from a single sample in that window produces a false
+    Codex re-auth alert even though the credential is healthy and systemd is
+    already restoring the bot. Stable inactive/failed states still fail fast.
+    """
     try:
-        r = subprocess.run(
-            ["systemctl", "--user", "is-active", unit],
-            capture_output=True, text=True, timeout=20,
-        )
-        return r.stdout.strip() == "active", r.stdout.strip() or "unknown"
+        state = "unknown"
+        for attempt in range(GATEWAY_SETTLE_ATTEMPTS + 1):
+            r = subprocess.run(
+                ["systemctl", "--user", "is-active", unit],
+                capture_output=True, text=True, timeout=20,
+            )
+            state = r.stdout.strip() or "unknown"
+            if state == "active":
+                return True, state
+            if state not in GATEWAY_TRANSIENT_STATES:
+                return False, state
+            if attempt < GATEWAY_SETTLE_ATTEMPTS:
+                time.sleep(GATEWAY_SETTLE_INTERVAL_S)
+        return False, state
     except Exception as e:
         return True, f"uncheckable ({type(e).__name__})"
 
