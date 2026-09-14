@@ -135,6 +135,46 @@ def test_quoted_env_values_are_unwrapped(tmp_path, sent, monkeypatch):
     assert sent[0]["chat"] == "42"
 
 
+def test_existing_private_failback_store_supplies_telegram_token(
+    tmp_path, sent, monkeypatch
+):
+    """The migrated TMN host must reuse its token without copying the secret."""
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("TELEGRAM_HOME_CHANNEL", raising=False)
+    cfg = write_cfg(tmp_path)
+    write_env(tmp_path, TELEGRAM_HOME_CHANNEL="555")
+    store = tmp_path / "home" / "llm-failback.json"
+    store.write_text(json.dumps({"telegram": {"bot_token": "existing-token"}}))
+    store.chmod(0o600)
+    monkeypatch.setattr(nf, "HOME", tmp_path / "nowhere")
+
+    assert nf.run(Args(cfg)) == 0
+    assert sent[0]["token"] == "existing-token"
+
+
+@pytest.mark.parametrize("mode", [0o644, 0o660])
+def test_failback_store_must_be_owner_only(tmp_path, monkeypatch, mode):
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    store = tmp_path / "llm-failback.json"
+    store.write_text(json.dumps({"telegram": {"bot_token": "unsafe-token"}}))
+    store.chmod(mode)
+    monkeypatch.setattr(nf, "HOME", tmp_path / "nowhere")
+
+    assert nf.telegram_token_from_existing_store(tmp_path) == ""
+
+
+def test_failback_store_symlink_is_rejected(tmp_path, monkeypatch):
+    target = tmp_path / "token.json"
+    target.write_text(json.dumps({"telegram": {"bot_token": "linked-token"}}))
+    target.chmod(0o600)
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "llm-failback.json").symlink_to(target)
+    monkeypatch.setattr(nf, "HOME", tmp_path / "nowhere")
+
+    assert nf.telegram_token_from_existing_store(home) == ""
+
+
 def test_thread_id_is_forwarded_when_set(tmp_path, sent, monkeypatch):
     """Both boxes set TELEGRAM_HOME_CHANNEL_THREAD_ID; a forum topic needs it."""
     monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
@@ -218,6 +258,28 @@ def test_message_stays_inside_telegram_limit(tmp_path):
     assert text.rstrip().endswith("x")          # trimmed from the front, newest kept
 
 
+def test_healer_failure_message_names_repair_not_reporting(tmp_path):
+    cfg = json.loads(write_cfg(tmp_path).read_text())
+    text = nf.build_message(
+        cfg, "hermes-codex-self-heal.service", "timer repair failed"
+    )
+
+    assert "SELF-HEAL REPAIR FAILED" in text
+    assert "FAILED TO REPORT" not in text
+
+
+def test_onfailure_monitor_unit_selects_healer_message(
+    tmp_path, sent, monkeypatch
+):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
+    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "123")
+    monkeypatch.setenv("MONITOR_UNIT", "hermes-codex-self-heal.service")
+
+    assert nf.run(Args(write_cfg(tmp_path), unit="hermes-codex-health.service")) == 0
+    assert "SELF-HEAL REPAIR FAILED" in sent[0]["text"]
+    assert "hermes-codex-self-heal.service" in sent[0]["text"]
+
+
 # --------------------------------------------------------------------------
 # wiring — the directive that was claimed for months and never existed
 # --------------------------------------------------------------------------
@@ -238,10 +300,35 @@ def test_every_check_unit_wires_onfailure_to_its_notifier():
         assert f"--unit {unit}" in notify_body
 
 
+def test_every_healer_unit_wires_a_healer_specific_notifier():
+    pairs = {
+        "hermes-codex-self-heal.service": "hermes-codex-self-heal-notify.service",
+        "hermes-codex-self-heal-tmn.service": (
+            "hermes-codex-self-heal-tmn-notify.service"
+        ),
+        "codex-observer-self-heal.service": "codex-observer-self-heal-notify.service",
+    }
+    for unit, notify in pairs.items():
+        body = (WATCHDOG / "systemd" / unit).read_text()
+        assert f"OnFailure={notify}" in body
+
+        notify_body = (WATCHDOG / "systemd" / notify).read_text()
+        assert "notify_failure.py" in notify_body
+        assert f"--unit {unit}" in notify_body
+
+        trigger_sources = [
+            candidate.name
+            for candidate in (WATCHDOG / "systemd").glob("*.service")
+            if f"OnFailure={notify}" in candidate.read_text()
+        ]
+        assert trigger_sources == [unit]
+
+
 def test_notifier_units_read_the_env_that_holds_the_bot_token():
-    """tmn must load the profile .env first; without it the token never resolves."""
+    """The live TMN host stores its notifier token in the root Hermes env."""
     tmn = (WATCHDOG / "systemd" / "hermes-codex-health-tmn-notify.service").read_text()
-    assert tmn.index("profiles/tmn/.env") < tmn.index("%h/.hermes/.env")
+    assert "EnvironmentFile=-%h/.hermes/.env" in tmn
+    assert "profiles/tmn" not in tmn
 
     host = (WATCHDOG / "systemd" / "hermes-codex-health-notify.service").read_text()
     assert "%h/.hermes/.env" in host
@@ -326,7 +413,7 @@ def test_every_shipped_config_names_itself_for_escalation():
     its Telegram alert would have read "unknown host … a Hermes bot" — anonymous
     at the one moment the name matters. Caught when install.sh printed host=None.
     """
-    for name in ("hostinger", "tmn", "neb-ops", "nebos-claude"):
+    for name in ("src", "tmn", "hermes-tmn-observer", "nebos-claude"):
         cfg = json.loads((WATCHDOG / "hosts" / f"{name}.json").read_text())
         assert cfg.get("host_label"), f"{name}.json has no host_label"
         assert cfg.get("bot_label"), f"{name}.json has no bot_label"

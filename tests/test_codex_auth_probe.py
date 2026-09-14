@@ -12,6 +12,7 @@ import importlib.util
 import io
 import json
 import pathlib
+import sys
 import time
 import urllib.error
 
@@ -22,6 +23,7 @@ WATCHDOG = HERE.parent / "watchdog"
 
 
 def _load(name: str):
+    sys.path.insert(0, str(WATCHDOG))
     spec = importlib.util.spec_from_file_location(name, WATCHDOG / f"{name}.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -65,6 +67,50 @@ def http_error(code: str | int, body: str) -> urllib.error.HTTPError:
 
 def test_success_is_zero(tmp_path, monkeypatch):
     assert run_probe(monkeypatch, write_auth(tmp_path)) == 0
+
+
+def test_probe_uses_selected_pool_entry_instead_of_stale_singleton(tmp_path, monkeypatch):
+    def jwt(account_id: str) -> str:
+        claims = {
+            "https://api.openai.com/auth": {"chatgpt_account_id": account_id},
+            "exp": int(time.time()) + 3600,
+        }
+        payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+        return f"h.{payload}.s"
+
+    singleton = jwt("acct-singleton")
+    backup = jwt("acct-backup")
+    auth = tmp_path / "auth.json"
+    auth.write_text(json.dumps({
+        "providers": {"openai-codex": {"tokens": {
+            "access_token": singleton, "refresh_token": "dead-rt"
+        }}},
+        "credential_pool": {"openai-codex": [
+            {"id": "backup", "label": "backup", "auth_type": "oauth",
+             "source": "manual:oauth", "access_token": backup,
+             "refresh_token": "backup-rt", "last_status": "ok", "priority": 1}
+        ]}
+    }))
+    seen = {}
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def fake_open(req, timeout):
+        seen["authorization"] = req.headers["Authorization"]
+        seen["account"] = req.headers["Chatgpt-account-id"]
+        return Response()
+
+    monkeypatch.setattr(probe.urllib.request, "urlopen", fake_open)
+    monkeypatch.setattr("sys.argv", ["probe", "--auth-json", str(auth)])
+    assert probe.main() == 0
+    assert seen == {"authorization": f"Bearer {backup}", "account": "acct-backup"}
 
 
 def test_401_is_broken(tmp_path, monkeypatch):
