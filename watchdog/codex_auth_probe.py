@@ -36,6 +36,8 @@ import sys
 import urllib.error
 import urllib.request
 
+from auth_state import selected_codex_credential
+
 ENDPOINT = "https://chatgpt.com/backend-api/codex/responses"
 
 
@@ -50,6 +52,14 @@ def resolve_auth(args) -> pathlib.Path:
     raise SystemExit("need --auth-json or --config")
 
 
+def resolve_credential(auth_path: pathlib.Path) -> tuple[str, str]:
+    auth = json.loads(auth_path.read_text())
+    selected = selected_codex_credential(auth)
+    if not selected or not selected.get("access_token"):
+        raise ValueError("no probeable Codex credential")
+    return str(selected["access_token"]), str(selected.get("label") or "unknown")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--auth-json", help="path to the Hermes auth.json to probe")
@@ -61,11 +71,12 @@ def main() -> int:
     args = ap.parse_args()
 
     auth_path = resolve_auth(args)
+    label = "unknown"
     try:
-        tok = json.loads(auth_path.read_text())["providers"]["openai-codex"]["tokens"]
-        at = tok["access_token"]
+        at, label = resolve_credential(auth_path)
     except Exception as e:
-        print(f"UNKNOWN: cannot read {auth_path} ({type(e).__name__}: {e})")
+        print(f"UNKNOWN: cannot read {auth_path} (credential={label}; "
+              f"{type(e).__name__}: {e})")
         return 2
     try:
         p = at.split(".")[1]
@@ -73,7 +84,8 @@ def main() -> int:
         claims = json.loads(base64.urlsafe_b64decode(p))
         acct = claims["https://api.openai.com/auth"]["chatgpt_account_id"]
     except Exception as e:
-        print(f"UNKNOWN: cannot parse account_id ({type(e).__name__}: {e})")
+        print(f"UNKNOWN: cannot parse account_id (credential={label}; "
+              f"{type(e).__name__}: {e})")
         return 2
 
     body = json.dumps({
@@ -89,7 +101,7 @@ def main() -> int:
                  "originator": "codex_cli_rs", "User-Agent": "codex-auth-probe"})
     try:
         r = urllib.request.urlopen(req, timeout=30)
-        print(f"OK: {r.status} (auth={auth_path}, model={args.model})")
+        print(f"OK: {r.status} (credential={label}, auth={auth_path}, model={args.model})")
         return 0
     except urllib.error.HTTPError as e:
         try:
@@ -97,7 +109,7 @@ def main() -> int:
         except Exception:
             payload = ""
         if e.code == 429 and "usage_limit" in payload.lower():
-            print(f"QUOTA: {e.code} {payload[:200]}")
+            print(f"QUOTA: {e.code} (credential={label}) {payload[:200]}")
             return 3
         # Any 401/403 is BROKEN. The version this replaces also required the body
         # to match a substring allowlist, so a reworded OpenAI error fell through
@@ -106,12 +118,12 @@ def main() -> int:
         # consequence is telling a human, a false page costs nothing and a
         # swallowed 401 costs an outage.
         if e.code in (401, 403):
-            print(f"BROKEN: {e.code} {payload[:200]}")
+            print(f"BROKEN: {e.code} (credential={label}) {payload[:200]}")
             return 1
-        print(f"UNKNOWN: {e.code} {payload[:200]}")
+        print(f"UNKNOWN: {e.code} (credential={label}) {payload[:200]}")
         return 2
     except Exception as e:
-        print(f"UNKNOWN: {type(e).__name__}: {e}")
+        print(f"UNKNOWN: {type(e).__name__} (credential={label}): {e}")
         return 2
 
 

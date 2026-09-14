@@ -1,12 +1,26 @@
 {
-  "host_label": "hostinger",
+  "host_label": "src",
   "bot_label": "@Screddy_bot",
   "hermes_home": "~/.hermes",
   "gateway_unit": "hermes-gateway.service",
+  "self_heal": {
+    "health_timer": "hermes-codex-health.timer",
+    "check_service": "hermes-codex-health.service",
+    "gateway_restart": true,
+    "hermes_python": "/opt/hermes-agent/venv/bin/python",
+    "hermes_version": "0.16.0",
+    "hermes_auth_module": "/opt/hermes-agent/hermes_cli/auth.py",
+    "hermes_auth_sha256": "0e7be1c3e1e5c5c36e2b8f118ff51acb573d4a12207dc2fc6eb6b9f092af383f",
+    "hermes_credential_pool_module": "/opt/hermes-agent/agent/credential_pool.py",
+    "hermes_credential_pool_sha256": "be1a45cb8e2b34463b079941b0c9c18f76f8bc7d2c22282696783eca389a99fb",
+    "maintenance_lock": "~/.hermes/codex-health/SELF_HEAL_PAUSED",
+    "retry_s": 21600,
+    "peers": []
+  },
   "reauth_url": "https://auth.openai.com/codex/device",
   "renotify_s": 86400,
-  "subject": "Action needed: personal Hermes lost its Codex sign-in (hostinger)",
-  "ticket_title": "Codex sign-in lost — personal Hermes (hostinger)",
+  "subject": "Action needed: personal Hermes lost its Codex sign-in (src)",
+  "ticket_title": "Codex sign-in lost — personal Hermes (src)",
   "channels": {
     "telegram": {
       "chat_id": "6056863584",
@@ -27,7 +41,7 @@
     "a person at a browser. Until someone runs these steps the bot stays down.",
     "",
     "1. SSH to the box:",
-    "   ssh hostinger",
+    "   ssh screddy-hermes",
     "",
     "2. Start the device-code login (default profile — no --profile flag here):",
     "   hermes auth add openai-codex --type oauth --no-browser",
@@ -49,23 +63,21 @@
     "   hermes -z \"Reply with exactly one word: PONG\""
   ],
   "context_note": [
-    "Why this needs a person: the only repair is a full re-login, which OpenAI now gates",
-    "behind 2FA. Nothing will retry it for you. The headless device-code self-heal that",
-    "used to run here was removed on 2026-08-11 precisely because 2FA made it impossible;",
-    "do not wait for anything to recover on its own.",
+    "Why this needs a person: the selected lineage is terminal, and OpenAI gates a full",
+    "re-login behind 2FA. The healer will not retry a terminal refresh token. Complete",
+    "the device-code login instead of waiting for the next scheduled cycle.",
     "",
-    "Note there is no longer any scheduled token refresh on this box. codex-keepalive was",
-    "retired with the self-heal, so the running gateway refreshing on use is the only thing",
-    "keeping the token alive. If the gateway is down, the token will age out unrefreshed —",
-    "that is exactly how the 2026-08-05 outage happened.",
+    "The 15-minute healer uses a pinned direct-refresh helper for one eligible renewable",
+    "lineage. It cannot recover this terminal lineage. Do not edit token fields by hand or",
+    "restore a backup; a prior request may have consumed the saved refresh token.",
     "",
     "Use a FRESH authorization, not a copy of the one hermes-tmn holds. The two boxes",
     "sharing one OAuth lineage is what caused the July outage: whichever box refreshes",
     "last silently invalidates the other. The credential `label` field is cosmetic —",
     "compare the refresh-token fingerprint printed in this alert, not labels."
   ],
-  "quota_subject": "Action needed: personal Hermes is out of Codex quota (hostinger)",
-  "quota_ticket_title": "Codex quota exhausted — personal Hermes (hostinger)",
+  "quota_subject": "Action needed: personal Hermes is out of Codex quota (src)",
+  "quota_ticket_title": "Codex quota exhausted — personal Hermes (src)",
   "quota_note": [
     "This box has a local Ollama fallback configured, so an exhausted plan degrades",
     "@Screddy_bot rather than killing it outright. Lower urgency than the same alert from",
@@ -74,11 +86,5 @@
     "@Screddy_bot and @Teamnebula_bot are on SEPARATE ChatGPT accounts — confirm which one",
     "this credential is attached to before changing a plan. The refresh-token fingerprint in",
     "this alert identifies the credential; the account itself is in the access-token claims."
-  ],
-  "peer": {
-    "label": "hermes-tmn",
-    "bot_label": "@Teamnebula_bot",
-    "url": "http://100.126.215.66:8299/heartbeat",
-    "stale_after_s": 46800
-  }
+  ]
 }
