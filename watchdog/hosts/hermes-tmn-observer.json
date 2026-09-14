@@ -58,6 +58,10 @@
     "telegram": {
       "chat_id": "6056863584",
       "token_env": "TELEGRAM_BOT_TOKEN"
+    },
+    "slack": {
+      "channel": "C09FLJDCAJD",
+      "token_env": "SLACK_BOT_TOKEN"
     }
   },
   "runbook": [
@@ -80,7 +84,6 @@
     "credential. neb-ops-gcp watches its heartbeat in turn.",
     "",
     "It holds no Hermes credential and checks none. It reads two heartbeats over the",
-    "tailnet and alerts by Telegram, the narrowest secret that reaches Shawn from a",
-    "third box."
+    "tailnet and alerts by Telegram plus Slack, without the Composio mail credential."
   ]
 }
