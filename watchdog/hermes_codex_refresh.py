@@ -133,17 +133,23 @@ def _validate_auth_ast(source: str) -> None:
         if assignments.get(name) != expected:
             raise RefreshError(f"Hermes auth contract mismatch for {name}")
     signatures = {
-        "_auth_lock_path": ([], []),
-        "_auth_store_lock": (["timeout_seconds"], []),
-        "_load_auth_store": (["auth_file"], []),
-        "_save_auth_store": (["auth_store"], []),
+        "_auth_lock_path": (([], []),),
+        "_auth_store_lock": (
+            (["timeout_seconds"], []),
+            (["timeout_seconds"], ["target_path"]),
+        ),
+        "_load_auth_store": ((["auth_file"], []),),
+        "_save_auth_store": (
+            (["auth_store"], []),
+            (["auth_store", "target_path"], []),
+        ),
         "refresh_codex_oauth_pure": (
-            ["access_token", "refresh_token"],
-            ["timeout_seconds"],
+            (["access_token", "refresh_token"], ["timeout_seconds"]),
         ),
     }
-    for name, expected in signatures.items():
-        if _function_signature(tree, name) != expected:
+    for name, accepted in signatures.items():
+        signature = _function_signature(tree, name)
+        if signature not in accepted:
             raise RefreshError(f"Hermes auth signature mismatch for {name}")
 
 

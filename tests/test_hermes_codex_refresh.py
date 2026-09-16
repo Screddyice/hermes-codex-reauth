@@ -35,13 +35,13 @@ CODEX_RATE_LIMITED_CODE = "codex_rate_limited"
 def _auth_lock_path():
     return _auth_file_path().with_suffix(".lock")
 
-def _auth_store_lock(timeout_seconds=AUTH_LOCK_TIMEOUT_SECONDS):
+def _auth_store_lock(timeout_seconds=AUTH_LOCK_TIMEOUT_SECONDS, *, target_path=None):
     return None
 
 def _load_auth_store(auth_file=None):
     return {}
 
-def _save_auth_store(auth_store):
+def _save_auth_store(auth_store, target_path=None):
     return None
 
 def refresh_codex_oauth_pure(access_token, refresh_token, *, timeout_seconds=20.0):
@@ -85,6 +85,20 @@ def write_contract(tmp_path: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
         "Metadata-Version: 2.1\nName: hermes-agent\nVersion: 0.16.0\n"
     )
     return auth_module, pool_module
+
+
+def test_auth_contract_rejects_unreviewed_signature_expansion():
+    source = AUTH_SOURCE.replace(
+        "def _save_auth_store(auth_store, target_path=None):",
+        "def _save_auth_store(auth_store, target_path=None, unsafe=False):",
+    )
+
+    try:
+        helper._validate_auth_ast(source)
+    except helper.RefreshError as exc:
+        assert str(exc) == "Hermes auth signature mismatch for _save_auth_store"
+    else:
+        raise AssertionError("unreviewed signature expansion was accepted")
 
 
 def helper_argv(
